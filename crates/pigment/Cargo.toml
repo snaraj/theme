@@ -1,7 +1,32 @@
 [package]
 name = "pigment"
-version = "0.0.1"
+version = "0.1.0"
 description = "In-house wallpaper-to-palette color engine"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Sole runtime dependency (coordinator ruling, issue #2): decoders only, and
+# exactly the codecs THEME_FORMATS names — jpg/jpeg, png, webp, gif, bmp,
+# tif/tiff. Decoding hostile image bytes in-house would trade away security.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "webp",
+    "gif",
+    "bmp",
+    "tiff",
+] }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
+
+[[bench]]
+name = "stages"
+harness = false
