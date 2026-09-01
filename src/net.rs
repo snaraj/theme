@@ -141,35 +141,53 @@ pub fn is_public_http(url: &str) -> bool {
     }
 }
 
-/// A globally-routable unicast address: NOT loopback, private, link-local,
-/// ULA, unspecified, broadcast, CGNAT, documentation, or `0.0.0.0/8` — and an
-/// IPv4-mapped/compatible IPv6 is judged by the v4 it wraps.
+/// True only for a globally-routable unicast address — an allowlist by
+/// exclusion of EVERY IANA special-use range, not a partial denylist (the
+/// stdlib `is_global` is nightly-only). An IPv4-mapped/compatible IPv6 is
+/// judged by the v4 it wraps; the pinned untrusted hop refuses anything else.
 pub fn is_global_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(a) => is_global_v4(a),
         IpAddr::V6(a) => {
-            if let Some(v4) = a.to_ipv4() {
-                return is_global_v4(&v4); // ::a.b.c.d and ::ffff:a.b.c.d
+            // ::ffff:0:0/96 — judge by the embedded v4.
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return is_global_v4(&v4);
             }
-            let seg0 = a.segments()[0];
-            !(a.is_loopback()
-                || a.is_unspecified()
-                || (seg0 & 0xfe00) == 0xfc00 // ULA fc00::/7
-                || (seg0 & 0xffc0) == 0xfe80) // link-local fe80::/10
+            // ::/96 (incl. ::, ::1, deprecated IPv4-compatible) — non-global.
+            if a.to_ipv4().is_some() {
+                return false;
+            }
+            let s = a.segments();
+            let special = (s[0] & 0xfe00) == 0xfc00                       // fc00::/7 ULA
+                || (s[0] & 0xffc0) == 0xfe80                              // fe80::/10 link-local
+                || (s[0] & 0xff00) == 0xff00                              // ff00::/8 multicast
+                || (s[0] == 0x2001 && s[1] == 0x0db8)                     // 2001:db8::/32 doc
+                || (s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0)        // 2001:2::/48 benchmarking
+                || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020)          // 2001:20::/28 ORCHIDv2
+                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001)   // 64:ff9b:1::/48 NAT64 local
+                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0); // 100::/64 discard
+            !special
         }
     }
 }
 
 fn is_global_v4(a: &Ipv4Addr) -> bool {
     let o = a.octets();
-    !(a.is_loopback()
-        || a.is_private()
-        || a.is_link_local()
-        || a.is_unspecified()
-        || a.is_broadcast()
-        || a.is_documentation()
-        || o[0] == 0 // "this network" 0.0.0.0/8
-        || (o[0] == 100 && (o[1] & 0xc0) == 64)) // CGNAT 100.64.0.0/10
+    let special = o[0] == 0                                  // 0.0.0.0/8 this-network
+        || o[0] == 10                                       // 10/8 private
+        || o[0] == 127                                      // 127/8 loopback
+        || (o[0] == 100 && (o[1] & 0xc0) == 64)             // 100.64/10 CGNAT
+        || (o[0] == 169 && o[1] == 254)                     // 169.254/16 link-local
+        || (o[0] == 172 && (16..=31).contains(&o[1]))       // 172.16/12 private
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)          // 192.0.0/24 IETF protocol
+        || (o[0] == 192 && o[1] == 0 && o[2] == 2)          // 192.0.2/24 TEST-NET-1
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99)        // 192.88.99/24 6to4 relay
+        || (o[0] == 192 && o[1] == 168)                     // 192.168/16 private
+        || (o[0] == 198 && (o[1] == 18 || o[1] == 19))      // 198.18/15 benchmarking
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100)       // 198.51.100/24 TEST-NET-2
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113)        // 203.0.113/24 TEST-NET-3
+        || o[0] >= 224; // 224/4 multicast + 240/4 reserved + 255.255.255.255 broadcast
+    !special
 }
 
 /// Split an http(s) URL into (host, port), bracket-aware for IPv6. The port
@@ -252,32 +270,60 @@ pub fn fetch_vetted(v: &Vetted, dest: &Path) -> bool {
     curl_pinned(&v.url, v, dest, 60)
 }
 
-fn curl_pinned(url: &str, v: &Vetted, dest: &Path, timeout: u32) -> bool {
+/// Every proxy-selecting variable curl consults, in both cases. Scrubbed from
+/// the pinned hop's child env so a proxy cannot re-resolve the host inward.
+const PROXY_VARS: [&str; 10] = [
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "ftp_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "FTP_PROXY",
+    "NO_PROXY",
+];
+
+fn pinned_command(url: &str, v: &Vetted, dest: &Path, timeout: u32) -> Command {
     // `--resolve host:port:ip` pins curl to the address we vetted; NO `-L` and
     // `--max-redirs 0` forbid following a redirect to an unvetted (e.g.
     // loopback) destination — curl will not re-vet, so it must not chase.
-    Command::new("curl")
-        .args([
-            "-fsg",
-            "--max-redirs",
-            "0",
-            "--proto",
-            "=http,https",
-            "--proto-redir",
-            "=http,https",
-            "--resolve",
-            &format!("{}:{}:{}", v.host, v.port, v.ip),
-            "--max-filesize",
-            &MAX_DOWNLOAD_BYTES.to_string(),
-            "--max-time",
-            &timeout.to_string(),
-            "-A",
-            UA,
-            "-o",
-        ])
-        .arg(dest)
-        .arg("--url")
-        .arg(url)
+    // `--noproxy '*'` (plus scrubbing every proxy var from the child env, in
+    // case a curl build ignores the flag) stops a proxy from re-resolving the
+    // host inward and defeating the pin entirely.
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-fsg",
+        "--noproxy",
+        "*",
+        "--max-redirs",
+        "0",
+        "--proto",
+        "=http,https",
+        "--proto-redir",
+        "=http,https",
+        "--resolve",
+        &format!("{}:{}:{}", v.host, v.port, v.ip),
+        "--max-filesize",
+        &MAX_DOWNLOAD_BYTES.to_string(),
+        "--max-time",
+        &timeout.to_string(),
+        "-A",
+        UA,
+        "-o",
+    ])
+    .arg(dest)
+    .arg("--url")
+    .arg(url);
+    for k in PROXY_VARS {
+        cmd.env_remove(k);
+    }
+    cmd
+}
+
+fn curl_pinned(url: &str, v: &Vetted, dest: &Path, timeout: u32) -> bool {
+    pinned_command(url, v, dest, timeout)
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -445,23 +491,110 @@ mod tests {
         );
     }
 
+    /// A proxy env var must not defeat the pin: with a hostile proxy injected
+    /// straight into curl's child env (past the scrub), `--noproxy '*'` keeps
+    /// curl off it — the proxy records ZERO connections and the pinned server
+    /// is reached directly.
+    #[test]
+    fn a_proxy_env_cannot_defeat_the_pin() {
+        let ok = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_string();
+        let (proxy_port, proxy_hits, pjh) = spawn_server(Some(ok.clone()));
+        let (pin_port, pin_hits, sjh) = spawn_server(Some(ok));
+        let v = Vetted {
+            url: format!("http://pin.test:{pin_port}/x"),
+            host: "pin.test".to_string(),
+            port: pin_port,
+            ip: "127.0.0.1".parse().unwrap(),
+        };
+        let dest = std::env::temp_dir().join(format!("theme-proxy-{}", std::process::id()));
+        let proxy = format!("http://127.0.0.1:{proxy_port}");
+        let mut cmd = pinned_command(&v.url, &v, &dest, 5);
+        cmd.env("http_proxy", &proxy)
+            .env("HTTP_PROXY", &proxy)
+            .env("all_proxy", &proxy);
+        let _ = cmd.status();
+        let _ = std::fs::remove_file(&dest);
+        pjh.join().unwrap();
+        sjh.join().unwrap();
+        assert_eq!(
+            proxy_hits.load(Ordering::SeqCst),
+            0,
+            "curl used the proxy despite --noproxy"
+        );
+        assert!(
+            pin_hits.load(Ordering::SeqCst) >= 1,
+            "the pinned server was not reached directly"
+        );
+    }
+
+    /// The belt to `--noproxy`'s suspenders: every proxy var is scrubbed from
+    /// the child env (proven structurally — a curl build ignoring --noproxy
+    /// still sees no proxy variable).
+    #[test]
+    fn the_pinned_command_scrubs_proxy_env() {
+        let v = Vetted {
+            url: "http://pin.test/x".to_string(),
+            host: "pin.test".to_string(),
+            port: 80,
+            ip: "203.0.113.9".parse().unwrap(),
+        };
+        let cmd = pinned_command(&v.url, &v, Path::new("/dev/null"), 5);
+        let removed: Vec<_> = cmd
+            .get_envs()
+            .filter(|(_, val)| val.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for k in PROXY_VARS {
+            assert!(removed.contains(&k.to_string()), "{k} not scrubbed");
+        }
+    }
+
     #[test]
     fn global_ip_predicate() {
-        for ip in ["93.184.216.34", "1.1.1.1", "2606:4700:4700::1111"] {
+        for ip in [
+            "93.184.216.34",
+            "1.1.1.1",
+            "8.8.8.8",
+            "198.20.0.1", // just outside the 198.18/15 benchmark block
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+            "::ffff:1.1.1.1", // mapped PUBLIC v4 stays global
+        ] {
             assert!(is_global_ip(&ip.parse().unwrap()), "rejected public {ip}");
         }
         for ip in [
-            "127.0.0.1",
-            "10.0.0.1",
-            "192.168.1.1",
-            "172.16.0.1",
-            "169.254.0.1",
-            "100.64.0.1", // CGNAT
-            "0.0.0.0",
-            "::1",
+            // v4 special-use, one representative per range.
+            "0.0.0.0",         // 0/8
+            "10.0.0.1",        // 10/8
+            "127.0.0.1",       // 127/8
+            "100.64.0.1",      // 100.64/10 CGNAT
+            "169.254.0.1",     // 169.254/16
+            "172.16.0.1",      // 172.16/12
+            "192.0.0.1",       // 192.0.0/24
+            "192.0.2.1",       // 192.0.2/24 TEST-NET-1
+            "192.88.99.1",     // 192.88.99/24
+            "192.168.1.1",     // 192.168/16
+            "198.18.0.1",      // 198.18/15 benchmarking
+            "198.19.0.1",      // 198.18/15 upper half
+            "198.51.100.1",    // 198.51.100/24 TEST-NET-2
+            "203.0.113.1",     // 203.0.113/24 TEST-NET-3
+            "224.0.0.1",       // 224/4 multicast
+            "239.255.255.255", // 224/4 multicast upper
+            "240.0.0.1",       // 240/4 reserved
+            "255.255.255.255", // broadcast
+            // v6 special-use.
+            "::",               // ::/128
+            "::1",              // ::1/128
             "::ffff:127.0.0.1", // mapped loopback
-            "fe80::1",
-            "fc00::1",
+            "::ffff:10.0.0.1",  // mapped private
+            "64:ff9b:1::1",     // NAT64 local
+            "100::1",           // discard-only
+            "2001:db8::1",      // documentation
+            "2001:2::1",        // benchmarking
+            "2001:20::1",       // ORCHIDv2
+            "fe80::1",          // link-local
+            "fc00::1",          // ULA
+            "ff02::1",          // multicast
         ] {
             assert!(
                 !is_global_ip(&ip.parse().unwrap()),
