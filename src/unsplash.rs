@@ -283,11 +283,16 @@ pub fn cmd_unsplash(cfg: &Config, arg: &str, flags: &mut Flags) {
     if !curl_download(&img_url, &tmp, 90) {
         die("photo download failed");
     }
-    let mime = mime_of(&tmp);
+    let mut mime = mime_of(&tmp);
     if !mime.starts_with("image/") {
         die(&format!("Unsplash served {mime}, not an image"));
     }
     flags.apply_transforms(&tmp);
+    if flags.transforms_requested() {
+        // A transform re-encodes (WebP lands as PNG): name the save by the
+        // post-transform bytes — the order cmd_local already uses.
+        mime = mime_of(&tmp);
+    }
     // Name = your search prompt (when given) + the photo's own description.
     // The photographer is credited in the terminal note, not the filename.
     let hint = format!(

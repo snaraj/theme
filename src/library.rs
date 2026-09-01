@@ -185,8 +185,8 @@ pub fn resolve_library(cfg: &Config, name: &str) -> Option<PathBuf> {
     if contained { Some(cand) } else { None }
 }
 
-/// The first library dir a download can land in: it must exist (created if
-/// missing at the configured path's parent existing) and be writable.
+/// The first library dir that exists takes downloads. No creation and no
+/// writability probe here: an unwritable pick fails closed in the saver.
 pub fn download_dir(cfg: &Config) -> &Path {
     for d in &cfg.wallpaper_dirs {
         if d.is_dir() {

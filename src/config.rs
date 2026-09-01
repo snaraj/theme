@@ -1,7 +1,7 @@
 //! Environment-derived configuration, resolved once. The wallpaper library
 //! is a COLON-SEPARATED list of directories (owner fix #5): every listing,
 //! resolution and random pick searches all of them recursively in order, and
-//! downloads land in the first writable one. A single-directory value keeps
+//! downloads land in the first existing one. A single-directory value keeps
 //! its old meaning unchanged.
 
 use crate::ui::die;

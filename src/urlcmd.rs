@@ -61,7 +61,10 @@ fn fetch_best(url: &str, dest: &Path) -> Option<String> {
 pub fn og_meta(html: &str) -> (String, String) {
     let mut image = String::new();
     let mut title = String::new();
-    let lower = html.to_lowercase();
+    // ASCII-only lowercasing: tag/attribute names are ASCII, and unlike
+    // to_lowercase() it is length-preserving, so offsets found in `lower`
+    // stay valid in the original (İ and friends change byte length).
+    let lower = html.to_ascii_lowercase();
     let mut at = 0;
     while let Some(pos) = lower[at..].find("<meta") {
         let start = at + pos;
@@ -86,7 +89,7 @@ pub fn og_meta(html: &str) -> (String, String) {
 }
 
 fn attr(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
+    let lower = tag.to_ascii_lowercase();
     let mut at = 0;
     loop {
         let pos = lower[at..].find(name)? + at;
@@ -115,7 +118,7 @@ pub fn cmd_url(cfg: &Config, link: &str, flags: &mut Flags) {
     }
     flags.source_url = link.to_string();
     let tmp = scratch::new();
-    let mut link = match fetch_best(link, &tmp) {
+    let link = match fetch_best(link, &tmp) {
         Some(served) => served,
         None => die(&format!("download failed: {link}")),
     };
@@ -157,11 +160,13 @@ pub fn cmd_url(cfg: &Config, link: &str, flags: &mut Flags) {
         };
     } else if !mime.starts_with("image/") {
         die(&format!("that URL is {mime}, not an image"));
-    } else {
-        // Direct image: the served URL (post-upgrade) labels the provider.
-        link = link.clone();
     }
     flags.apply_transforms(&tmp);
+    if flags.transforms_requested() {
+        // A transform re-encodes (WebP lands as PNG): name the save by the
+        // post-transform bytes — the order cmd_local already uses.
+        mime = mime_of(&tmp);
+    }
     // Route the download into its provider's subfolder; an unrecognized
     // host keeps the library root.
     let sub = url_host(&link).and_then(|h| host_label(&h)).unwrap_or("");
@@ -182,6 +187,20 @@ mod tests {
         let (i, t) = og_meta(h);
         assert_eq!(i, "https://x/1.jpg");
         assert_eq!(t, "A Title");
+    }
+
+    /// to_lowercase() is not length-preserving (İ grows 2→3 bytes, Å and K
+    /// shrink), so lowercased-copy offsets desynced from the original and
+    /// the tag slice drifted — or split a UTF-8 boundary and panicked. A
+    /// page salted with all three around AND inside the tags must resolve.
+    #[test]
+    fn og_meta_survives_length_changing_lowercase() {
+        let h = "<title>İSTANBUL Å K İİİ</title>\n\
+                 <meta property='og:image' content='https://x/İ-pic.jpg'>\n\
+                 <meta property='og:title' content='Işık Å K'>";
+        let (i, t) = og_meta(h);
+        assert_eq!(i, "https://x/İ-pic.jpg");
+        assert_eq!(t, "Işık Å K");
     }
 
     #[test]

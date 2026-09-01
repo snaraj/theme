@@ -6,7 +6,7 @@
 
 use crate::config::Config;
 use crate::imaging::img_size;
-use crate::ui::{die, note};
+use crate::ui::{die, note, parse_hex6};
 use pigment::{Options, Palette, effective_background};
 use std::fs;
 use std::io::Write;
@@ -190,16 +190,36 @@ impl Terminal for OscTty {
     }
 }
 
+/// Exactly `#rrggbb` — the only line shape the colors file legitimately
+/// holds, and the only shape allowed into an escape sequence.
+fn osc_color(l: &str) -> bool {
+    l.strip_prefix('#').is_some_and(|h| parse_hex6(h).is_some())
+}
+
 fn osc_sequences(colors_file: &str) -> String {
+    // Only lines that parse as a hex color reach the terminal — the gate the
+    // sibling reader of this file (scheme_colors → swatch_row) already
+    // applies. set_palette wrote the file itself moments earlier, but OSC is
+    // a sink the shell never had, so it inherits no parity cover: validate
+    // at the sink.
     let mut out = String::new();
     let lines: Vec<&str> = colors_file.lines().collect();
     for (i, hex) in lines.iter().take(16).enumerate() {
-        out.push_str(&format!("\x1b]4;{i};{hex}\x1b\\"));
+        if osc_color(hex) {
+            out.push_str(&format!("\x1b]4;{i};{hex}\x1b\\"));
+        }
     }
-    if let Some(bg) = lines.first() {
+    if let Some(bg) = lines.first()
+        && osc_color(bg)
+    {
         out.push_str(&format!("\x1b]11;{bg}\x1b\\"));
     }
-    if let Some(fg) = lines.get(16).or_else(|| lines.get(7)) {
+    // The writer emits exactly 16 lines (the derived foreground never lands
+    // in this file), so foreground/cursor take color7 — the conventional
+    // foreground slot.
+    if let Some(fg) = lines.get(7)
+        && osc_color(fg)
+    {
         out.push_str(&format!("\x1b]10;{fg}\x1b\\\x1b]12;{fg}\x1b\\"));
     }
     out

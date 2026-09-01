@@ -492,6 +492,35 @@ okslib="$fixture/subdir-ok"; mkdir -p "$okslib"
 run_url "$okslib" https://images.unsplash.com/fine.png >/dev/null 2>&1
 exists "an ordinary provider folder still receives the download" yes "$okslib/unsplash/fine.png"
 
+# --- a transformed WebP re-encodes as PNG: the mime is re-read AFTER the
+# transform, so the save is named by the actual bytes and the width warning
+# still fires (it reads dimensions by extension). Stub serves a real 6x4 webp.
+webpbin="$fixture/webpbin"
+mkdir -p "$webpbin"
+cat >"$webpbin/curl" <<'EOS'
+#!/bin/bash
+o=""; prev=""
+for a in "$@"; do [ "$prev" = "-o" ] && o="$a"; prev="$a"; done
+[ -n "$o" ] && printf '%s' 'UklGRi4AAABXRUJQVlA4TCIAAAAvBcAAAB8wHkUZ5PmPA4CCRpKa7x1Qh0lMYiOi/wFw9dU/' | base64 -d >"$o"
+exit 0
+EOS
+chmod +x "$webpbin/curl"
+webplib="$fixture/webplib"; mkdir -p "$webplib"
+run_webp() { PATH="$webpbin:$PATH" THEME_WALLPAPER_DIR="$webplib" THEME_NO_APPLY=1 \
+    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" url "$@"; }
+webpout=$(run_webp https://img.invalid/photo.webp --rotate right 2>&1)
+exists "a transformed webp is saved as png"    yes "$webplib/photo-rotated-right.png"
+case "$webpout" in
+*"below the 2560px desktop floor"*) pass "the width warning fires on the post-transform bytes" ;;
+*) fail "the width warning vanished after a webp transform" ;;
+esac
+plainout=$(run_webp https://img.invalid/plain.webp 2>&1)
+exists "an untransformed webp keeps .webp"     yes "$webplib/plain.webp"
+case "$plainout" in
+*"below the 2560px desktop floor"*) pass "the untransformed control warns too" ;;
+*) fail "the untransformed webp control lost its width warning" ;;
+esac
+
 # A world-writable ANCESTOR refuses the save (the whole chain is audited).
 chaindir="$fixture/chain"; mkdir -p "$chaindir/parent/lib"
 chmod 0777 "$chaindir/parent"
