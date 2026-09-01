@@ -39,3 +39,9 @@ image = { version = "0.25", default-features = false, features = [
 # does not expose; rustix is the safe binding that keeps deny(unsafe_code)
 # intact (raw libc would need unsafe in this crate).
 rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
+# `theme update` verifies a release download against SHA256SUMS before it
+# may replace the running binary. In-process (RustCrypto) rather than
+# shelling to shasum/sha256sum: a PATH-resolved tool must not be the
+# integrity check for executable replacement, and the two platform tools
+# differ anyway.
+sha2 = { version = "0.10", default-features = false, features = ["std"] }

@@ -23,6 +23,7 @@ mod save;
 mod scratch;
 mod ui;
 mod unsplash;
+mod update;
 mod urlcmd;
 
 use config::Config;
@@ -135,6 +136,7 @@ fn main() {
             }
             commands::cmd_rm(&cfg, &args[1..]);
         }
+        "update" => update::cmd_update(),
         "version" | "--version" | "-V" => {
             // Compile-time version — no runtime lookups.
             println!(

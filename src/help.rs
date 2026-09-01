@@ -138,6 +138,7 @@ Library Commands:
 
 Info Commands:
   status          current theme, color-scheme swatches, variables
+  update          replace this binary with the latest release (verified)
   version, -V     version, repository, and maintainer
   help            this text (per-command: theme <command> --help)
 
@@ -299,6 +300,21 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
   Examples:
     theme rm albedo-wings-black
     theme rm old-one.jpg other-old-one
+"
+        ),
+        "update" => print!(
+            "theme update
+
+  Check the latest GitHub release (snaraj/theme) and install it over
+  this binary in one step, printing current → new. Already current is
+  a no-op. The download is verified against the release's SHA256SUMS
+  BEFORE anything is installed, and the swap is atomic — the running
+  binary is never left partial or replaced by unverified bytes. If the
+  install location is not writable the command says so and stops;
+  theme never elevates.
+
+  Example:
+    theme update
 "
         ),
         "help" | "" => usage(cfg),

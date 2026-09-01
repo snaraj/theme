@@ -758,7 +758,7 @@ help_run() { # $1 label, $2 TERM_PROGRAM, $3 TERM, $4… theme arguments
     printf '%s\n' "$o" >>"$help_all"
     return 0
 }
-for c in random set unsplash url list preview status rename rm help; do
+for c in random set unsplash url list preview status rename rm update help; do
     help_run "$c--help" TermSAFE xtermSAFE "$c" --help
 done
 help_run help-TERM_PROGRAM "TermSAFE$oscpay" xtermSAFE help
@@ -768,7 +768,7 @@ if [ -n "$help_bad" ]; then
 else pass "no help path emits environment data as terminal protocol"; fi
 help_missing=""
 for marker in 'hlibSAFE' 'TermSAFE' 'xtermSAFE' 'LinuxSAFE' \
-    'Apply Commands' 'theme random' 'theme unsplash' 'theme rm'; do
+    'Apply Commands' 'theme random' 'theme unsplash' 'theme rm' 'never elevates'; do
     grep -qF -- "$marker" "$help_all" || help_missing="$help_missing [$marker]"
 done
 if [ -z "$help_missing" ]; then
@@ -812,6 +812,179 @@ else fail "version output shape drifted: $vout"; fi
 if [ "$(run "$lib" --version 2>&1)" = "$vout" ] && [ "$(run "$lib" -V 2>&1)" = "$vout" ]; then
     pass "--version and -V alias the version command"
 else fail "--version/-V do not match the version output"; fi
+
+# --- update: verify-then-rename self-update against a stubbed GitHub --------
+# The invariant under test: the running binary is NEVER replaced by
+# unverified bytes. A copy of the real binary is the install target; a PATH
+# stub plays the whole GitHub flow (API → 302 → asset host), logging every
+# URL curl is asked for — so "refused" means curl was never spawned at it.
+updd="$fixture/upd"
+mkdir -p "$updd/bin" "$updd/stubbin"
+cur_ver=$(printf '%s\n' "$vout" | sed -n 1p | sed 's/^version: v//')
+case "$(uname -s)-$(uname -m)" in
+Darwin-arm64) triple=aarch64-apple-darwin ;;
+Darwin-x86_64) triple=x86_64-apple-darwin ;;
+Linux-aarch64) triple=aarch64-unknown-linux-gnu ;;
+*) triple=x86_64-unknown-linux-gnu ;;
+esac
+# The release asset shape: a tar.gz holding the single member `theme`
+# (SHA256SUMS digests the TARBALL, exactly as the release workflow builds).
+inner="$updd/inner"
+printf 'NEW-RELEASE-BYTES-%s' "$triple" >"$updd/theme"
+cp "$updd/theme" "$inner"
+payload="$updd/payload.tar.gz"
+tar -czf "$payload" -C "$updd" theme
+rm -f "$updd/theme"
+if command -v sha256sum >/dev/null 2>&1; then
+    paysha=$(sha256sum "$payload" | cut -d' ' -f1)
+else
+    paysha=$(shasum -a 256 "$payload" | cut -d' ' -f1)
+fi
+cat >"$updd/stubbin/curl" <<'EOS'
+#!/bin/bash
+out=""; hdr=""; url=""; k=0
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[$i]}" in
+    -o) out="${args[$((i + 1))]}" ;;
+    -D) hdr="${args[$((i + 1))]}" ;;
+    --url) url="${args[$((i + 1))]}" ;;
+    -K) k=1 ;;
+    esac
+done
+[ "$k" = 1 ] && cat >/dev/null
+printf '%s\n' "$url" >>"$UPD_LOG"
+resp() { printf 'HTTP/2 %s\r\n%s\r\n\r\n' "$1" "$2" >"$hdr"; }
+case "$url" in
+*api.github.com/repos/snaraj/theme/releases/latest*)
+    a="https://github.com/snaraj/theme/releases/download/$UPD_TAG"
+    printf '{"tag_name":"%s","assets":[{"name":"SHA256SUMS","browser_download_url":"%s/SHA256SUMS"},{"name":"theme-%s-%s.tar.gz","browser_download_url":"%s/theme-%s-%s.tar.gz"}]}' \
+        "$UPD_TAG" "$a" "$UPD_TAG" "$UPD_TRIPLE" "$a" "$UPD_TAG" "$UPD_TRIPLE"
+    ;;
+*/releases/download/*/SHA256SUMS*)
+    : >"$out"; resp 302 "location: https://release-assets.githubusercontent.com/sums"
+    ;;
+*release-assets.githubusercontent.com/sums*)
+    cp "$UPD_SUMS_FILE" "$out"; resp 200 "content-type: text/plain"
+    ;;
+*/releases/download/*/theme-*)
+    : >"$out"
+    if [ "${UPD_EVIL:-}" = 1 ]; then
+        resp 302 "location: https://evil.invalid/steal"
+    else
+        resp 302 "location: https://release-assets.githubusercontent.com/bin"
+    fi
+    ;;
+*release-assets.githubusercontent.com/bin*)
+    if [ "${UPD_PARTIAL:-}" = 1 ]; then
+        head -c 8 "$UPD_PAYLOAD" >"$out"
+        resp 200 "content-type: application/octet-stream"
+        exit 23
+    fi
+    if [ "${UPD_BIG:-}" = 1 ]; then
+        dd if=/dev/zero of="$out" bs=1048576 count=101 2>/dev/null
+        resp 200 "content-type: application/octet-stream"
+        exit 0
+    fi
+    cp "$UPD_PAYLOAD" "$out"; resp 200 "content-type: application/octet-stream"
+    ;;
+*evil.invalid*)
+    printf 'EVIL' >"$out"; resp 200 ""
+    ;;
+*) exit 6 ;;
+esac
+exit 0
+EOS
+chmod +x "$updd/stubbin/curl"
+updlog="$updd/log"
+upd_out="$updd/out"
+upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
+    # a $() capture would strand both in a subshell); env pairs as args
+    # rm first: macOS caches code-signing state by inode, and cp -f over a
+    # previously-executed binary poisons it — the next exec dies SIGKILL.
+    rm -f "$updd/bin/theme"
+    cp "$THEME" "$updd/bin/theme"
+    : >"$updlog"
+    env UPD_LOG="$updlog" UPD_TRIPLE="$triple" UPD_PAYLOAD="$payload" \
+        UPD_SUMS_FILE="$updd/sums" PATH="$updd/stubbin:$PATH" \
+        THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
+        THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
+        "$@" "$updd/bin/theme" update >"$upd_out" 2>&1
+    upd_rc=$?
+}
+upd_intact() { # target still byte-identical to the real binary, no temp left
+    cmp -s "$THEME" "$updd/bin/theme" \
+        && [ -z "$(find "$updd/bin" -name '.*update*' 2>/dev/null)" ]
+}
+printf '%s  theme-v9.9.9-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
+
+upd_run UPD_TAG="v$cur_ver"
+if [ "$upd_rc" = 0 ] && grep -qF "already up to date (v$cur_ver)" "$upd_out"; then
+    pass "an up-to-date binary short-circuits"
+else fail "same-version update did not short-circuit: $(cat "$upd_out")"; fi
+if [ "$(wc -l <"$updlog" | tr -d ' ')" = 1 ]; then
+    pass "the short-circuit downloads no asset"
+else fail "same-version update still transferred: $(cat "$updlog")"; fi
+
+upd_run UPD_TAG=v9.9.9
+if [ "$upd_rc" = 0 ] && grep -qF "theme v$cur_ver → v9.9.9" "$upd_out"; then
+    pass "update prints current → new"
+else fail "update success output drifted: $(cat "$upd_out")"; fi
+if cmp -s "$inner" "$updd/bin/theme" && [ -x "$updd/bin/theme" ]; then
+    pass "the target holds exactly the verified member bytes, executable"
+else fail "installed bytes differ from the release payload"; fi
+if [ -z "$(find "$updd/bin" -name '.*update*' 2>/dev/null)" ]; then
+    pass "no install temp file survives success"
+else fail "an install temp file was left beside the binary"; fi
+
+printf '%064d  theme-v9.9.9-%s.tar.gz\n' 0 "$triple" >"$updd/sums"
+upd_run UPD_TAG=v9.9.9
+if [ "$upd_rc" != 0 ] && grep -q 'SHA256 verification FAILED' "$upd_out"; then
+    pass "a corrupted hash is refused"
+else fail "corrupted hash not refused: $(cat "$upd_out")"; fi
+if upd_intact; then
+    pass "the corrupted download never touched the binary"
+else fail "unverified bytes reached the install target"; fi
+
+printf '%s  theme-v9.9.9-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
+upd_run UPD_TAG=v9.9.9 UPD_EVIL=1
+if [ "$upd_rc" != 0 ] && grep -q 'refusing non-GitHub download host' "$upd_out"; then
+    pass "a redirect off GitHub's hosts is refused"
+else fail "foreign redirect host not refused: $(cat "$upd_out")"; fi
+if ! grep -q 'evil.invalid' "$updlog" && upd_intact; then
+    pass "the foreign host was never contacted and the binary is intact"
+else fail "curl was spawned at the foreign host or the binary changed"; fi
+
+upd_run UPD_TAG=v9.9.9 UPD_PARTIAL=1
+if [ "$upd_rc" != 0 ] && upd_intact; then
+    pass "an interrupted download leaves the binary untouched"
+else fail "a partial download reached the install path: $(cat "$upd_out")"; fi
+
+# A digest-VALID tarball that holds no `theme` member: verification passes,
+# the unpack must still refuse and leave the target alone.
+printf 'IMPOSTOR' >"$updd/not-theme"
+badtar="$updd/badtar.tar.gz"
+tar -czf "$badtar" -C "$updd" not-theme
+rm -f "$updd/not-theme"
+if command -v sha256sum >/dev/null 2>&1; then
+    badsha=$(sha256sum "$badtar" | cut -d' ' -f1)
+else
+    badsha=$(shasum -a 256 "$badtar" | cut -d' ' -f1)
+fi
+printf '%s  theme-v9.9.9-%s.tar.gz\n' "$badsha" "$triple" >"$updd/sums"
+upd_run UPD_TAG=v9.9.9 UPD_PAYLOAD="$badtar"
+if [ "$upd_rc" != 0 ] && grep -q "no 'theme' binary" "$upd_out" && upd_intact; then
+    pass "a verified archive without the binary is refused"
+else fail "member-less archive not refused: $(cat "$upd_out")"; fi
+printf '%s  theme-v9.9.9-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
+
+upd_run UPD_TAG=v9.9.9 UPD_BIG=1
+if [ "$upd_rc" != 0 ] && grep -q 'byte cap' "$upd_out" && upd_intact; then
+    pass "an oversized download is refused before install"
+else fail "oversized download not refused: $(cat "$upd_out")"; fi
+if [ -z "$(find "$fixture/tmpdir" -type f -name 'theme.*' 2>/dev/null)" ]; then
+    pass "update leaves no scratch residue on any path"
+else fail "update left scratch files behind"; fi
 
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILURES"; fi
 [ "$fails" -eq 0 ]
