@@ -44,6 +44,21 @@ pub fn timestamp() -> String {
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cfg = Config::from_env();
+    // `update` owns its argv end-to-end: its grammar parses the RAW argv,
+    // BEFORE the global flag pass could swallow anything, and --version
+    // exists for no other command — every other verb refuses it like any
+    // unknown flag, pre-mutation, in the dispatch validation below.
+    if argv.first().map(String::as_str) == Some("update") {
+        let (want_help, version_sel) = main_flags::parse_update(&argv[1..]);
+        if want_help {
+            let code = help::usage_cmd(&cfg, "update");
+            scratch::cleanup();
+            std::process::exit(code);
+        }
+        update::cmd_update(&cfg, &version_sel);
+        scratch::cleanup();
+        return;
+    }
     let mut flags = main_flags::parse(&argv);
     let args = std::mem::take(&mut flags.args);
 
@@ -136,7 +151,6 @@ fn main() {
             }
             commands::cmd_rm(&cfg, &args[1..]);
         }
-        "update" => update::cmd_update(&cfg, &flags.version_sel),
         "version" | "--version" | "-V" => {
             // Compile-time version — no runtime lookups.
             println!(

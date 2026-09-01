@@ -2,7 +2,7 @@
 //! flag-free — the shell dispatch's loop, typed.
 
 use crate::imaging::{extend_image, rotate_image};
-use crate::ui::die;
+use crate::ui::{die, display_text};
 use std::path::Path;
 
 #[derive(Default)]
@@ -14,9 +14,45 @@ pub struct Flags {
     pub desktop_only: bool,
     pub wallpaper: String,
     pub source_url: String,
-    /// `update --version <v>`: the requested release, empty = latest.
-    pub version_sel: String,
     pub args: Vec<String>,
+}
+
+/// `theme update`'s OWN argv grammar, parsed from the RAW argv — the global
+/// flag pass never runs for update, so nothing can swallow a typo before
+/// refusal, and `--version` exists for NO other command (a destructive verb
+/// handed `--version` refuses it like any unknown flag, before any side
+/// effect — Codex round 3). Accepted: zero or one `--version <v>` /
+/// `--version=<v>`, `-h`/`--help`. Anything else — positional or flag —
+/// refuses HERE, before any network call. Returns (want_help, version_sel).
+pub fn parse_update(rest: &[String]) -> (bool, String) {
+    let mut help = false;
+    let mut version = String::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        let value = match a.as_str() {
+            "-h" | "--help" => {
+                help = true;
+                continue;
+            }
+            "--version" => match it.next().filter(|v| !v.starts_with('-')) {
+                Some(v) => v.clone(),
+                None => die("--version takes a release version like v0.1.0"),
+            },
+            s if s.starts_with("--version=") => s["--version=".len()..].to_string(),
+            s => die(&format!(
+                "unknown argument '{}' for 'theme update' — try: theme update --help",
+                display_text(s)
+            )),
+        };
+        if value.is_empty() {
+            die("--version takes a release version like v0.1.0");
+        }
+        if !version.is_empty() {
+            die("theme update takes one --version at most");
+        }
+        version = value;
+    }
+    (help, version)
 }
 
 pub fn parse(argv: &[String]) -> Flags {
@@ -27,7 +63,6 @@ pub fn parse(argv: &[String]) -> Flags {
     let mut want_rotate = false;
     let mut want_n = false;
     let mut want_w = false;
-    let mut want_version = false;
     let mut list_n_raw = String::from("10");
     for a in argv {
         if want_rotate {
@@ -43,11 +78,6 @@ pub fn parse(argv: &[String]) -> Flags {
         if want_w {
             f.wallpaper = a.clone();
             want_w = false;
-            continue;
-        }
-        if want_version {
-            f.version_sel = a.clone();
-            want_version = false;
             continue;
         }
         match a.as_str() {
@@ -67,13 +97,6 @@ pub fn parse(argv: &[String]) -> Flags {
             s if s.starts_with("--wallpaper=") => {
                 f.wallpaper = s["--wallpaper=".len()..].to_string();
             }
-            // Leading `--version` is the version-command alias (falls
-            // through to args); AFTER a command token it is `update`'s
-            // release selector.
-            "--version" if !f.args.is_empty() => want_version = true,
-            s if s.starts_with("--version=") && !f.args.is_empty() => {
-                f.version_sel = s["--version=".len()..].to_string();
-            }
             _ => f.args.push(a.clone()),
         }
     }
@@ -85,9 +108,6 @@ pub fn parse(argv: &[String]) -> Flags {
     }
     if want_w {
         die("--wallpaper takes a wallpaper name");
-    }
-    if want_version {
-        die("--version takes a release version like v0.1.0");
     }
     if !matches!(f.rotate.as_str(), "" | "left" | "right") {
         die("--rotate takes left or right");

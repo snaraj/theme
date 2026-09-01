@@ -1107,6 +1107,39 @@ if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ]; then
     pass "a dangling --version refuses before any network"
 else fail "dangling --version was not refused: $(cat "$upd_out")"; fi
 
+# --- --version exists for update ONLY; update's grammar is strict ----------
+# (Codex round 3: the flag was consumed globally, so `rm victim --version x`
+# deleted the victim. Now every other verb refuses it pre-mutation, and any
+# residual update token refuses before a single transfer.)
+png1x1 "$lib/vic-flag.png" 1 2 3
+vic_sum=$(cksum <"$lib/vic-flag.png")
+check "rm refuses a foreign --version flag"      1 run "$lib" rm vic-flag --version v9.9.9
+if [ -f "$lib/vic-flag.png" ] && [ "$(cksum <"$lib/vic-flag.png")" = "$vic_sum" ]; then
+    pass "the rm victim survives byte-identical"
+else fail "rm mutated despite the refused flag"; fi
+check "rename refuses a foreign --version flag"  1 run "$lib" rename vic-flag renamed-vic --version v9.9.9
+if [ -f "$lib/vic-flag.png" ] && [ ! -e "$lib/renamed-vic.png" ] \
+   && [ "$(cksum <"$lib/vic-flag.png")" = "$vic_sum" ]; then
+    pass "the rename victim is untouched and no destination appeared"
+else fail "rename mutated despite the refused flag"; fi
+rm -f "$lib/vic-flag.png"
+upd_run UPD_TAG=v9.9.9 -- extraneous
+if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ]; then
+    pass "a residual update positional refuses with zero transfers"
+else fail "update accepted a stray positional: $(cat "$upd_out")"; fi
+upd_run UPD_TAG=v9.9.9 -- --rotate left
+if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ]; then
+    pass "a global flag is unknown to update and spawns zero transfers"
+else fail "update accepted --rotate: $(cat "$upd_out")"; fi
+upd_run UPD_TAG=v9.9.9 -- --version=
+if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ]; then
+    pass "an empty --version value refuses with zero transfers"
+else fail "update accepted an empty --version: $(cat "$upd_out")"; fi
+upd_run UPD_TAG=v9.9.9 -- --version 1.0.0 --version 2.0.0
+if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ]; then
+    pass "a duplicate --version refuses with zero transfers"
+else fail "update accepted duplicate --version: $(cat "$upd_out")"; fi
+
 upd_run UPD_TAG=v9.9.9 -- --version 0.0.0
 if grep -q 'warning: older versions may be unsupported or break — proceeding to v0.0.0' "$upd_out"; then
     pass "a downgrade warns at launch and proceeds"
