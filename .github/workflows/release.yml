@@ -52,11 +52,9 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
-      - run: |
-          for f in theme-*.tar.gz; do
-            mv "$f" "${f/theme-/theme-$GITHUB_REF_NAME-}"
-          done
-          sha256sum theme-*.tar.gz > SHA256SUMS
+      # Asset names stay version-free: `releases/latest/download/<name>`
+      # needs a stable name, and the release itself carries the version.
+      - run: sha256sum theme-*.tar.gz > SHA256SUMS
       - env:
           GH_TOKEN: ${{ github.token }}
         run: >
