@@ -45,3 +45,8 @@ rustix = { version = "1", default-features = false, features = ["fs", "process",
 # integrity check for executable replacement, and the two platform tools
 # differ anyway.
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
+# Same principle one step further down the chain: the release tarball is
+# unpacked in-process (pure-Rust gzip; the strict single-member tar walk is
+# in-house) so no PATH-resolved tar can sit between the verified bytes and
+# the installed binary.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

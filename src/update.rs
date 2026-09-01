@@ -450,17 +450,159 @@ fn verify_file(path: &Path, expect_hex: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A reader that refuses to yield more than `left` bytes in total — the
+/// ceiling on everything consumed FROM THE DECOMPRESSOR, the
+/// decompression-bomb backstop behind the per-member header check.
+struct Capped<R> {
+    inner: R,
+    left: u64,
+}
+
+impl<R: Read> Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.left == 0 {
+            return Err(std::io::Error::other("decompressed byte cap exceeded"));
+        }
+        let want = buf.len().min(self.left as usize);
+        let n = self.inner.read(&mut buf[..want])?;
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Octal field of a tar header: leading spaces/NULs tolerated, digits,
+/// terminated by space/NUL. Anything else — including GNU base-256 — is
+/// None.
+fn parse_octal(field: &[u8]) -> Option<u64> {
+    let mut v: u64 = 0;
+    let mut seen = false;
+    for &b in field {
+        match b {
+            b'0'..=b'7' => {
+                seen = true;
+                v = v.checked_mul(8)?.checked_add((b - b'0') as u64)?;
+            }
+            b' ' | 0 => {
+                if seen {
+                    break;
+                }
+            }
+            _ => return None,
+        }
+    }
+    seen.then_some(v)
+}
+
+/// The strict single-member tar walk, in-process — NOTHING PATH-resolved
+/// touches the verified-bytes-to-installed-bytes chain (the round-2
+/// finding that moved extraction in-house; the same principle that picked
+/// sha2 over a shelled shasum). The release chain ships exactly one shape,
+/// probed on the real v0.1.0 asset (bsdtar- and GNU-built alike): one
+/// plain ustar header named `theme`, typeflag '0', empty prefix, data,
+/// zero padding, zero end blocks. This reader accepts exactly that:
+///   - EXACTLY one member — a regular file named `theme` at the root;
+///   - duplicates, links, directories, pax/GNU extension entries, long
+///     names, base-256 sizes: refused (a duplicate is a nonzero byte where
+///     only zeros may remain, so concatenation is impossible by
+///     construction);
+///   - the header checksum must verify, the member size must fit `cap`,
+///     and every padding/trailing byte to EOF must be zero.
+///
+/// Streams the member into `out` and returns its byte count. The caller
+/// wraps `r` in [`Capped`], which bounds TOTAL decompressed consumption.
+fn unpack_single_member<R: Read>(r: &mut R, out: &mut impl Write, cap: u64) -> Result<u64, String> {
+    let shape =
+        |what: &str| format!("the verified archive is not a single 'theme' binary ({what})");
+    let mut hdr = [0u8; 512];
+    let mut filled = 0usize;
+    while filled < 512 {
+        let n = r
+            .read(&mut hdr[filled..])
+            .map_err(|e| format!("read failed mid-unpack: {e}"))?;
+        if n == 0 {
+            return Err(shape("truncated archive"));
+        }
+        filled += n;
+    }
+    if hdr.iter().all(|&b| b == 0) {
+        return Err(shape("empty archive"));
+    }
+    let stored = parse_octal(&hdr[148..156]).ok_or_else(|| shape("unreadable header checksum"))?;
+    let sum: u64 = hdr
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            if (148..156).contains(&i) {
+                0x20
+            } else {
+                b as u64
+            }
+        })
+        .sum();
+    if sum != stored {
+        return Err(shape("header checksum mismatch"));
+    }
+    let name_end = hdr[..100].iter().position(|&b| b == 0).unwrap_or(100);
+    if &hdr[..name_end] != b"theme" {
+        return Err(shape("member is not 'theme'"));
+    }
+    // A ustar prefix would relocate the member into a subdirectory.
+    if hdr[345..500].iter().any(|&b| b != 0) {
+        return Err(shape("member is not at the archive root"));
+    }
+    if hdr[156] != b'0' && hdr[156] != 0 {
+        return Err(shape("member is not a regular file"));
+    }
+    let size = parse_octal(&hdr[124..136]).ok_or_else(|| shape("unreadable member size"))?;
+    if size > cap {
+        return Err(shape("member exceeds the byte cap"));
+    }
+    let mut left = size;
+    let mut buf = [0u8; 64 * 1024];
+    while left > 0 {
+        let want = buf.len().min(left as usize);
+        let n = r
+            .read(&mut buf[..want])
+            .map_err(|e| format!("read failed mid-unpack: {e}"))?;
+        if n == 0 {
+            return Err(shape("truncated member data"));
+        }
+        out.write_all(&buf[..n])
+            .map_err(|e| format!("write failed mid-install: {e}"))?;
+        left -= n as u64;
+    }
+    // Block padding, end-of-archive marker, blocking-factor padding: all of
+    // it must be zeros to EOF. A second member's header is a nonzero byte
+    // here — duplicates refuse instead of concatenating.
+    loop {
+        let n = r
+            .read(&mut buf)
+            .map_err(|e| format!("read failed mid-unpack: {e}"))?;
+        if n == 0 {
+            return Ok(size);
+        }
+        if buf[..n].iter().any(|&b| b != 0) {
+            return Err(shape("trailing entries after the member"));
+        }
+    }
+}
+
 /// Unpack-then-rename. The release asset is a tar.gz holding the single
 /// member `theme` (the release workflow's `tar -C … theme`); its digest was
 /// verified against SHA256SUMS before this runs, and between verification
 /// and unpack it sits in the 0700 scratch directory — the same
-/// no-other-principal custody every save in this tool relies on. tar
-/// streams the member (`-xzOf`) STRAIGHT into a fresh temp file opened
-/// O_CREAT|O_EXCL 0755 in the TARGET'S own directory (same filesystem), so
-/// there is no intermediate extracted file; only a clean tar exit with
-/// non-empty output earns fsync + the atomic rename(2) over the target.
-/// Any failure unlinks the temp and the target is untouched — there is no
-/// window where it is partial or unverified.
+/// no-other-principal custody every save in this tool relies on. The
+/// gzip layer is in-process (flate2, pure Rust) and the tar layer is
+/// [`unpack_single_member`], which streams the member STRAIGHT into a
+/// fresh temp file opened O_CREAT|O_EXCL 0755 in the TARGET'S own
+/// directory (same filesystem) — no intermediate file, no external
+/// process; only a clean strict-shape unpack with non-empty output earns
+/// fsync + the atomic rename(2) over the target. Any failure unlinks the
+/// temp and the target is untouched — there is no window where it is
+/// partial or unverified.
 fn install_over(target: &Path, tarball: &Path) -> Result<(), String> {
     let dir = target.parent().ok_or("install target has no directory")?;
     let name = target
@@ -488,46 +630,27 @@ fn install_over(target: &Path, tarball: &Path) -> Result<(), String> {
         let _ = rustix::fs::unlinkat(&dirfd, tmp_name.as_str(), rustix::fs::AtFlags::empty());
     };
 
-    let mut tar = match Command::new("tar")
-        .arg("-xzOf")
-        .arg(tarball)
-        .arg("theme")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
+    let src = match File::open(tarball) {
+        Ok(f) => f,
         Err(e) => {
             sweep();
-            return Err(format!("cannot run tar: {e}"));
+            return Err(format!("cannot reread the download: {e}"));
         }
     };
-    let mut out = tar.stdout.take().expect("piped stdout");
-    let mut total: u64 = 0;
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = match out.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                let _ = tar.kill();
-                let _ = tar.wait();
-                sweep();
-                return Err(format!("read failed mid-unpack: {e}"));
-            }
-        };
-        total += n as u64;
-        if let Err(e) = tmp.write_all(&buf[..n]) {
-            let _ = tar.kill();
-            let _ = tar.wait();
+    let mut capped = Capped {
+        inner: flate2::read::GzDecoder::new(src),
+        left: MAX_DOWNLOAD_BYTES,
+    };
+    let total = match unpack_single_member(&mut capped, &mut tmp, MAX_DOWNLOAD_BYTES) {
+        Ok(n) => n,
+        Err(e) => {
             sweep();
-            return Err(format!("write failed mid-install: {e}"));
+            return Err(e);
         }
-    }
-    let tar_ok = tar.wait().map(|s| s.success()).unwrap_or(false);
-    if !tar_ok || total == 0 {
+    };
+    if total == 0 {
         sweep();
-        return Err("the verified archive holds no 'theme' binary — refusing to install".into());
+        return Err("the verified archive is not a single 'theme' binary (empty member)".into());
     }
     if let Err(e) = tmp.sync_all() {
         sweep();
@@ -662,22 +785,16 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
     }
 
     /// A tar.gz shaped like the release asset: one member, named `member`,
-    /// holding `bytes`.
+    /// holding `bytes`. Built from raw blocks — a LOCAL macOS tar would add
+    /// AppleDouble/pax entries for this machine's provenance xattrs, which
+    /// the strict walker rightly refuses; the shipped shape (probed on the
+    /// real v0.1.0 asset) is the plain single-entry form raw_tar emits.
     fn tarball(dir: &Path, member: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let src = dir.join(member);
-        std::fs::write(&src, bytes).unwrap();
         let tb = dir.join("asset.tar.gz");
-        let ok = Command::new("tar")
-            .arg("-czf")
-            .arg(&tb)
-            .arg("-C")
-            .arg(dir)
-            .arg(member)
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok, "test tarball creation failed");
-        std::fs::remove_file(&src).unwrap();
+        let mut enc =
+            flate2::write::GzEncoder::new(File::create(&tb).unwrap(), flate2::Compression::fast());
+        enc.write_all(&raw_tar(&[(member, bytes, b'0')])).unwrap();
+        enc.finish().unwrap();
         tb
     }
 
@@ -718,9 +835,140 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
         std::fs::write(&target, b"OLD").unwrap();
         let tb = tarball(&d, "not-theme", b"WRONG-MEMBER");
         let err = install_over(&target, &tb).unwrap_err();
-        assert!(err.contains("no 'theme' binary"), "got: {err}");
+        assert!(err.contains("not a single 'theme' binary"), "got: {err}");
         assert_eq!(std::fs::read(&target).unwrap(), b"OLD");
         assert_eq!(dotfiles_beside(&d), 0, "the temp was swept");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Hand-rolled tar bytes — the hostile shapes no real tar will write.
+    fn raw_header(name: &str, size: u64, typ: u8) -> [u8; 512] {
+        let mut h = [0u8; 512];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        h[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+        h[156] = typ;
+        let sum: u64 = h
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| {
+                if (148..156).contains(&i) {
+                    0x20
+                } else {
+                    b as u64
+                }
+            })
+            .sum();
+        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        h
+    }
+
+    fn raw_tar(entries: &[(&str, &[u8], u8)]) -> Vec<u8> {
+        let mut t = Vec::new();
+        for (name, data, typ) in entries {
+            t.extend_from_slice(&raw_header(name, data.len() as u64, *typ));
+            t.extend_from_slice(data);
+            t.resize(t.len().div_ceil(512) * 512, 0);
+        }
+        t.resize(t.len() + 1024, 0);
+        t
+    }
+
+    fn walk(tar: &[u8], cap: u64) -> Result<(u64, Vec<u8>), String> {
+        let mut out = Vec::new();
+        let mut capped = Capped {
+            inner: std::io::Cursor::new(tar),
+            left: cap,
+        };
+        unpack_single_member(&mut capped, &mut out, cap).map(|n| (n, out))
+    }
+
+    #[test]
+    fn the_walker_accepts_exactly_the_shipped_shape() {
+        let (n, out) = walk(&raw_tar(&[("theme", b"BINARY-BYTES", b'0')]), 1 << 20).unwrap();
+        assert_eq!(n, 12);
+        assert_eq!(out, b"BINARY-BYTES");
+        // Old-style regular typeflag (NUL) is the one tolerated variant.
+        assert!(walk(&raw_tar(&[("theme", b"X", 0)]), 1 << 20).is_ok());
+    }
+
+    #[test]
+    fn duplicate_members_refuse_not_concatenate() {
+        let err = walk(
+            &raw_tar(&[("theme", b"FIRST", b'0'), ("theme", b"SECOND", b'0')]),
+            1 << 20,
+        )
+        .unwrap_err();
+        assert!(err.contains("trailing entries"), "got: {err}");
+    }
+
+    #[test]
+    fn non_regular_and_extension_members_refuse() {
+        for typ in *b"125xgL" {
+            let err = walk(&raw_tar(&[("theme", b"X", typ)]), 1 << 20).unwrap_err();
+            assert!(err.contains("not a regular file"), "typ {typ}: {err}");
+        }
+    }
+
+    #[test]
+    fn foreign_names_and_prefixes_refuse() {
+        for name in ["notme", "./theme", "theme2", "a/theme"] {
+            let err = walk(&raw_tar(&[(name, b"X", b'0')]), 1 << 20).unwrap_err();
+            assert!(err.contains("is not 'theme'"), "name {name}: {err}");
+        }
+        let mut t = raw_tar(&[("theme", b"X", b'0')]);
+        t[345] = b'a'; // ustar prefix relocates the member — recompute sum
+        let sum: u64 = t[..512]
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| {
+                if (148..156).contains(&i) {
+                    0x20
+                } else {
+                    b as u64
+                }
+            })
+            .sum();
+        t[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        let err = walk(&t, 1 << 20).unwrap_err();
+        assert!(err.contains("archive root"), "got: {err}");
+    }
+
+    #[test]
+    fn a_tampered_header_refuses() {
+        let mut t = raw_tar(&[("theme", b"X", b'0')]);
+        t[0] = b'T'; // name edit without checksum fix
+        let err = walk(&t, 1 << 20).unwrap_err();
+        assert!(err.contains("checksum mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn the_caps_bound_member_and_total_alike() {
+        // Header claims more than the cap: refused before a byte is read.
+        let err = walk(&raw_tar(&[("theme", b"OVERSIZED", b'0')]), 4).unwrap_err();
+        assert!(err.contains("byte cap"), "got: {err}");
+        // A bomb hiding PAST the member (endless zero tail) trips the
+        // TOTAL-consumption cap inside the zeros-to-EOF scan.
+        let mut t = raw_tar(&[("theme", b"OK", b'0')]);
+        let tail = t.len() + (1 << 20);
+        t.resize(tail, 0);
+        let err = walk(&t, 4096).unwrap_err();
+        assert!(err.contains("cap exceeded"), "got: {err}");
+        // Trailing NONZERO garbage refuses as shape, not as cap.
+        let mut t = raw_tar(&[("theme", b"OK", b'0')]);
+        t.push(b'!');
+        let err = walk(&t, 1 << 20).unwrap_err();
+        assert!(err.contains("trailing entries"), "got: {err}");
+    }
+
+    #[test]
+    fn an_empty_member_never_installs() {
+        let d = tempdir();
+        let target = d.join("theme");
+        std::fs::write(&target, b"OLD").unwrap();
+        let tb = tarball(&d, "theme", b"");
+        let err = install_over(&target, &tb).unwrap_err();
+        assert!(err.contains("empty member"), "got: {err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"OLD");
         let _ = std::fs::remove_dir_all(&d);
     }
 

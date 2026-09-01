@@ -834,11 +834,27 @@ Linux-aarch64) triple=aarch64-unknown-linux-gnu ;;
 esac
 # The release asset shape: a tar.gz holding the single member `theme`
 # (SHA256SUMS digests the TARBALL, exactly as the release workflow builds).
+# Local macOS tar would add AppleDouble/pax entries for this machine's
+# provenance xattrs — entries the strict in-process walker rightly refuses
+# and the real runner-built assets don't have — so members are stripped and
+# archived with COPYFILE_DISABLE, reproducing the shipped shape.
+# python tarfile in USTAR format: byte-exact plain headers, arcname = the
+# path's basename, symlinks preserved as entries. (macOS provenance xattrs
+# are SIP-protected — local bsdtar smuggles them in no matter what.)
+mktar() { # $1 out.tar.gz  $2 srcdir  $3… member paths relative to srcdir
+    python3 - "$@" <<'PY'
+import os, sys, tarfile
+out, d, *members = sys.argv[1:]
+with tarfile.open(out, 'w:gz', format=tarfile.USTAR_FORMAT) as t:
+    for m in members:
+        t.add(os.path.join(d, m), arcname=os.path.basename(m), recursive=False)
+PY
+}
 inner="$updd/inner"
 printf 'NEW-RELEASE-BYTES-%s' "$triple" >"$updd/theme"
 cp "$updd/theme" "$inner"
 payload="$updd/payload.tar.gz"
-tar -czf "$payload" -C "$updd" theme
+mktar "$payload" "$updd" theme
 rm -f "$updd/theme"
 if command -v sha256sum >/dev/null 2>&1; then
     paysha=$(sha256sum "$payload" | cut -d' ' -f1)
@@ -922,6 +938,7 @@ upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
     cp "$THEME" "$updd/bin/theme"
     : >"$updlog"
     env UPD_LOG="$updlog" UPD_TRIPLE="$triple" UPD_PAYLOAD="$payload" \
+        UPD_TAR_MARKER="$updd/tar-ran" \
         UPD_SUMS_FILE="$updd/sums" PATH="$updd/stubbin:$PATH" \
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
@@ -980,7 +997,7 @@ else fail "a partial download reached the install path: $(cat "$upd_out")"; fi
 # the unpack must still refuse and leave the target alone.
 printf 'IMPOSTOR' >"$updd/not-theme"
 badtar="$updd/badtar.tar.gz"
-tar -czf "$badtar" -C "$updd" not-theme
+mktar "$badtar" "$updd" not-theme
 rm -f "$updd/not-theme"
 if command -v sha256sum >/dev/null 2>&1; then
     badsha=$(sha256sum "$badtar" | cut -d' ' -f1)
@@ -989,9 +1006,66 @@ else
 fi
 printf '%s  theme-%s.tar.gz\n' "$badsha" "$triple" >"$updd/sums"
 upd_run UPD_TAG=v9.9.9 UPD_PAYLOAD="$badtar"
-if [ "$upd_rc" != 0 ] && grep -q "no 'theme' binary" "$upd_out" && upd_intact; then
+if [ "$upd_rc" != 0 ] && grep -q "not a single 'theme' binary" "$upd_out" && upd_intact; then
     pass "a verified archive without the binary is refused"
 else fail "member-less archive not refused: $(cat "$upd_out")"; fi
+printf '%s  theme-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
+
+# --- the archive shape is enforced IN-PROCESS (Codex round-2 findings) -----
+# A PATH-planted tar must not be able to influence the installed bytes —
+# extraction is in-process now, so the stub must NEVER EVEN RUN.
+cat >"$updd/stubbin/tar" <<'EOS'
+#!/bin/sh
+: >"$UPD_TAR_MARKER"
+printf 'EVIL-TAR-BYTES'
+exit 0
+EOS
+chmod +x "$updd/stubbin/tar"
+rm -f "$updd/tar-ran"
+upd_run UPD_TAG=v9.9.9
+if [ "$upd_rc" = 0 ] && cmp -s "$inner" "$updd/bin/theme" && [ ! -e "$updd/tar-ran" ]; then
+    pass "a PATH-planted tar never executes and cannot touch the install"
+else fail "PATH tar influenced the install (marker: $([ -e "$updd/tar-ran" ] && echo ran))"; fi
+
+# Duplicate members concatenated FIRST+SECOND under the old extractor —
+# now any second entry refuses.
+mkdir -p "$updd/dupa" "$updd/dupb"
+printf 'FIRST' >"$updd/dupa/theme"
+printf 'SECOND' >"$updd/dupb/theme"
+duptar="$updd/dup.tar.gz"
+mktar "$duptar" "$updd" dupa/theme dupb/theme
+dupsha=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum "$duptar"; else shasum -a 256 "$duptar"; fi | cut -d' ' -f1)
+printf '%s  theme-%s.tar.gz\n' "$dupsha" "$triple" >"$updd/sums"
+upd_run UPD_TAG=v9.9.9 UPD_PAYLOAD="$duptar"
+if [ "$upd_rc" != 0 ] && grep -q "not a single 'theme' binary" "$upd_out" && upd_intact; then
+    pass "a duplicate-member archive refuses instead of concatenating"
+else fail "dup-member archive not refused: $(cat "$upd_out")"; fi
+
+# A symlink member (digest-valid) must refuse as a non-regular file.
+mkdir -p "$updd/lnk"
+ln -sf /etc/passwd "$updd/lnk/theme"
+lnktar="$updd/lnk.tar.gz"
+mktar "$lnktar" "$updd" lnk/theme
+lnksha=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum "$lnktar"; else shasum -a 256 "$lnktar"; fi | cut -d' ' -f1)
+printf '%s  theme-%s.tar.gz\n' "$lnksha" "$triple" >"$updd/sums"
+upd_run UPD_TAG=v9.9.9 UPD_PAYLOAD="$lnktar"
+if [ "$upd_rc" != 0 ] && grep -q "not a single 'theme' binary" "$upd_out" && upd_intact; then
+    pass "a link member refuses as non-regular"
+else fail "symlink member not refused: $(cat "$upd_out")"; fi
+
+# An uncompressed size over the cap (tiny gzip, 101MiB member) refuses at
+# the header, before a byte lands anywhere.
+mkdir -p "$updd/big"
+dd if=/dev/zero of="$updd/big/theme" bs=1048576 count=101 2>/dev/null
+bigtar="$updd/big.tar.gz"
+mktar "$bigtar" "$updd/big" theme
+rm -rf "$updd/big"
+bigsha=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum "$bigtar"; else shasum -a 256 "$bigtar"; fi | cut -d' ' -f1)
+printf '%s  theme-%s.tar.gz\n' "$bigsha" "$triple" >"$updd/sums"
+upd_run UPD_TAG=v9.9.9 UPD_PAYLOAD="$bigtar"
+if [ "$upd_rc" != 0 ] && grep -q 'byte cap' "$upd_out" && upd_intact; then
+    pass "an over-cap uncompressed member refuses with the target intact"
+else fail "decompression bomb not refused: $(cat "$upd_out")"; fi
 printf '%s  theme-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
 
 upd_run UPD_TAG=v9.9.9 UPD_BIG=1
