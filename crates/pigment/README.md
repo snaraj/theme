@@ -83,15 +83,20 @@ structural, not tuning: pigment spawns zero subprocesses and clusters a
 ≤128×128 grid, where wallrust shells out to ImageMagick ~52 times per
 uncached run and clusters at full resolution.
 
-**Color.** Same 16-slot output shape; three behaviors neither wallrust nor
-pywal has: deterministic palettes (seeded k-means++ — the same bytes and
-options reproduce the same palette), hue-archetype mapping so ANSI 1-6 chase
-their conventional hue instead of duplicating neighbours, and the
-blend-aware contrast floor — text held readable against the *effective*
-background a translucent terminal actually shows. One idea flows the other
-way and is used here with attribution: the fixed accent-curve ladder and the
-dark/light sort on correct WCAG relative luminance descend from wallrust,
-© prime-run, MIT license.
+**Color.** Same 16-slot output shape; two behaviors neither wallrust nor
+pywal has: hue-archetype mapping so ANSI 1-6 chase their conventional hue
+instead of duplicating neighbours, and the blend-aware contrast floor —
+text held readable against the *effective* background a translucent
+terminal actually shows. Determinism is a contract here, not a lucky
+behavior: the k-means++ is seeded in-house and invariant-tested — gold-file
+tests pin the palette, independent of any external binary version. wallrust
+reproduces palettes only as an undocumented accident of the installed
+ImageMagick build (an IM upgrade can silently shift every palette; nothing
+there tests or pins it), and pywal not at all on its randomly-initialised
+colorz-class backends. One idea flows the other way and is used here with
+attribution: the fixed accent-curve ladder and the dark/light sort on
+correct WCAG relative luminance descend from wallrust, © prime-run, MIT
+license.
 
 **Security and safety.** One audited runtime dependency (`image`, exactly
 the `THEME_FORMATS` codecs) vs wallrust's 14. Content-sniffed decode bounded
