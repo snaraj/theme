@@ -25,6 +25,11 @@ money, never trade away security.
   Co-Authored-By trailers, ever.
 - Low code volume: deletion outranks addition; every diff is judged first on
   how little it adds.
+- **A BEHIND PR is never repaired with GitHub "Update branch".** This repo
+  enforces linear history AND required signatures together, so merge mode
+  breaks one and rebase mode force-pushes and sheds the other. Re-cut
+  instead: fresh branch from current main, cherry-pick without `-x`,
+  supersede the old PR; its remote branch is deleted only by the owner.
 
 ## Review
 
@@ -41,6 +46,7 @@ money, never trade away security.
 - Identity: `Samuel Naranjo <39077795+snaraj@users.noreply.github.com>`,
   SSH-signed per command with the registered signing key; GitHub must report
   `verified=true, reason=valid` on every commit before Ready.
+- Commit bodies, like PR bodies, end with the acting lane's signature.
 
 ## CI and releases
 
@@ -48,14 +54,19 @@ money, never trade away security.
   wall-clock; actions SHA-pinned with truthful version comments; workflow
   token stays read-only.
 - Releases are immutable `v*.*.*` tags cut from main (ruleset-enforced: no
-  update, no delete, no force-push). One release slot: parallel Drafts each
-  claim base+1; declared merge order resolves who re-cuts.
+  update, no delete, no force-push). One release slot, anchored by the tag
+  ledger itself: a Draft claims the next unpublished `vX.Y.Z`; parallel
+  Drafts each claim base+1, and declared merge order resolves who re-cuts.
 
 ## Code rules
 
 - Rust stable, `cargo fmt --all --check`, `clippy -D warnings`, tests green —
-  the same gate CI runs, executed locally before every push.
-- `#![deny(unsafe_code)]` in every crate; exceptions need an owner ruling.
+  the same gate CI runs, executed locally before every push. Both gitleaks
+  scan modes run before push: that is the named backstop for the
+  no-credentials rule below.
+- `#![deny(unsafe_code)]` in every crate, wired as workspace lints so the
+  gate enforces it (the code PR that adds a crate adds the lint table);
+  exceptions need an owner ruling.
 - The `pigment` crate emits strings and files only — it never touches a
   terminal, socket, or the desktop. Only the CLI applies state, and only
   through the documented paths (kitty socket `set-colors`, wallpaper tool,
