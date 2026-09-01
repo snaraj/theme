@@ -69,19 +69,46 @@ the cached path — what `theme list`/`preview`/repeat-`set` actually hit — is
 five orders of magnitude faster than a pywal invocation, which pays ~100 ms
 of interpreter startup before any work.
 
-## Why not wallrust?
+## vs wallrust, measured
 
 [prime-run/wallrust](https://github.com/prime-run/wallrust) (MIT) was the
-study reference. It is a CLI orchestrator, not an engine: every analysis step
-shells out to ImageMagick (~52 subprocess spawns per uncached run measured on
-defaults), k-means runs on the full-resolution image, and the 2,163-line tree
-carries zero tests and 14 runtime dependencies. Two ideas were worth
-deriving, with thanks: the fixed accent-curve ladder (our bright-variant
-step) and sorting by correct WCAG relative luminance. Everything else here is
-independent implementation.
+study reference. The comparison sticks to three axes and to what was
+measured; what pigment does not have is listed as dropped, not spun.
 
-Attribution: the accent-ladder concept and dark/light sort flow descend from
-wallrust, © prime-run, MIT license — see the repository above.
+**Speed.** Same real 4K JPEG, same machine (Apple Silicon), every tool
+uncached with caches wiped between runs — hyperfine, 8 runs: pigment
+177.5 ms, the pywal ladder 1.184 s (6.7× slower), wallrust 16.73 s (94×
+slower); per-stage criterion numbers are in the table above. The gap is
+structural, not tuning: pigment spawns zero subprocesses and clusters a
+≤128×128 grid, where wallrust shells out to ImageMagick ~52 times per
+uncached run and clusters at full resolution.
+
+**Color.** Same 16-slot output shape; three behaviors neither wallrust nor
+pywal has: deterministic palettes (seeded k-means++ — the same bytes and
+options reproduce the same palette), hue-archetype mapping so ANSI 1-6 chase
+their conventional hue instead of duplicating neighbours, and the
+blend-aware contrast floor — text held readable against the *effective*
+background a translucent terminal actually shows. One idea flows the other
+way and is used here with attribution: the fixed accent-curve ladder and the
+dark/light sort on correct WCAG relative luminance descend from wallrust,
+© prime-run, MIT license.
+
+**Security and safety.** One audited runtime dependency (`image`, exactly
+the `THEME_FORMATS` codecs) vs wallrust's 14. Content-sniffed decode bounded
+at 512 MiB allocation and 16,384 px per edge. No template engine, so no
+shell-expanded template-directed filesystem writes (wallrust's `{# output:
+… #}` directives write to arbitrary expanded paths). Subprocess-free, so no
+exit-status masking (wallrust treats a `magick` run whose stderr contains
+"warning:" as success). `unsafe_code = "deny"` enforced from the workspace
+lint table. 33 tests vs 0.
+
+**Deliberately dropped, not improved on:** wallrust's tera templating
+breadth (arbitrary user templates), HTML palette preview, and Hyprland
+detection. The CLI this engine serves needs none of them; if that changes,
+they are features to build, not gaps that were closed.
+
+**Size, told with the tests in:** 1,795 lines of Rust including all tests,
+benches, and the example harness, vs wallrust's 2,163 with zero tests.
 
 ## Dependencies
 
@@ -90,8 +117,8 @@ png, webp, gif, bmp, tiff) is the sole runtime dependency — decoding hostile
 image bytes is precisely where a fuzzed, widely-audited crate beats in-house
 code.
 `criterion` is dev-only. Everything else — PRNG, k-means, color math, WCAG
-contrast, FNV cache keys, emitters — is in-house (~1,700 lines including all
-tests and benches; wallrust is 2,163 with neither).
+contrast, FNV cache keys, emitters — is in-house (1,795 lines including all
+tests, benches, and the example harness).
 
 ## Invariants the tests pin
 
