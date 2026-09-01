@@ -250,11 +250,13 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
         "preview" => print!(
             "theme preview [name | -w <name>]
 
-  One wallpaper up close, styled like the list: a larger picture on the
-  left (kitty only; skipped elsewhere) and the labeled facts on the
-  right — title, location (~/path), source, size — plus a larger render
-  of its colorscheme. With no name it previews the CURRENT wallpaper; a
-  name (positional or -w/--wallpaper, truncated titles welcome) previews
+  One wallpaper up close: a picture (kitty only; skipped elsewhere) above
+  every fact the file actually has — title, artist, published date,
+  camera, place, license, source, format, size — empty fields are
+  omitted, never rendered blank. Long values wrap under their own
+  column. Colorscheme swatches and the location (~/path) close the
+  block. With no name it previews the CURRENT wallpaper; a name
+  (positional or -w/--wallpaper, truncated titles welcome) previews
   that one.
 
   Examples:

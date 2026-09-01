@@ -88,6 +88,22 @@ pub fn wall_source(path: &Path) -> String {
     s.split(['/', ':']).next().unwrap_or("").to_string()
 }
 
+/// One `theme.*` metadata xattr, read back defensively: it holds UNTRUSTED
+/// bytes (an API record persisted at download time), so control bytes are
+/// stripped and the length capped again on the way out — the write-side gate
+/// in `record_meta` is not trusted to have run.
+fn wall_meta(path: &Path, key: &str) -> String {
+    let raw = Command::new("xattr")
+        .args(["-p", key])
+        .arg(path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    display_text(&raw).chars().take(512).collect()
+}
+
 /// The first 8 palette colors a wallpaper derives, from the pigment scheme
 /// cache — a cache read, never an image reprocess. No cached entry (or a
 /// corrupt one) is a silent None: the caller renders a dash.
@@ -467,49 +483,73 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "-".into());
 
-    // Values must FIT the right-hand column — a wrapped line lands at column
-    // 0 and shreds the block. LOCATION gets its own full-width line below.
-    let cols = columns();
-    let availw = cols.saturating_sub(22 + 13).max(12);
-    let name = truncate_ellipsis(&name, availw);
-    let src = truncate_ellipsis(&src, availw);
+    // Every field that HAS a value, and none that don't: an empty field is
+    // omitted, never rendered blank.
+    let mut fields: Vec<(&str, String)> = vec![("TITLE", name)];
+    for (label, key) in [
+        ("ARTIST", "theme.artist"),
+        ("PUBLISHED", "theme.published"),
+        ("CAMERA", "theme.camera"),
+        ("PLACE", "theme.place"),
+        ("LICENSE", "theme.license"),
+    ] {
+        let v = wall_meta(&img, key);
+        if !v.is_empty() {
+            fields.push((label, v));
+        }
+    }
+    if src != "-" {
+        fields.push(("SOURCE", src));
+    }
+    if let Some(ext) = img.extension().and_then(|e| e.to_str()) {
+        fields.push(("FORMAT", ext.to_lowercase()));
+    }
     let dims_disp = if dims.is_empty() {
         "?".to_string()
     } else {
         dims
     };
-    let rlines = [
-        String::new(),
-        format!("{:<12} {}", "TITLE", name),
-        format!("{:<12} {}", "SOURCE", src),
-        format!("{:<12} {dims_disp} ({bytes})", "SIZE"),
-        String::new(),
-        "COLORSCHEME".to_string(),
-        sw,
-        String::new(),
-    ];
-    match render_preview(&img, 18, 8) {
-        Some(p) => {
-            print!("{}", p.apc);
-            for i in 0..8 {
-                let line = p
-                    .rows
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("{:<18}", ""));
-                println!(
-                    "  {line}  {}",
-                    rlines.get(i).map(String::as_str).unwrap_or("")
-                );
-            }
+    fields.push(("SIZE", format!("{dims_disp} ({bytes})")));
+
+    // Thumbnail above, fields below — stacked, so a long value can never
+    // interleave with the image rows; values wrap with a hanging indent.
+    let cols = columns();
+    if let Some(p) = render_preview(&img, 24, 10) {
+        print!("{}", p.apc);
+        for r in &p.rows {
+            println!("  {r}");
         }
-        None => {
-            for line in &rlines {
-                println!("  {line}");
-            }
+        println!();
+    }
+    for (label, value) in &fields {
+        for line in wrap_field(label, value, cols) {
+            println!("{line}");
         }
     }
-    println!("  {:<12} {loc}", "LOCATION");
+    println!("  {:<12} {sw}", "COLORSCHEME");
+    for line in wrap_field("LOCATION", &loc, cols) {
+        println!("{line}");
+    }
+}
+
+/// One metadata line, wrapped at the terminal edge with a hanging indent to
+/// the value column — the invariant is that a wrapped value can never
+/// visually merge with the next label's line.
+fn wrap_field(label: &str, value: &str, cols: usize) -> Vec<String> {
+    let width = cols.saturating_sub(15).max(12);
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() || i == 0 {
+        let chunk: String = chars[i..(i + width).min(chars.len())].iter().collect();
+        if i == 0 {
+            out.push(format!("  {label:<12} {chunk}"));
+        } else {
+            out.push(format!("  {:<12} {chunk}", ""));
+        }
+        i += width;
+    }
+    out
 }
 
 /// The 16 colors of the active scheme: the pigment cache, or whatever other

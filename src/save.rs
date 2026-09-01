@@ -33,6 +33,22 @@ pub enum Saved {
 }
 
 /// The user-facing save: extension from the CONTENT type, slugified name
+/// Record one provenance fact as a `theme.*` xattr, best-effort (the same
+/// mechanism as `theme.source`). The value is UNTRUSTED (an API record):
+/// control bytes are stripped and the length capped BEFORE it persists, and a
+/// dash-leading value is refused outright so it can never read as an `xattr`
+/// option.
+pub fn record_meta(path: &Path, key: &str, value: &str) {
+    let clean: String = crate::ui::display_text(value).chars().take(256).collect();
+    if clean.is_empty() || clean.starts_with('-') {
+        return;
+    }
+    let _ = Command::new("xattr")
+        .args(["-w", key, &clean])
+        .arg(path)
+        .output();
+}
+
 /// hint, provenance xattr, size note and the small-width warning. Returns
 /// the settled library path.
 pub fn save_wallpaper(

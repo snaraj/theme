@@ -84,6 +84,11 @@ struct Photo {
     download_location: String,
     who: String,
     premium: bool,
+    /// Capture-time metadata the FILE will not carry (CDNs strip EXIF):
+    /// persisted as theme.* xattrs at save time so preview can render it.
+    published: String,
+    camera: String,
+    place: String,
 }
 
 /// The shell's UNSPLASH_PY, minus the NUL transport it needed: candidates
@@ -141,6 +146,37 @@ fn parse_photo(json: &Json) -> Option<Photo> {
             .and_then(|u| u.str_field("name"))
             .unwrap_or("")
             .to_string(),
+        published: best
+            .str_field("created_at")
+            .map(|s| s.chars().take(10).collect()) // the date half of the ISO stamp
+            .unwrap_or_default(),
+        camera: {
+            let ex = best.get("exif");
+            let mk = ex.and_then(|e| e.str_field("make")).unwrap_or("");
+            let md = ex.and_then(|e| e.str_field("model")).unwrap_or("");
+            if md.starts_with(mk) {
+                md.to_string() // many models repeat the make; don't double it
+            } else {
+                format!("{mk} {md}").trim().to_string()
+            }
+        },
+        place: best
+            .get("location")
+            .map(|l| {
+                let name = l.str_field("name").unwrap_or("");
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+                let city = l.str_field("city").unwrap_or("");
+                let country = l.str_field("country").unwrap_or("");
+                [city, country]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
         img_url,
         premium,
     })
@@ -307,6 +343,13 @@ pub fn cmd_unsplash(cfg: &Config, arg: &str, flags: &mut Flags) {
     );
     let saved = save_wallpaper(cfg, &tmp, &mime, &hint, "unsplash", &flags.source_url);
     scratch::done(&tmp);
+    // The served file carries no EXIF (the CDN strips it) — persist the
+    // capture-time facts as theme.* xattrs so preview can render them.
+    crate::save::record_meta(&saved, "theme.artist", &photo.who);
+    crate::save::record_meta(&saved, "theme.published", &photo.published);
+    crate::save::record_meta(&saved, "theme.camera", &photo.camera);
+    crate::save::record_meta(&saved, "theme.place", &photo.place);
+    crate::save::record_meta(&saved, "theme.license", "Unsplash License");
     // Unsplash API guideline: report the download so the photographer is
     // credited. --url draws an explicit boundary so the (validated) target
     // can never be read as another curl option.

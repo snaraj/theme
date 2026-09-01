@@ -191,16 +191,22 @@ check  "same stem across dirs refuses rm"       1 run "$multi" rm dupname
 exists "first-dir dupname intact"               yes "$lib/dupname.png"
 exists "second-dir dupname intact"              yes "$lib2/dupname.png"
 
-# --- right-column values are BOUNDED and control-sanitized ------------------
+# --- long values WRAP with a hanging indent — never merging with a label ----
 png1x1 "$lib/long-src.png" 0 0 0
 xattr -w theme.source "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bb.invalid/x" "$lib/long-src.png" 2>/dev/null
 pv_out=$(COLUMNS=60 run_nokitty "$lib" preview long-src 2>/dev/null)
-if printf '%s' "$pv_out" | grep -q 'SOURCE       aaaaaaaaaaaaaaaaaaaaaaaa…'; then
-    pass "preview truncates a long source (fallback layout)"
-else fail "preview fallback layout leaked a long source"; fi
-if printf '%s' "$pv_out" | grep -q 'aaaaaaaaaaaaaaaaaaaaaaaaa'; then
-    fail "preview fallback layout exceeded the column bound"
-else pass "no over-length source run in fallback layout"; fi
+if printf '%s' "$pv_out" | grep -q '^  SOURCE       aaaa'; then
+    pass "the long source starts in the value column"
+else fail "the long source lost its label line"; fi
+if printf '%s' "$pv_out" | grep -q '^               nvalid$'; then
+    pass "the wrapped remainder carries the hanging indent"
+else fail "a wrapped value landed outside the value column"; fi
+if printf '%s\n' "$pv_out" | awk 'length($0) > 60 { exit 1 }'; then
+    pass "no preview line exceeds the terminal width"
+else fail "a preview line overran COLUMNS"; fi
+if printf '%s' "$pv_out" | grep -q '^a'; then
+    fail "a wrapped value merged into column 0 (the wrap-tangle)"
+else pass "no wrapped value ever reaches column 0"; fi
 lv_out=$(COLUMNS=100 run_nokitty "$lib" list -v --all 2>/dev/null)
 if printf '%s' "$lv_out" | grep -q 'aaaaaaaaa…  png'; then
     pass "list -v bounds the SOURCE field"
@@ -211,6 +217,27 @@ pv_out=$(COLUMNS=80 run_nokitty "$lib" preview ctrl-src 2>/dev/null)
 if printf '%s' "$pv_out" | grep -q 'SOURCE       badlineirl'; then
     pass "control bytes in the source xattr are stripped"
 else fail "control bytes reached the preview table"; fi
+
+# --- OWNER: only populated fields render; hostile metadata xattrs are inert -
+png1x1 "$lib/bare-meta.png" 5 5 5
+pv_out=$(COLUMNS=80 run_nokitty "$lib" preview bare-meta 2>/dev/null)
+if printf '%s' "$pv_out" | grep -qE '^  (ARTIST|PUBLISHED|CAMERA|PLACE|LICENSE)'; then
+    fail "an empty metadata field rendered for a bare file"
+else pass "empty metadata fields are omitted, not rendered blank"; fi
+if printf '%s' "$pv_out" | grep -q '^  TITLE        bare-meta' \
+   && printf '%s' "$pv_out" | grep -q '^  SIZE' \
+   && printf '%s' "$pv_out" | grep -q '^  LOCATION'; then
+    pass "a bare file still renders its filesystem facts"
+else fail "preview lost a filesystem fact on a bare file"; fi
+xattr -w theme.artist "$(printf 'Ev\033]52;c;steal\ail Artist')" "$lib/bare-meta.png" 2>/dev/null
+pv_out=$(COLUMNS=80 run_nokitty "$lib" preview bare-meta 2>/dev/null)
+if printf '%s' "$pv_out" | grep -qF "$(printf '\033]')"; then
+    fail "a metadata xattr smuggled terminal protocol into preview"
+else pass "hostile metadata cannot emit terminal protocol"; fi
+if printf '%s' "$pv_out" | grep -q '^  ARTIST       Ev]52;c;stealil Artist$'; then
+    pass "the sanitized artist value still renders"
+else fail "the artist metadata line was lost or mangled"; fi
+rm -f "$lib/bare-meta.png"
 rm -f "$lib/long-src.png" "$lib/ctrl-src.png" "$lib/dupname.png" "$lib2/dupname.png"
 
 # --- list -v outside kitty must still render -------------------------------
