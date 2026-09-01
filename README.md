@@ -45,7 +45,7 @@ theme random | set <name> | unsplash [query|page-url] | url <link>
 theme list | preview [-w] <name> | status | version | rename | rm
 ```
 
-`--rotate left|right`, `--extend [hex]`, and `--desktop-only` (wallpaper
+`--rotate left|right`, `--extend[=hex]`, and `--desktop-only` (wallpaper
 without recoloring the terminal) are accepted anywhere.
 
 ## Terminals
