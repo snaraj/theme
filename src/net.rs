@@ -128,16 +128,63 @@ pub fn is_public_http(url: &str) -> bool {
     }
 }
 
+/// The IANA IPv6 global-unicast ALLOCATED rows, as (first 32 bits, prefix
+/// length ≤ 32) — snapshot fetched 2026-09-01 from
+/// <https://www.iana.org/assignments/ipv6-unicast-address-assignments/ipv6-unicast-address-assignments.csv>.
+///
+/// Maintenance contract: this table mirrors the registry's ALLOCATED rows
+/// only. IANA reserves everything it does not list, so a stale table can only
+/// OVER-REJECT a future allocation (a parity bug to fix by refreshing from the
+/// CSV) — it can never admit reserved space. `2002::/16` (6to4, allocated) is
+/// deliberately absent: the code judges it by its embedded v4 before the table.
+const V6_ALLOCATED: [(u32, u32); 35] = [
+    (0x2001_0000, 23), // IANA — special-purpose; excluded again after the table
+    (0x2001_0200, 23), // APNIC
+    (0x2001_0400, 23), // ARIN
+    (0x2001_0600, 23), // RIPE NCC
+    (0x2001_0800, 22), // RIPE NCC
+    (0x2001_0c00, 23), // APNIC (contains 2001:db8::/32, excluded below)
+    (0x2001_0e00, 23), // APNIC
+    (0x2001_1200, 23), // LACNIC
+    (0x2001_1400, 22), // RIPE NCC
+    (0x2001_1800, 23), // ARIN
+    (0x2001_1a00, 23), // RIPE NCC
+    (0x2001_1c00, 22), // RIPE NCC
+    (0x2001_2000, 19), // RIPE NCC
+    (0x2001_4000, 23), // RIPE NCC
+    (0x2001_4200, 23), // AFRINIC
+    (0x2001_4400, 23), // APNIC
+    (0x2001_4600, 23), // RIPE NCC
+    (0x2001_4800, 23), // ARIN
+    (0x2001_4a00, 23), // RIPE NCC
+    (0x2001_4c00, 23), // RIPE NCC
+    (0x2001_5000, 20), // RIPE NCC
+    (0x2001_8000, 19), // APNIC
+    (0x2001_a000, 20), // APNIC
+    (0x2001_b000, 20), // APNIC
+    (0x2003_0000, 18), // RIPE NCC
+    (0x2400_0000, 12), // APNIC
+    (0x2410_0000, 12), // APNIC
+    (0x2600_0000, 12), // ARIN
+    (0x2610_0000, 23), // ARIN
+    (0x2620_0000, 23), // ARIN
+    (0x2630_0000, 12), // ARIN
+    (0x2800_0000, 12), // LACNIC
+    (0x2a00_0000, 12), // RIPE NCC
+    (0x2a10_0000, 12), // RIPE NCC
+    (0x2c00_0000, 12), // AFRINIC
+];
+
 /// True only for a globally-routable unicast address (the stdlib `is_global`
 /// is nightly-only). The two halves are structured differently on purpose:
 ///
-/// - **v6 is a positive allowlist with registry exceptions, fail-closed**: an
-///   address is global only inside allocated global-unicast `2000::/3`, minus
-///   the special-use rows within it. Unlisted space (reserved blocks, IANA
-///   dummy prefixes, site-local, ULA, multicast, `::/96`, …) is rejected by
-///   structure, with zero enumeration. This deliberately also rejects a few
-///   exotic globally-reachable prefixes outside `2000::/3` (e.g. NAT64
-///   `64:ff9b::/96`) — no wallpaper CDN lives there.
+/// - **v6 is an allocation-based allowlist, fail-closed**: an address is
+///   global only when it falls inside a currently-ALLOCATED IANA
+///   global-unicast row ([`V6_ALLOCATED`]), minus the non-global
+///   special-purpose rows inside allocated space (`2001::/23` as a disclosed
+///   blanket, `2001:db8::/32`). `2000::/3` is *assignable*, not allocated —
+///   its reserved blocks (`2000::` itself, `2d00::/8` … `3fff::/20`) and all
+///   space outside it are denied because no row lists them.
 /// - **v4 space is fully allocated, so a denylist is sound there** — with the
 ///   two IANA globally-reachable /32 exceptions inside `192.0.0.0/24`.
 ///
@@ -147,31 +194,30 @@ pub fn is_global_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(a) => is_global_v4(a),
         IpAddr::V6(a) => {
-            // ::ffff:0:0/96 — judge by the embedded v4 (outside 2000::/3, so
-            // this must come before the structural gate).
+            // ::ffff:0:0/96 — judge by the embedded v4 (outside every table
+            // row, so this must come first).
             if let Some(v4) = a.to_ipv4_mapped() {
                 return is_global_v4(&v4);
             }
             let s = a.segments();
-            // Fail-closed: anything outside allocated global-unicast 2000::/3
-            // is non-global — no list to fall out of.
-            if (s[0] & 0xe000) != 0x2000 {
-                return false;
-            }
-            if s[0] == 0x2001 && (s[1] & 0xfe00) == 0 {
-                return false; // 2001::/23 IETF protocol assignments (default non-global)
-            }
-            if s[0] == 0x2001 && s[1] == 0x0db8 {
-                return false; // 2001:db8::/32 documentation
-            }
-            if s[0] == 0x3fff && (s[1] & 0xf000) == 0 {
-                return false; // 3fff::/20 documentation
-            }
             if s[0] == 0x2002 {
                 // 2002::/16 6to4 — judged by the embedded v4 destination.
                 let v4 =
                     Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8);
                 return is_global_v4(&v4);
+            }
+            let a32 = (u32::from(s[0]) << 16) | u32::from(s[1]);
+            if !V6_ALLOCATED
+                .iter()
+                .any(|&(prefix, len)| (a32 ^ prefix) >> (32 - len) == 0)
+            {
+                return false; // not in any ALLOCATED row — reserved/future space
+            }
+            if s[0] == 0x2001 && (s[1] & 0xfe00) == 0 {
+                return false; // 2001::/23 IANA special-purpose (disclosed blanket)
+            }
+            if s[0] == 0x2001 && s[1] == 0x0db8 {
+                return false; // 2001:db8::/32 documentation (inside 2001:c00::/23)
             }
             true
         }
@@ -597,18 +643,52 @@ mod tests {
             "203.0.112.255",   // below 203.0.113/24
             "203.0.114.0",     // above 203.0.113/24
             "223.255.255.255", // last before 224/4
-            // v6: inside 2000::/3, outside the special rows.
-            "2000::", // very first address of 2000::/3
-            "2000::1",
-            "2001:200::1",      // first /16 row past 2001::/23
-            "2001:db7:ffff::1", // below 2001:db8::/32
-            "2001:db9::1",      // above 2001:db8::/32
+            // v6: one address inside EVERY currently-ALLOCATED IANA row
+            // (2002::/16 is exercised via its embedded-v4 branch below).
+            "2001:200::1",
+            "2001:400::1",
+            "2001:600::1",
+            "2001:800::1",
+            "2001:c00::1",
+            "2001:e00::1",
+            "2001:1200::1",
+            "2001:1400::1",
+            "2001:1800::1",
+            "2001:1a00::1",
+            "2001:1c00::1",
+            "2001:2000::1",
+            "2001:3fff::1", // last /16 of the 2001:2000::/19 row
+            "2001:4000::1",
+            "2001:4200::1",
+            "2001:4400::1",
+            "2001:4600::1",
+            "2001:4800::1",
+            "2001:4a00::1",
+            "2001:4c00::1",
+            "2001:5000::1",
+            "2001:8000::1",
+            "2001:a000::1",
+            "2001:b000::1",
+            "2003::1",
+            "2400::1",
+            "2410::1",
+            "2600::1",
+            "2610::1",
+            "2620::1",
+            "2630::1",
+            "2800::1",
+            "2a00::1",
+            "2a10::1",
+            "2c00::1",
+            // Real-world anchors (live-AAAA classes: Google, Cloudflare,
+            // Wikimedia, Fastly) and the db8 neighbours (inside 2001:c00::/23).
             "2001:4860:4860::8888",
             "2606:4700:4700::1111",
+            "2620:0:863:ed1a::1",
+            "2a04:4e42:87::313",
+            "2001:db7:ffff::1",
+            "2001:db9::1",
             "2002:101:101::1", // 6to4 embedding public 1.1.1.1
-            "3fff:1000::1",    // first address past 3fff::/20
-            "3fff:ffff::1",    // top /32 of 2000::/3
-            "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // very last of 2000::/3
             "::ffff:1.1.1.1",  // mapped PUBLIC v4 stays global
         ];
         for ip in global {
@@ -667,8 +747,40 @@ mod tests {
             "ff02::1",          // multicast
             "::ffff:127.0.0.1", // mapped loopback
             "::ffff:10.0.0.1",  // mapped private
-            // v6 special rows INSIDE 2000::/3: first and last of each.
-            "2001::", // first of 2001::/23
+            // v6 inside assignable 2000::/3 but NOT in any ALLOCATED row:
+            // the round-5 reproduction and its family, one per RESERVED row,
+            // and the unlisted gaps between allocated rows.
+            "2000::", // reviewer-named: 2000:: itself has no allocation
+            "2000::1",
+            "2004::1",      // unlisted gap after 2003::/18's /16
+            "2003:4000::1", // just past 2003::/18
+            "2100::1",      // unlisted gap
+            "2500::1",      // unlisted gap between 2410::/12 and 2600::/12
+            "2700::1",      // unlisted gap
+            "2900::1",      // unlisted gap
+            "2b00::1",      // unlisted gap
+            "2c10::1",      // just past 2c00::/12
+            "2001:6000::1", // gap between 2001:5000::/20 and 2001:8000::/19
+            "2001:c000::1", // just past 2001:b000::/20
+            "2d00::1",      // RESERVED row
+            "2e00::1",      // RESERVED row
+            "3000::1",      // RESERVED row
+            "3800::1",      // RESERVED row
+            "3c00::1",      // RESERVED row
+            "3e00::1",      // RESERVED row
+            "3f00::1",      // RESERVED row
+            "3f80::1",      // RESERVED row
+            "3fc0::1",      // RESERVED row
+            "3fe0::1",      // RESERVED row
+            "3ff0::1",      // RESERVED row
+            "3ff8::1",      // RESERVED row
+            "3ffc::1",      // RESERVED row
+            "3ffe::1",      // RESERVED row (returned 6bone)
+            "3fff:1000::1", // reviewer-named: unlisted, past the doc /20
+            "3fff:ffff::1", // reviewer-named: unlisted top of the /3
+            "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            // v6 non-global special rows INSIDE allocated space.
+            "2001::", // first of 2001::/23 (IANA special-purpose blanket)
             "2001::1",
             "2001:2::1",                              // benchmarking, inside the /23
             "2001:20::1",                             // ORCHIDv2, inside the /23
@@ -677,7 +789,7 @@ mod tests {
             "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", // last of 2001:db8::/32
             "2002:7f00:1::1",                         // 6to4 embedding loopback 127.0.0.1
             "2002:c0a8:1::1",                         // 6to4 embedding private 192.168.0.1
-            "3fff::",                                 // first of 3fff::/20
+            "3fff::",                                 // documentation 3fff::/20
             "3fff::1",
             "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff", // last of 3fff::/20
         ];
@@ -687,6 +799,33 @@ mod tests {
                 "admitted non-global {ip}"
             );
         }
+    }
+
+    /// Live-DNS sanity for the allocation table's parity risk (over-rejecting
+    /// real space): AAAA records of major CDN/RIR-hosted sites must classify
+    /// global. Ignored in CI — the suite stays hermetic; run locally with
+    /// `cargo test -- --ignored` when the table changes.
+    #[test]
+    #[ignore = "live DNS — local evidence only"]
+    fn live_aaaa_records_classify_global() {
+        let mut seen = 0;
+        for host in [
+            "www.cloudflare.com",
+            "www.google.com",
+            "www.wikipedia.org",
+            "www.fastly.com",
+        ] {
+            let Ok(addrs) = (host, 443).to_socket_addrs() else {
+                continue;
+            };
+            for sa in addrs {
+                if matches!(sa.ip(), IpAddr::V6(_)) {
+                    seen += 1;
+                    assert!(is_global_ip(&sa.ip()), "{host} AAAA {} rejected", sa.ip());
+                }
+            }
+        }
+        assert!(seen > 0, "no AAAA records resolved - no evidence gathered");
     }
 
     #[test]
