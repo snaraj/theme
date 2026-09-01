@@ -25,3 +25,17 @@ workspace = true
 
 [dependencies]
 pigment = { path = "crates/pigment" }
+# Same crate and feature set pigment already pins — transforms, dimension
+# reads and content decodes reuse it rather than shelling to sips/magick.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "webp",
+    "gif",
+    "bmp",
+    "tiff",
+] }
+# The descriptor-bound saver needs openat/O_NOFOLLOW/fstat-by-fd, which std
+# does not expose; rustix is the safe binding that keeps deny(unsafe_code)
+# intact (raw libc would need unsafe in this crate).
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }

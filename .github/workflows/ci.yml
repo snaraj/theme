@@ -15,6 +15,7 @@ concurrency:
 jobs:
   lint-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20 # a hung test must cost minutes of feedback, not 6h
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: cargo fmt --all --check
@@ -22,6 +23,7 @@ jobs:
       - run: cargo test --workspace --locked
   test-macos:
     runs-on: macos-latest
+    timeout-minutes: 20 # a hung test must cost minutes of feedback, not 6h
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: cargo test --workspace --locked
