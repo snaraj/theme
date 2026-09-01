@@ -201,7 +201,8 @@ fn fetch_release(url: &str, max_time: &str) -> Option<Json> {
 /// Speed contract: the note reads one small cache file. At most one
 /// bounded refresh (2s hard cap) runs per [`CHECK_TTL`] window, and the
 /// attempt is stamped even on failure so an offline machine pays it once
-/// per window, not per run.
+/// per window, not per run. Every cache touch — read and stamp alike —
+/// goes through [`check_dir`]'s fail-closed custody.
 pub fn maybe_note(cfg: &Config) {
     let off = std::env::var("THEME_NO_UPDATE_CHECK")
         .map(|v| !v.is_empty())
@@ -209,16 +210,10 @@ pub fn maybe_note(cfg: &Config) {
     if off {
         return;
     }
-    let path = cfg.cache_dir.join("update-check");
-    let fresh = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .map(|t| match std::time::SystemTime::now().duration_since(t) {
-            Ok(age) => age <= CHECK_TTL,
-            // A future mtime reads as fresh, not stale — the failure mode
-            // of a skewed clock must be silence, never a hot loop.
-            Err(_) => true,
-        })
-        .unwrap_or(false);
+    // Custody first: a cache dir that fails the fail-closed audit gets no
+    // read, no stamp, no note — and no network attempt either.
+    let Some(dirfd) = check_dir(cfg) else { return };
+    let (fresh, mut cached) = read_check(&dirfd);
     if !fresh {
         let tag = fetch_release(&format!("{RELEASES_API}/latest"), "2")
             .and_then(|j| {
@@ -227,9 +222,9 @@ pub fn maybe_note(cfg: &Config) {
                     .map(str::to_string)
             })
             .unwrap_or_default();
-        write_check(cfg, &tag);
+        write_check_at(&dirfd, &tag);
+        cached = tag;
     }
-    let cached = std::fs::read_to_string(&path).unwrap_or_default();
     // The cached tag is REMOTE data headed for a terminal: it renders only
     // if it parses as a strict numeric semver triple, and both printed
     // values are RECONSTRUCTED from the parsed numbers — a remote-supplied
@@ -242,17 +237,105 @@ pub fn maybe_note(cfg: &Config) {
     }
 }
 
-/// Stamp the check cache: content is the latest known tag (empty when the
-/// refresh failed), mtime is the attempt time. Write-then-rename so a
-/// concurrent reader never sees a torn value.
-fn write_check(cfg: &Config, tag: &str) {
-    let _ = std::fs::create_dir_all(&cfg.cache_dir);
-    let tmp = cfg
-        .cache_dir
-        .join(format!(".update-check.{}", std::process::id()));
-    if std::fs::write(&tmp, tag).is_ok() {
-        let _ = std::fs::rename(&tmp, cfg.cache_dir.join("update-check"));
+/// Fail-closed custody of the cache directory (Codex round 4): the check
+/// cache is only touched through a directory fd whose fstat proves the dir
+/// is OURS and carries no group/world write bit — audited, never chmodded;
+/// created 0700 when absent. A dir that fails the audit gets NOTHING: no
+/// stamp, no read, no note — silence, exactly like every other failure
+/// mode here. O_NOFOLLOW on the open kills a symlink planted AT the dir
+/// name; the uid check kills an attacker-owned real dir swapped in through
+/// a writable ancestor (they cannot create one owned as us).
+fn check_dir(cfg: &Config) -> Option<rustix::fd::OwnedFd> {
+    let _ = rustix::fs::mkdir(&cfg.cache_dir, Mode::from_raw_mode(0o700));
+    let fd = rustix::fs::open(
+        &cfg.cache_dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .ok()?;
+    let st = rustix::fs::fstat(&fd).ok()?;
+    if st.st_uid != rustix::process::getuid().as_raw() || (st.st_mode as u32) & 0o022 != 0 {
+        return None;
     }
+    Some(fd)
+}
+
+/// Stamp the check cache: content is the latest known tag (empty when the
+/// refresh failed — stamping the failed attempt is the deliberate
+/// anti-thundering choice, one bounded try per TTL window), mtime is the
+/// attempt time. Custody-gated by [`check_dir`].
+fn write_check(cfg: &Config, tag: &str) {
+    if let Some(dirfd) = check_dir(cfg) {
+        write_check_at(&dirfd, tag);
+    }
+}
+
+/// The stamp itself, descriptor-bound like the installer: the temp is
+/// created O_CREAT|O_EXCL|O_NOFOLLOW 0600 THROUGH the audited dirfd (the
+/// pid-predictable name is harmless once no other principal can write the
+/// directory), then renameat replaces the final name — only ever renaming
+/// a file THIS process opened, and replacing whatever entry sat there
+/// (symlink, FIFO) rather than following it.
+fn write_check_at(dirfd: &rustix::fd::OwnedFd, tag: &str) {
+    let tmp = format!(".update-check.{}", std::process::id());
+    let _ = rustix::fs::unlinkat(dirfd, tmp.as_str(), rustix::fs::AtFlags::empty());
+    let Ok(fd) = rustix::fs::openat(
+        dirfd,
+        tmp.as_str(),
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    ) else {
+        return;
+    };
+    let mut f = File::from(fd);
+    if f.write_all(tag.as_bytes()).is_err() {
+        drop(f);
+        let _ = rustix::fs::unlinkat(dirfd, tmp.as_str(), rustix::fs::AtFlags::empty());
+        return;
+    }
+    drop(f);
+    if rustix::fs::renameat(dirfd, tmp.as_str(), dirfd, "update-check").is_err() {
+        let _ = rustix::fs::unlinkat(dirfd, tmp.as_str(), rustix::fs::AtFlags::empty());
+    }
+}
+
+/// The read side of the same custody: the cache file opens through the
+/// audited dirfd with O_NOFOLLOW (a planted symlink refuses) and
+/// O_NONBLOCK (a planted FIFO returns instead of hanging — the save
+/// path's guard), must fstat as a REGULAR file, and is read through a
+/// 256-byte cap. Freshness comes from the opened fd's own metadata, never
+/// a path re-walk. Returns (fresh, content); anything irregular is
+/// (stale, empty) — silent, and healed by the next stamp.
+fn read_check(dirfd: &rustix::fd::OwnedFd) -> (bool, String) {
+    let Ok(fd) = rustix::fs::openat(
+        dirfd,
+        "update-check",
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) else {
+        return (false, String::new());
+    };
+    let f = File::from(fd);
+    let Ok(md) = f.metadata() else {
+        return (false, String::new());
+    };
+    if !md.file_type().is_file() {
+        return (false, String::new());
+    }
+    let fresh = md
+        .modified()
+        .map(|t| match std::time::SystemTime::now().duration_since(t) {
+            Ok(age) => age <= CHECK_TTL,
+            // A future mtime reads as fresh, not stale — the failure mode
+            // of a skewed clock must be silence, never a hot loop.
+            Err(_) => true,
+        })
+        .unwrap_or(false);
+    let mut s = String::new();
+    if f.take(256).read_to_string(&mut s).is_err() {
+        return (fresh, String::new());
+    }
+    (fresh, s)
 }
 
 /// Strict numeric semver: `v<major>.<minor>.<patch>`, ASCII digits only —
@@ -990,21 +1073,93 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
     }
 
     /// Test scratch inside target/ like the save tests — never /tmp, whose
-    /// world-writable ancestry other cases legitimately refuse.
+    /// world-writable ancestry other cases legitimately refuse. A counter
+    /// joins the timestamp: parallel tests can share a clock tick, and a
+    /// name collision lets one test's cleanup delete another's files.
     fn tempdir() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let d = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("test-tmp")
             .join(format!(
-                "upd-{}-{:x}",
+                "upd-{}-{:x}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|t| t.as_nanos())
-                    .unwrap_or(0)
+                    .unwrap_or(0),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn test_cfg(cache: &Path) -> Config {
+        Config {
+            wallpaper_dirs: Vec::new(),
+            wallpaper_dirs_display: String::new(),
+            cache_dir: cache.to_path_buf(),
+            kitty_dir: cache.to_path_buf(),
+            current: cache.join("current-theme.conf"),
+            formats: Vec::new(),
+            contrast: 4.5,
+            no_apply: true,
+        }
+    }
+
+    #[test]
+    fn the_cache_stamp_is_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir();
+        let cache = d.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let victim = d.join("victim");
+        std::fs::write(&victim, b"twenty-four bytes long!!").unwrap();
+        std::os::unix::fs::symlink(&victim, cache.join("update-check")).unwrap();
+        let cfg = test_cfg(&cache);
+        // World-writable dir: custody refuses — nothing written, symlink
+        // untouched, victim byte-identical.
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o777)).unwrap();
+        write_check(&cfg, "v9.9.9");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"twenty-four bytes long!!");
+        assert!(
+            std::fs::symlink_metadata(cache.join("update-check"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        // Owner-only dir: the stamp lands by REPLACING the symlink entry
+        // (renameat), never following it — the victim still untouched.
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_check(&cfg, "v9.9.9");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"twenty-four bytes long!!");
+        let md = std::fs::symlink_metadata(cache.join("update-check")).unwrap();
+        assert!(md.file_type().is_file());
+        assert_eq!(
+            std::fs::read_to_string(cache.join("update-check")).unwrap(),
+            "v9.9.9"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_check_read_never_follows_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir();
+        let cache = d.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let victim = d.join("victim");
+        std::fs::write(&victim, b"v9.9.9").unwrap();
+        std::os::unix::fs::symlink(&victim, cache.join("update-check")).unwrap();
+        let dirfd = check_dir(&test_cfg(&cache)).unwrap();
+        let (fresh, content) = read_check(&dirfd);
+        assert!(!fresh, "a symlinked cache must read as no-data");
+        assert!(
+            content.is_empty(),
+            "the linked file's content must not leak"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Install temp files (`.theme.update.*`) left in the directory —

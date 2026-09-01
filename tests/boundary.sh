@@ -1224,5 +1224,37 @@ if ! grep -qF 'update to the latest' "$note_out" \
     pass "the kill-switch spawns nothing and renders nothing"
 else fail "THEME_NO_UPDATE_CHECK did not disable the check"; fi
 
+# --- the cache stamp is fail-closed (Codex round 4) ------------------------
+# An attacker-writable cache dir with a planted symlink: the old stamp
+# followed it and truncated the victim on a bare help. Now custody refuses
+# the dir outright — no write, no read, no note, no network attempt.
+hostile="$fixture/hostile-cache"
+mkdir -p "$hostile"
+printf 'twenty-four byte victim!' >"$fixture/stamp-victim"
+vic2_sum=$(cksum <"$fixture/stamp-victim")
+ln -s "$fixture/stamp-victim" "$hostile/update-check"
+chmod 777 "$hostile"
+before_ls=$(ls -a "$hostile")
+note_run THEME_CACHE_DIR="$hostile"
+after_ls=$(ls -a "$hostile")
+if [ "$note_rc" = 0 ] && ! grep -qF 'update to the latest' "$note_out" \
+   && [ "$(cksum <"$fixture/stamp-victim")" = "$vic2_sum" ] \
+   && [ "$before_ls" = "$after_ls" ] \
+   && [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ]; then
+    pass "a hostile cache dir is refused: victim intact, dir untouched, zero transfers"
+else fail "hostile cache dir was touched (rc=$note_rc): $(ls -al "$hostile")"; fi
+chmod 700 "$hostile"
+
+# A FIFO planted at the cache name in an otherwise-valid dir must neither
+# hang the bare command nor render — and the next stamp heals it into a
+# regular file by renameat-replacing the entry.
+rm -f "$notecache/update-check"
+mkfifo "$notecache/update-check"
+note_run
+if [ "$note_rc" = 0 ] && ! grep -qF 'update to the latest' "$note_out" \
+   && [ -f "$notecache/update-check" ] && [ ! -p "$notecache/update-check" ]; then
+    pass "a planted FIFO neither hangs nor renders, and the stamp heals it"
+else fail "FIFO at the cache name broke (rc=$note_rc): $(ls -l "$notecache" 2>/dev/null)"; fi
+
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILURES"; fi
 [ "$fails" -eq 0 ]
