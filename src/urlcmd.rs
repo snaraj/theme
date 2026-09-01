@@ -146,14 +146,20 @@ pub fn cmd_url(cfg: &Config, link: &str, flags: &mut Flags) {
         if page_img.is_empty() {
             die("no og:image on that page — pass a direct image URL instead");
         }
-        // The og:image is REMOTE-supplied: it must be a public http(s) target,
-        // never file:, an option-shaped value, or the local/private network.
-        // (curl's --proto guard covers the direct user link; this covers the
-        // page-controlled hop, and rejects loopback the proto guard allows.)
+        // The og:image is REMOTE-supplied. A string check is not enough — curl
+        // resolves the host, so decimal/hex/octal IP spellings and DNS names
+        // that point inward slip past it. Fast-reject the obvious shapes, then
+        // RESOLVE the host ourselves, require every address to be global, and
+        // pin curl to the vetted one (no redirects) so it cannot reach a
+        // destination we did not clear.
         if !crate::net::is_public_http(&page_img) {
             die("that page's og:image is not a public http(s) image URL");
         }
-        if fetch_best(&page_img, &tmp).is_none() {
+        let vetted = match crate::net::vet_untrusted(&page_img) {
+            Ok(v) => v,
+            Err(e) => die(&format!("refusing that page's og:image - {e}")),
+        };
+        if !crate::net::fetch_vetted(&vetted, &tmp) {
             die(&format!("download failed: {page_img}"));
         }
         mime = mime_of(&tmp);

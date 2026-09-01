@@ -540,7 +540,11 @@ case "$url" in
   *page-file*) body="${html}\"file:///etc/hosts\"></head></html>" ;;
   *page-loop*) body="${html}\"http://127.0.0.1/secret.png\"></head></html>" ;;
   *page-opt*)  body="${html}\"-O/tmp/pwned\"></head></html>" ;;
-  *page-ok*)   body="${html}\"https://images.unsplash.com/real.png\"></head></html>" ;;
+  # Decimal spelling of 127.0.0.1: passes the string gate, caught by the
+  # resolve-and-vet (getaddrinfo parses it locally, no network).
+  *page-dec*)  body="${html}\"http://2130706433/secret.png\"></head></html>" ;;
+  # A PUBLIC IP LITERAL keeps this hermetic: vet resolves it without DNS.
+  *page-ok*)   body="${html}\"https://93.184.216.34/real.png\"></head></html>" ;;
   *) [ -n "$o" ] && printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' | base64 -d >"$o"; exit 0 ;;
 esac
 [ -n "$o" ] && printf '%s' "$body" >"$o"
@@ -557,6 +561,13 @@ for kind in file loop opt; do
     *) fail "og:image ($kind) was not refused: $err" ;;
     esac
 done
+# The decimal-IP spelling passes the string gate but the resolve-and-vet
+# rejects the loopback it resolves to — refused, nothing fetched.
+decerr=$(run_ssrf "https://pin.example/page-dec" 2>&1)
+case "$decerr" in
+*"resolves to a non-public address"*) pass "og:image (decimal-IP) refused after resolution" ;;
+*) fail "decimal-IP og:image was not refused: $decerr" ;;
+esac
 if [ "$(find "$ssrflib" -type f 2>/dev/null | wc -l | tr -d ' ')" = 0 ]; then
     pass "no SSRF og:image wrote anything into the library"
 else fail "an SSRF og:image landed a file in the library"; fi
