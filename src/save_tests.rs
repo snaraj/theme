@@ -6,10 +6,43 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 
 fn tmpdir(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("theme-save-{name}-{}", std::process::id()));
+    // Not env::temp_dir(): on Linux runners /tmp is world-writable (1777),
+    // and the saver's ancestor audit — correctly — refuses any library whose
+    // chain contains such a directory. The workspace target/ dir sits on a
+    // user-owned chain wherever the repo is sanely checked out.
+    let d = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/test-tmp")
+        .join(format!("save-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// Deterministic check/use window driver. A FIFO's nonblocking writer open
+/// succeeds exactly when a reader is present — and the saver only reads the
+/// source AFTER the provider directory was opened and validated — so waiting
+/// for that open to succeed, THEN swapping, THEN delivering the bytes puts
+/// the swap inside the window with no sleeps and no races. Gives up after
+/// 10s so a saver that refused early (and so never reads) makes the test
+/// FAIL on its assertions instead of deadlocking a blocked writer.
+fn swap_then_feed(fifo: &Path, swap: impl FnOnce(), bytes: &[u8]) {
+    use rustix::fs::{Mode, OFlags};
+    use std::io::Write;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let fd = loop {
+        match rustix::fs::open(fifo, OFlags::WRONLY | OFlags::NONBLOCK, Mode::empty()) {
+            Ok(fd) => break fd,
+            Err(rustix::io::Errno::NXIO) => {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("fifo writer open: {e}"),
+        }
+    };
+    swap();
+    std::fs::File::from(fd).write_all(bytes).unwrap();
 }
 
 #[test]
@@ -114,10 +147,14 @@ fn mid_save_provider_swap_writes_nothing_outside() {
     let outc = outside.clone();
     let fifoc = fifo.clone();
     let swapper = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        fs::rename(libc.join("unsplash"), libc.join("checked-dir")).unwrap();
-        std::os::unix::fs::symlink(&outc, libc.join("unsplash")).unwrap();
-        fs::write(&fifoc, b"png-bytes").unwrap();
+        swap_then_feed(
+            &fifoc,
+            || {
+                fs::rename(libc.join("unsplash"), libc.join("checked-dir")).unwrap();
+                std::os::unix::fs::symlink(&outc, libc.join("unsplash")).unwrap();
+            },
+            b"png-bytes",
+        );
     });
     let res = save_into(&fifo, &lib, "unsplash", "pic", "png", native_platform());
     swapper.join().unwrap();
@@ -166,10 +203,14 @@ fn reuse_under_a_swap_never_reads_the_attacker_copy() {
     let outc = outside.clone();
     let fifoc = fifo.clone();
     let swapper = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        fs::rename(libc.join("unsplash"), libc.join("checked-dir")).unwrap();
-        std::os::unix::fs::symlink(&outc, libc.join("unsplash")).unwrap();
-        fs::write(&fifoc, b"trusted-bytes").unwrap();
+        swap_then_feed(
+            &fifoc,
+            || {
+                fs::rename(libc.join("unsplash"), libc.join("checked-dir")).unwrap();
+                std::os::unix::fs::symlink(&outc, libc.join("unsplash")).unwrap();
+            },
+            b"trusted-bytes",
+        );
     });
     let res = save_into(&fifo, &lib, "unsplash", "pic", "png", native_platform());
     swapper.join().unwrap();
