@@ -93,12 +93,10 @@ pub fn fetch_img(url: &str, dest: &Path) -> bool {
     curl_download(url, dest, 60)
 }
 
-/// http(s) only, and not aimed at loopback/link-local/private/unspecified.
-/// The gate for URLs supplied by REMOTE metadata (an og:image): a wallpaper
-/// fetch has no business reaching the local host or private network on the
-/// say-so of a downloaded page. Literal-IP and `localhost` targets are
-/// rejected here; a DNS name that resolves inward is left to curl's transport
-/// (we do not resolve, to stay a thin subprocess boundary).
+/// The FAST string gate for remote-metadata URLs: http(s) only, and a literal
+/// IP or `localhost` target must be global. This is the pre-filter with the
+/// clear message — the authoritative check is [`vet_untrusted`], which
+/// resolves the host and vets every address it actually maps to.
 pub fn is_public_http(url: &str) -> bool {
     let Some(rest) = url
         .strip_prefix("http://")
@@ -123,56 +121,70 @@ pub fn is_public_http(url: &str) -> bool {
         return false;
     }
     match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(a)) => {
-            !(a.is_loopback()
-                || a.is_private()
-                || a.is_link_local()
-                || a.is_unspecified()
-                || a.is_broadcast())
-        }
-        Ok(IpAddr::V6(a)) => {
-            let seg0 = a.segments()[0];
-            !(a.is_loopback()
-                || a.is_unspecified()
-                || (seg0 & 0xfe00) == 0xfc00 // unique-local fc00::/7
-                || (seg0 & 0xffc0) == 0xfe80) // link-local fe80::/10
-        }
-        Err(_) => true, // a DNS name — scheme-gated, resolved by curl
+        // One predicate for literals — the same the resolve gate applies, so
+        // the pre-gate cannot be weaker than the authoritative check.
+        Ok(ip) => is_global_ip(&ip),
+        Err(_) => true, // a DNS name — judged by resolve-and-vet, not here
     }
 }
 
-/// True only for a globally-routable unicast address — an allowlist by
-/// exclusion of EVERY IANA special-use range, not a partial denylist (the
-/// stdlib `is_global` is nightly-only). An IPv4-mapped/compatible IPv6 is
-/// judged by the v4 it wraps; the pinned untrusted hop refuses anything else.
+/// True only for a globally-routable unicast address (the stdlib `is_global`
+/// is nightly-only). The two halves are structured differently on purpose:
+///
+/// - **v6 is a positive allowlist with registry exceptions, fail-closed**: an
+///   address is global only inside allocated global-unicast `2000::/3`, minus
+///   the special-use rows within it. Unlisted space (reserved blocks, IANA
+///   dummy prefixes, site-local, ULA, multicast, `::/96`, …) is rejected by
+///   structure, with zero enumeration. This deliberately also rejects a few
+///   exotic globally-reachable prefixes outside `2000::/3` (e.g. NAT64
+///   `64:ff9b::/96`) — no wallpaper CDN lives there.
+/// - **v4 space is fully allocated, so a denylist is sound there** — with the
+///   two IANA globally-reachable /32 exceptions inside `192.0.0.0/24`.
+///
+/// An IPv4-mapped IPv6 (`::ffff:0:0/96`) is judged by the v4 it wraps, as is
+/// a 6to4 address (`2002::/16` — its destination IS the embedded v4).
 pub fn is_global_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(a) => is_global_v4(a),
         IpAddr::V6(a) => {
-            // ::ffff:0:0/96 — judge by the embedded v4.
+            // ::ffff:0:0/96 — judge by the embedded v4 (outside 2000::/3, so
+            // this must come before the structural gate).
             if let Some(v4) = a.to_ipv4_mapped() {
                 return is_global_v4(&v4);
             }
-            // ::/96 (incl. ::, ::1, deprecated IPv4-compatible) — non-global.
-            if a.to_ipv4().is_some() {
+            let s = a.segments();
+            // Fail-closed: anything outside allocated global-unicast 2000::/3
+            // is non-global — no list to fall out of.
+            if (s[0] & 0xe000) != 0x2000 {
                 return false;
             }
-            let s = a.segments();
-            let special = (s[0] & 0xfe00) == 0xfc00                       // fc00::/7 ULA
-                || (s[0] & 0xffc0) == 0xfe80                              // fe80::/10 link-local
-                || (s[0] & 0xff00) == 0xff00                              // ff00::/8 multicast
-                || (s[0] == 0x2001 && s[1] == 0x0db8)                     // 2001:db8::/32 doc
-                || (s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0)        // 2001:2::/48 benchmarking
-                || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020)          // 2001:20::/28 ORCHIDv2
-                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001)   // 64:ff9b:1::/48 NAT64 local
-                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0); // 100::/64 discard
-            !special
+            if s[0] == 0x2001 && (s[1] & 0xfe00) == 0 {
+                return false; // 2001::/23 IETF protocol assignments (default non-global)
+            }
+            if s[0] == 0x2001 && s[1] == 0x0db8 {
+                return false; // 2001:db8::/32 documentation
+            }
+            if s[0] == 0x3fff && (s[1] & 0xf000) == 0 {
+                return false; // 3fff::/20 documentation
+            }
+            if s[0] == 0x2002 {
+                // 2002::/16 6to4 — judged by the embedded v4 destination.
+                let v4 =
+                    Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8);
+                return is_global_v4(&v4);
+            }
+            true
         }
     }
 }
 
 fn is_global_v4(a: &Ipv4Addr) -> bool {
     let o = a.octets();
+    // IANA marks exactly two /32s inside 192.0.0.0/24 globally reachable:
+    // 192.0.0.9 (PCP anycast) and 192.0.0.10 (NAT64/DNS64 discovery).
+    if o == [192, 0, 0, 9] || o == [192, 0, 0, 10] {
+        return true;
+    }
     let special = o[0] == 0                                  // 0.0.0.0/8 this-network
         || o[0] == 10                                       // 10/8 private
         || o[0] == 127                                      // 127/8 loopback
@@ -549,53 +561,127 @@ mod tests {
         }
     }
 
+    /// Both halves of the predicate, with the FIRST and LAST address inside
+    /// every rejected range and the adjacent address outside it — so an
+    /// off-by-one at any boundary fails a named case, not a sampled one.
     #[test]
     fn global_ip_predicate() {
-        for ip in [
+        let global = [
+            // Ordinary public v4.
             "93.184.216.34",
-            "1.1.1.1",
             "8.8.8.8",
-            "198.20.0.1", // just outside the 198.18/15 benchmark block
-            "2606:4700:4700::1111",
+            // v4 boundary neighbours of each rejected range.
+            "1.0.0.0",         // above 0.0.0.0/8
+            "9.255.255.255",   // below 10/8
+            "11.0.0.0",        // above 10/8
+            "100.63.255.255",  // below 100.64/10
+            "100.128.0.0",     // above 100.64/10
+            "126.255.255.255", // below 127/8
+            "128.0.0.0",       // above 127/8
+            "169.253.255.255", // below 169.254/16
+            "169.255.0.0",     // above 169.254/16
+            "172.15.255.255",  // below 172.16/12
+            "172.32.0.0",      // above 172.16/12
+            "192.0.0.9",       // IANA globally-reachable exception (PCP anycast)
+            "192.0.0.10",      // IANA globally-reachable exception (NAT64 disc.)
+            "192.0.1.0",       // between 192.0.0/24 and 192.0.2/24
+            "192.0.3.0",       // above 192.0.2/24
+            "192.88.98.255",   // below 192.88.99/24
+            "192.88.100.0",    // above 192.88.99/24
+            "192.167.255.255", // below 192.168/16
+            "192.169.0.0",     // above 192.168/16
+            "198.17.255.255",  // below 198.18/15
+            "198.20.0.0",      // above 198.18/15
+            "198.51.99.255",   // below 198.51.100/24
+            "198.51.101.0",    // above 198.51.100/24
+            "203.0.112.255",   // below 203.0.113/24
+            "203.0.114.0",     // above 203.0.113/24
+            "223.255.255.255", // last before 224/4
+            // v6: inside 2000::/3, outside the special rows.
+            "2000::", // very first address of 2000::/3
+            "2000::1",
+            "2001:200::1",      // first /16 row past 2001::/23
+            "2001:db7:ffff::1", // below 2001:db8::/32
+            "2001:db9::1",      // above 2001:db8::/32
             "2001:4860:4860::8888",
-            "::ffff:1.1.1.1", // mapped PUBLIC v4 stays global
-        ] {
+            "2606:4700:4700::1111",
+            "2002:101:101::1", // 6to4 embedding public 1.1.1.1
+            "3fff:1000::1",    // first address past 3fff::/20
+            "3fff:ffff::1",    // top /32 of 2000::/3
+            "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // very last of 2000::/3
+            "::ffff:1.1.1.1",  // mapped PUBLIC v4 stays global
+        ];
+        for ip in global {
             assert!(is_global_ip(&ip.parse().unwrap()), "rejected public {ip}");
         }
-        for ip in [
-            // v4 special-use, one representative per range.
-            "0.0.0.0",         // 0/8
-            "10.0.0.1",        // 10/8
-            "127.0.0.1",       // 127/8
-            "100.64.0.1",      // 100.64/10 CGNAT
-            "169.254.0.1",     // 169.254/16
-            "172.16.0.1",      // 172.16/12
-            "192.0.0.1",       // 192.0.0/24
-            "192.0.2.1",       // 192.0.2/24 TEST-NET-1
-            "192.88.99.1",     // 192.88.99/24
-            "192.168.1.1",     // 192.168/16
-            "198.18.0.1",      // 198.18/15 benchmarking
-            "198.19.0.1",      // 198.18/15 upper half
-            "198.51.100.1",    // 198.51.100/24 TEST-NET-2
-            "203.0.113.1",     // 203.0.113/24 TEST-NET-3
-            "224.0.0.1",       // 224/4 multicast
-            "239.255.255.255", // 224/4 multicast upper
-            "240.0.0.1",       // 240/4 reserved
-            "255.255.255.255", // broadcast
-            // v6 special-use.
-            "::",               // ::/128
-            "::1",              // ::1/128
-            "::ffff:127.0.0.1", // mapped loopback
-            "::ffff:10.0.0.1",  // mapped private
-            "64:ff9b:1::1",     // NAT64 local
-            "100::1",           // discard-only
-            "2001:db8::1",      // documentation
-            "2001:2::1",        // benchmarking
-            "2001:20::1",       // ORCHIDv2
+        let non_global = [
+            // v4 special-use: first and last of each range, plus the
+            // neighbours of the two in-range exceptions.
+            "0.0.0.0",
+            "0.255.255.255",
+            "10.0.0.0",
+            "10.255.255.255",
+            "100.64.0.0",
+            "100.127.255.255",
+            "127.0.0.0",
+            "127.255.255.255",
+            "169.254.0.0",
+            "169.254.255.255",
+            "172.16.0.0",
+            "172.31.255.255",
+            "192.0.0.0",
+            "192.0.0.8",  // neighbour below the .9/.10 exceptions
+            "192.0.0.11", // neighbour above the .9/.10 exceptions
+            "192.0.0.255",
+            "192.0.2.0",
+            "192.0.2.255",
+            "192.88.99.0",
+            "192.88.99.255",
+            "192.168.0.0",
+            "192.168.255.255",
+            "198.18.0.0",
+            "198.19.255.255",
+            "198.51.100.0",
+            "198.51.100.255",
+            "203.0.113.0",
+            "203.0.113.255",
+            "224.0.0.0", // multicast through reserved to broadcast, one block
+            "239.255.255.255",
+            "240.0.0.0",
+            "255.255.255.255",
+            // v6 outside 2000::/3 — rejected by STRUCTURE, not by rows.
+            "::",
+            "::1",
+            "100:0:0:1::1", // IANA dummy prefix (the round-4 reproduction)
+            "100::1",       // discard-only
+            "64:ff9b:1::1", // NAT64 local
+            "400::1",       // reserved
+            "800::1",       // reserved
+            "5f00::1",      // reserved (reviewer-named)
+            "1fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // last below 2000::/3
+            "4000::",       // first above 2000::/3
+            "4000::1",
+            "fec0::1",          // deprecated site-local
             "fe80::1",          // link-local
             "fc00::1",          // ULA
             "ff02::1",          // multicast
-        ] {
+            "::ffff:127.0.0.1", // mapped loopback
+            "::ffff:10.0.0.1",  // mapped private
+            // v6 special rows INSIDE 2000::/3: first and last of each.
+            "2001::", // first of 2001::/23
+            "2001::1",
+            "2001:2::1",                              // benchmarking, inside the /23
+            "2001:20::1",                             // ORCHIDv2, inside the /23
+            "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", // last of 2001::/23
+            "2001:db8::",                             // first of 2001:db8::/32
+            "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", // last of 2001:db8::/32
+            "2002:7f00:1::1",                         // 6to4 embedding loopback 127.0.0.1
+            "2002:c0a8:1::1",                         // 6to4 embedding private 192.168.0.1
+            "3fff::",                                 // first of 3fff::/20
+            "3fff::1",
+            "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff", // last of 3fff::/20
+        ];
+        for ip in non_global {
             assert!(
                 !is_global_ip(&ip.parse().unwrap()),
                 "admitted non-global {ip}"
@@ -655,7 +741,7 @@ mod tests {
         // Accepted: ordinary public http(s), incl. a public literal IP.
         assert!(is_public_http("https://images.unsplash.com/a.jpg"));
         assert!(is_public_http("http://example.com/a.png"));
-        assert!(is_public_http("https://203.0.113.7/a.png"));
+        assert!(is_public_http("https://93.184.216.34/a.png"));
         // Rejected: non-http(s) schemes and option-shaped values.
         for u in [
             "file:///etc/passwd",
@@ -666,7 +752,9 @@ mod tests {
         ] {
             assert!(!is_public_http(u), "accepted {u}");
         }
-        // Rejected: loopback / link-local / private / unspecified targets.
+        // Rejected: loopback / link-local / private / unspecified targets —
+        // and, since the literal branch is is_global_ip itself, the special
+        // ranges too (TEST-NET-3, IANA dummy space).
         for u in [
             "http://localhost/a",
             "http://sub.localhost/a",
@@ -677,9 +765,11 @@ mod tests {
             "http://10.0.0.1/a",
             "http://192.168.1.1/a",
             "http://172.16.0.1/a",
+            "http://203.0.113.7/a",
             "http://[::1]/a",
             "http://[fe80::1]/a",
             "http://[fc00::1]/a",
+            "http://[100:0:0:1::1]/a",
         ] {
             assert!(!is_public_http(u), "accepted {u}");
         }
