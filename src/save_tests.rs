@@ -228,36 +228,58 @@ fn reuse_under_a_swap_never_reads_the_attacker_copy() {
     );
 }
 
-/// The posix branch, forced on every platform, pure over its inputs: a
-/// missing getfacl FAILS CLOSED, a reported foreign write grant refuses, a
-/// clean ACL passes, and our own entry does not count against us.
+/// The posix ACL parser, pure over the raw xattr bytes on every platform,
+/// with NO subprocess anywhere (round 7 removed getfacl and `id` from the
+/// audit): a named write grant refuses whoever it names, read-only and
+/// base entries pass, and anything unparseable refuses as unauditable.
 #[test]
 fn forced_posix_acl_predicate() {
-    let d = tmpdir("facl");
-    let target = d.join("lib");
-    fs::create_dir_all(&target).unwrap();
-    let stub = |body: &str| -> PathBuf {
-        let p = d.join(format!("getfacl-{}", body.len()));
-        fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
-        p
+    let entry = |tag: u16, perm: u16, id: u32| {
+        let mut v = Vec::new();
+        v.extend(tag.to_le_bytes());
+        v.extend(perm.to_le_bytes());
+        v.extend(id.to_le_bytes());
+        v
     };
-    let missing = posix_acl_audit(&target, None, "tester").unwrap();
-    assert!(missing.contains("getfacl is not installed"), "{missing}");
-
-    let grant = stub("echo 'group:staff:rwx'");
-    let why = posix_acl_audit(&target, Some(&grant), "tester").unwrap();
-    assert!(why.contains("ACL granting group:staff write"), "{why}");
-
-    let own = stub("echo 'user:tester:rwx'");
-    assert_eq!(posix_acl_audit(&target, Some(&own), "tester"), None);
-
-    let clean = stub("echo 'user::rwx'; echo 'group::r-x'; echo 'other::r-x'");
-    assert_eq!(posix_acl_audit(&target, Some(&clean), "tester"), None);
-
-    let failing = stub("exit 3");
-    let why = posix_acl_audit(&target, Some(&failing), "tester").unwrap();
-    assert!(why.contains("getfacl failed"), "{why}");
+    let acl = |entries: &[Vec<u8>]| {
+        let mut v = 2u32.to_le_bytes().to_vec();
+        for e in entries {
+            v.extend(e);
+        }
+        v
+    };
+    // Base entries only (owner/owning-group/other/mask express through the
+    // mode bits, which the mode audit judges): clean.
+    let base = [
+        entry(0x01, 7, u32::MAX),
+        entry(0x04, 5, u32::MAX),
+        entry(0x20, 5, u32::MAX),
+    ];
+    assert_eq!(posix_acl_grant(&acl(&base)), None);
+    // A named user with the write bit refuses — identity-free, so even a
+    // grant to "ourselves" counts (out of contract, documented).
+    let why = posix_acl_grant(&acl(&[
+        entry(0x01, 7, u32::MAX),
+        entry(0x02, 6, 1000),
+        entry(0x10, 7, u32::MAX),
+    ]))
+    .unwrap();
+    assert!(why.contains("user #1000 write"), "{why}");
+    // A named group likewise.
+    let why = posix_acl_grant(&acl(&[entry(0x08, 2, 50)])).unwrap();
+    assert!(why.contains("group #50 write"), "{why}");
+    // A named read-only entry does not.
+    assert_eq!(posix_acl_grant(&acl(&[entry(0x02, 4, 1000)])), None);
+    // Unparseable input is UNPROVEN input: truncated, wrong version,
+    // unknown tag all refuse.
+    let why = posix_acl_grant(&[1, 2, 3]).unwrap();
+    assert!(why.contains("malformed"), "{why}");
+    let mut wrong = acl(&base);
+    wrong[0] = 1;
+    let why = posix_acl_grant(&wrong).unwrap();
+    assert!(why.contains("unknown ACL xattr version"), "{why}");
+    let why = posix_acl_grant(&acl(&[entry(0x40, 2, 5)])).unwrap();
+    assert!(why.contains("unknown ACL entry tag"), "{why}");
 }
 
 /// macOS-native ACL semantics, end-to-end where chmod +a exists: an ALLOW

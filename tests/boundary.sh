@@ -11,8 +11,8 @@
 # test and drove it directly (the descriptor-bound saver's check/use windows,
 # the ACL interrogator branches, and the contrast floor). Those trust
 # decisions now live in Rust and are driven natively — src/save_tests.rs
-# (FIFO-opened swap windows, forced-posix getfacl predicate, darwin ACL
-# allow/deny/writesecurity) and the floor regression in src/apply.rs — so
+# (FIFO-opened swap windows, the in-process POSIX ACL xattr parser, darwin
+# ACL allow/deny/writesecurity) and the floor regression in src/apply.rs — so
 # this file carries their END-TO-END shapes (world-writable ancestor, ACL'd
 # library, symlinked provider) through the real binary instead.
 #
@@ -1270,14 +1270,49 @@ if [ "$note_rc" = 0 ] && ! grep -qF 'update to the latest' "$note_out" \
     pass "a steered cache path refuses: clean target, but hostile spelled chain"
 else fail "endpoint steering accepted (rc=$note_rc): $(ls -A "$fixture/steer-target")"; fi
 chmod 700 "$fixture/hostile-cache"
-# …while a symlink held in CLEAN territory keeps working — every macOS path
-# crosses /var -> /private/var, so benign links must not break custody.
+# …a symlink AT the cache-dir name refuses outright (the leaf opens
+# O_NOFOLLOW — round-6 killer d), even into clean territory…
 ln -s "$fixture/steer-target" "$fixture/goodlink-cache"
 printf 'v9.9.9' >"$fixture/steer-target/update-check"
 note_run THEME_CACHE_DIR="$fixture/goodlink-cache"
+if [ "$note_rc" = 0 ] && ! grep -qF 'update to the latest' "$note_out"; then
+    pass "a symlink at the cache-dir name refuses silently"
+else fail "leaf symlink accepted (rc=$note_rc): $(tail -3 "$note_out")"; fi
+# …while an INTERMEDIATE benign symlink keeps working — every macOS path
+# crosses /var -> /private/var, so links inside audited territory must not
+# break custody.
+mkdir -p "$fixture/steer-target/sub"
+printf 'v9.9.9' >"$fixture/steer-target/sub/update-check"
+note_run THEME_CACHE_DIR="$fixture/goodlink-cache/sub"
 if grep -qF 'update to the latest theme version: v9.9.9' "$note_out"; then
-    pass "a benign symlinked cache path still carries custody"
-else fail "benign symlink broke custody: $(tail -3 "$note_out")"; fi
+    pass "an intermediate benign symlink still carries custody"
+else fail "benign intermediate symlink broke custody: $(tail -3 "$note_out")"; fi
+
+# --- the audit itself shells NOTHING plantable (Codex round 7) -------------
+# id and getfacl are gone from the audit; ls is reached only at /bin/ls.
+# Planted lookalikes carrying markers prove none of them ever executes,
+# while the custody outcomes above stayed exactly as pinned.
+auditbin="$fixture/auditbin"
+mkdir -p "$auditbin"
+for tool in id getfacl ls; do
+    printf '#!/bin/sh\n: >"%s/audit-stub-ran-%s"\nexit 0\n' "$fixture" "$tool" >"$auditbin/$tool"
+    chmod +x "$auditbin/$tool"
+done
+printf 'v9.9.9' >"$notecache/update-check"
+note_run PATH="$auditbin:$failbin:$sweepbin:$PATH"
+if grep -qF 'update to the latest theme version: v9.9.9' "$note_out" \
+   && [ -z "$(ls "$fixture" | grep audit-stub-ran)" ]; then
+    pass "planted id/getfacl/ls never execute and custody is unchanged"
+else fail "an audit helper was PATH-resolved: $(ls "$fixture" | grep audit-stub-ran)"; fi
+
+# Refusal must create NOTHING (round-7 LOW): a hostile ancestor with an
+# ABSENT final component ends with no directory conjured at the target.
+chmod 777 "$fixture/hostile-cache"
+note_run THEME_CACHE_DIR="$fixture/hostile-cache/newcache"
+if [ "$note_rc" = 0 ] && [ ! -e "$fixture/hostile-cache/newcache" ]; then
+    pass "a refused chain conjures no directory at the steered target"
+else fail "refusal still created something: $(ls -A "$fixture/hostile-cache")"; fi
+chmod 700 "$fixture/hostile-cache"
 
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILURES"; fi
 [ "$fails" -eq 0 ]
