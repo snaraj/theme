@@ -521,6 +521,50 @@ case "$plainout" in
 *) fail "the untransformed webp control lost its width warning" ;;
 esac
 
+# --- SSRF: a page-controlled og:image must be a PUBLIC http(s) target, never
+# file:, an option-shaped value, or the loopback/private network. The stub
+# keys off --url: it serves HTML (with a chosen og:image) for a page request
+# and a PNG for an image request, so the ok case resolves one hop and saves.
+ssrfbin="$fixture/ssrfbin"
+mkdir -p "$ssrfbin"
+cat >"$ssrfbin/curl" <<'EOS'
+#!/bin/bash
+o=""; url=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "-o" ] && o="$a"
+  [ "$prev" = "--url" ] && url="$a"
+  prev="$a"
+done
+html='<!DOCTYPE html><html><head><meta property="og:image" content='
+case "$url" in
+  *page-file*) body="${html}\"file:///etc/hosts\"></head></html>" ;;
+  *page-loop*) body="${html}\"http://127.0.0.1/secret.png\"></head></html>" ;;
+  *page-opt*)  body="${html}\"-O/tmp/pwned\"></head></html>" ;;
+  *page-ok*)   body="${html}\"https://images.unsplash.com/real.png\"></head></html>" ;;
+  *) [ -n "$o" ] && printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' | base64 -d >"$o"; exit 0 ;;
+esac
+[ -n "$o" ] && printf '%s' "$body" >"$o"
+exit 0
+EOS
+chmod +x "$ssrfbin/curl"
+ssrflib="$fixture/ssrflib"; mkdir -p "$ssrflib"
+run_ssrf() { PATH="$ssrfbin:$PATH" THEME_WALLPAPER_DIR="$ssrflib" THEME_NO_APPLY=1 \
+    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" url "$1"; }
+for kind in file loop opt; do
+    err=$(run_ssrf "https://pin.example/page-$kind" 2>&1)
+    case "$err" in
+    *"not a public http(s) image URL"*) pass "og:image ($kind) refused before any fetch" ;;
+    *) fail "og:image ($kind) was not refused: $err" ;;
+    esac
+done
+if [ "$(find "$ssrflib" -type f 2>/dev/null | wc -l | tr -d ' ')" = 0 ]; then
+    pass "no SSRF og:image wrote anything into the library"
+else fail "an SSRF og:image landed a file in the library"; fi
+run_ssrf "https://pin.example/page-ok" >/dev/null 2>&1
+# The page host (pin.example) is not a known provider, so the save keeps the
+# library root — routing is by the served PAGE host, unchanged by this round.
+exists "a public https og:image still resolves and saves" yes "$ssrflib/real.png"
+
 # A world-writable ANCESTOR refuses the save (the whole chain is audited).
 chaindir="$fixture/chain"; mkdir -p "$chaindir/parent/lib"
 chmod 0777 "$chaindir/parent"

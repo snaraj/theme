@@ -12,6 +12,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// The desktop's own answer for the current wallpaper, when it has one.
 pub fn wallpaper_get() -> Option<PathBuf> {
@@ -121,6 +122,7 @@ impl Terminal for Kitty {
     fn apply(&self, cfg: &Config) {
         let colors = cfg.cache_dir.join("colors-kitty.conf");
         let Ok(rd) = fs::read_dir("/tmp") else { return };
+        let me = rustix::process::getuid().as_raw();
         for e in rd.flatten() {
             let name = e.file_name();
             let Some(n) = name.to_str() else { continue };
@@ -128,22 +130,53 @@ impl Terminal for Kitty {
                 continue;
             }
             let p = e.path();
-            let is_sock = fs::metadata(&p)
-                .map(|m| {
-                    use std::os::unix::fs::FileTypeExt;
-                    m.file_type().is_socket()
-                })
-                .unwrap_or(false);
-            if !is_sock {
+            if !own_socket(&p, me) {
                 continue;
             }
-            let _ = Command::new("kitten")
+            let child = Command::new("kitten")
                 .arg("@")
                 .arg("--to")
                 .arg(format!("unix:{}", p.display()))
                 .args(["set-colors", "--all", "--configured"])
                 .arg(&colors)
-                .output();
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            if let Ok(child) = child {
+                // A rogue same-uid socket can accept the request and never
+                // answer; a theme apply must not hang on a terminal. Cap each
+                // child, kill and reap on expiry — best-effort, never fatal.
+                wait_capped(child, Duration::from_secs(3));
+            }
+        }
+    }
+}
+
+/// A `/tmp` entry we may hand the palette to: a socket (checked without
+/// following symlinks) that WE own. A symlink, a non-socket, or another
+/// principal's socket is skipped — no disclosure, no connection.
+fn own_socket(p: &Path, me: u32) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    fs::symlink_metadata(p)
+        .map(|m| m.file_type().is_socket() && m.uid() == me)
+        .unwrap_or(false)
+}
+
+/// Wait for a child up to `limit`, then kill and reap it. Polls rather than
+/// blocking so a stalled peer cannot pin the call open.
+fn wait_capped(mut child: std::process::Child, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return,
         }
     }
 }
@@ -313,7 +346,91 @@ pub fn use_image(cfg: &Config, img: &Path, desktop_only: bool) {
 
 #[cfg(test)]
 mod tests {
+    use super::{osc_color, osc_sequences, own_socket, wait_capped};
     use pigment::{Mode, Palette, Rgb, effective_background};
+    use std::time::{Duration, Instant};
+
+    /// A theme apply must never hang on a terminal: a child that outlives its
+    /// deadline is killed and reaped, and the call returns near the deadline.
+    #[test]
+    fn wait_capped_kills_a_slow_child() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        wait_capped(child, Duration::from_millis(300));
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "wait_capped did not bound the child"
+        );
+    }
+
+    /// The socket predicate: our own socket qualifies; a regular file and a
+    /// symlink-to-socket do not — no palette goes to a non-socket or through
+    /// a symlink. (A foreign-uid socket also fails, but forging one needs
+    /// root, so the uid arm is exercised by passing a bogus uid here.)
+    #[test]
+    fn own_socket_requires_a_real_socket_we_own() {
+        use std::os::unix::net::UnixListener;
+        let d = std::env::temp_dir().join(format!("theme-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let me = rustix::process::getuid().as_raw();
+
+        let sock = d.join("s.sock");
+        let _l = UnixListener::bind(&sock).unwrap();
+        assert!(own_socket(&sock, me), "our own socket should qualify");
+        assert!(!own_socket(&sock, me + 1), "a foreign uid must not qualify");
+
+        let plain = d.join("plain");
+        std::fs::write(&plain, b"x").unwrap();
+        assert!(!own_socket(&plain, me), "a regular file is not a socket");
+
+        let link = d.join("link.sock");
+        std::os::unix::fs::symlink(&sock, &link).unwrap();
+        assert!(!own_socket(&link, me), "a symlink must not be followed");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Poisoned colors-file lines must never reach the terminal: only exact
+    /// `#rrggbb` is emitted, everything else — an ESC-laden line, a bad hex,
+    /// a bare word, a `#` without six digits — is dropped. A mutant that
+    /// evaluated the gate and then let the line through fails here.
+    #[test]
+    fn osc_sequences_emits_only_validated_hex() {
+        let poisoned = concat!(
+            "#123abc\n",           // valid slot 0 (also bg)
+            "not-a-color\n",       // bare word
+            "#zzzzzz\n",           // # but not hex
+            "#12 \x1b]4;9;evil\n", // embedded escape
+            "#abcdef\n",           // valid
+            "123456\n",            // hex but no leading #
+            "#7f7f7f\n"            // valid — reaches slot 6
+        );
+        let out = osc_sequences(poisoned);
+        // The three well-formed colors appear; nothing else does.
+        assert!(out.contains("#123abc"));
+        assert!(out.contains("#abcdef"));
+        assert!(out.contains("#7f7f7f"));
+        for bad in ["not-a-color", "zzzzzz", "evil", "]4;9;", "123456\x1b"] {
+            assert!(!out.contains(bad), "poisoned fragment leaked: {bad}");
+        }
+        // Only ESC bytes we ourselves framed (the OSC introducers) are present.
+        assert_eq!(out.matches("\x1b]4;").count(), 3);
+    }
+
+    #[test]
+    fn osc_color_is_exactly_hash_plus_six_hex() {
+        assert!(osc_color("#0a0b0c"));
+        assert!(osc_color("#ABCDEF"));
+        for bad in [
+            "0a0b0c", "#0a0b0", "#0a0b0cc", "#0a0b0g", "", "#", "##00000",
+        ] {
+            assert!(!osc_color(bad), "accepted a bad line: {bad:?}");
+        }
+    }
 
     /// The measured shell regression: a mid-tone background reaches the
     /// floor on ONE side only, and the old lightness heuristic shipped

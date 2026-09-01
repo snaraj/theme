@@ -302,6 +302,85 @@ fn darwin_acl_grants() {
     assert!(err.contains("writesecurity"), "{err}");
 }
 
+/// A FIFO planted at the first collision name must not hang the save: the
+/// reuse arm opens NONBLOCK and the S_ISREG check rejects it, so the saver
+/// steps to the next free name and returns promptly. Removing either the
+/// NONBLOCK open or the regular-file check reintroduces the deadlock — the
+/// bounded join below then fails instead of blocking the whole suite.
+#[test]
+fn a_fifo_at_the_collision_name_does_not_hang_the_save() {
+    let d = tmpdir("fifo-collide");
+    let lib = d.join("lib");
+    fs::create_dir_all(lib.join("unsplash")).unwrap();
+    // Occupy the first name with a FIFO (no writer will ever open it).
+    let victim = lib.join("unsplash/pic.png");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&victim)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let src = d.join("src.bin");
+    fs::write(&src, b"real-bytes").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = save_into(&src, &lib, "unsplash", "pic", "png", native_platform());
+        let _ = tx.send(r.map(|s| format!("{s:?}")));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(Ok(desc)) => assert!(desc.contains("pic-2.png"), "stepped somewhere odd: {desc}"),
+        Ok(Err(e)) => panic!("unexpected refusal: {e}"),
+        Err(_) => panic!("save hung on the planted FIFO"),
+    }
+}
+
+/// The download byte cap is enforced from the saver, before the whole-file
+/// read: a source one byte over the ceiling is refused without allocating a
+/// Vec its size (a sparse set_len makes the oversized file for free, and the
+/// refusal returns before the read). The boundary is inclusive by
+/// construction (`>` MAX), and small-file acceptance is proven throughout the
+/// rest of this suite.
+#[test]
+fn an_oversized_source_is_refused_before_allocation() {
+    let d = tmpdir("oversize");
+    let lib = d.join("lib");
+    fs::create_dir(&lib).unwrap();
+    let big = d.join("big.bin");
+    let f = fs::File::create(&big).unwrap();
+    f.set_len(crate::config::MAX_DOWNLOAD_BYTES + 1).unwrap();
+    drop(f);
+    let err = save_into(&big, &lib, "", "pic", "png", native_platform()).unwrap_err();
+    assert!(err.contains("exceeds the"), "{err}");
+    assert!(!lib.join("pic.png").exists());
+}
+
+/// Scratch files live inside a private, owner-only (0700) directory — the
+/// containment that makes a planted-symlink clobber impossible. A mutant
+/// returning a bare $TMPDIR name fails these invariants.
+#[test]
+fn scratch_paths_are_inside_a_private_owner_only_dir() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let a = crate::scratch::new();
+    let b = crate::scratch::new();
+    assert_ne!(a, b, "two scratch names collided");
+    let dir = a.parent().unwrap();
+    assert_eq!(dir, b.parent().unwrap(), "scratch files escaped the dir");
+    let m = fs::symlink_metadata(dir).unwrap();
+    assert!(m.file_type().is_dir(), "scratch dir is not a directory");
+    assert_eq!(
+        m.permissions().mode() & 0o777,
+        0o700,
+        "scratch dir not 0700"
+    );
+    assert_eq!(
+        m.uid(),
+        rustix::process::getuid().as_raw(),
+        "not owner-only"
+    );
+    crate::scratch::cleanup();
+}
+
 impl std::fmt::Debug for Saved {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

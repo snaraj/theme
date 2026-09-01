@@ -5,8 +5,9 @@
 //! fixture drives every network case through a deterministic PATH-stubbed
 //! curl — an in-process HTTP client would erase both properties.
 
-use crate::config::UA;
+use crate::config::{MAX_DOWNLOAD_BYTES, UA};
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -91,10 +92,76 @@ pub fn fetch_img(url: &str, dest: &Path) -> bool {
     curl_download(url, dest, 60)
 }
 
+/// http(s) only, and not aimed at loopback/link-local/private/unspecified.
+/// The gate for URLs supplied by REMOTE metadata (an og:image): a wallpaper
+/// fetch has no business reaching the local host or private network on the
+/// say-so of a downloaded page. Literal-IP and `localhost` targets are
+/// rejected here; a DNS name that resolves inward is left to curl's transport
+/// (we do not resolve, to stay a thin subprocess boundary).
+pub fn is_public_http(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let auth = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let auth = auth.rsplit('@').next().unwrap_or(""); // strip userinfo
+    // Host: a bracketed IPv6 literal, or host[:port]. url_host is not reused
+    // here because its `:`-split mangles `[::1]`.
+    let host = if let Some(inner) = auth.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("")
+    } else {
+        auth.split(':').next().unwrap_or("")
+    }
+    .to_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" || host.ends_with(".localhost") {
+        return false;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(a)) => {
+            !(a.is_loopback()
+                || a.is_private()
+                || a.is_link_local()
+                || a.is_unspecified()
+                || a.is_broadcast())
+        }
+        Ok(IpAddr::V6(a)) => {
+            let seg0 = a.segments()[0];
+            !(a.is_loopback()
+                || a.is_unspecified()
+                || (seg0 & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || (seg0 & 0xffc0) == 0xfe80) // link-local fe80::/10
+        }
+        Err(_) => true, // a DNS name — scheme-gated, resolved by curl
+    }
+}
+
 pub fn curl_download(url: &str, dest: &Path, timeout: u32) -> bool {
+    // `--url` binds the value so an option-shaped URL cannot become an option;
+    // `--proto`/`--proto-redir '=http,https'` refuse file:, gopher:, and any
+    // cross-protocol redirect; `--max-filesize` is the first (time-independent)
+    // byte cap, backstopped by a post-open size check at the saver.
     Command::new("curl")
-        .args(["-fsLg", "--max-time", &timeout.to_string(), "-A", UA, "-o"])
+        .args([
+            "-fsLg",
+            "--proto",
+            "=http,https",
+            "--proto-redir",
+            "=http,https",
+            "--max-filesize",
+            &MAX_DOWNLOAD_BYTES.to_string(),
+            "--max-time",
+            &timeout.to_string(),
+            "-A",
+            UA,
+            "-o",
+        ])
         .arg(dest)
+        .arg("--url")
         .arg(url)
         .status()
         .map(|s| s.success())
@@ -162,6 +229,41 @@ mod tests {
         assert_eq!(host_label("images.unsplash.com"), Some("unsplash"));
         assert_eq!(host_label("i.pinimg.com"), Some("pinterest"));
         assert_eq!(host_label("evilunsplash.com"), None);
+    }
+
+    #[test]
+    fn public_http_rejects_ssrf_shapes() {
+        // Accepted: ordinary public http(s), incl. a public literal IP.
+        assert!(is_public_http("https://images.unsplash.com/a.jpg"));
+        assert!(is_public_http("http://example.com/a.png"));
+        assert!(is_public_http("https://203.0.113.7/a.png"));
+        // Rejected: non-http(s) schemes and option-shaped values.
+        for u in [
+            "file:///etc/passwd",
+            "gopher://x/1",
+            "ftp://h/a",
+            "-O/tmp/x",
+            "--config=/tmp/evil",
+        ] {
+            assert!(!is_public_http(u), "accepted {u}");
+        }
+        // Rejected: loopback / link-local / private / unspecified targets.
+        for u in [
+            "http://localhost/a",
+            "http://sub.localhost/a",
+            "http://127.0.0.1/a",
+            "http://127.9.9.9/a",
+            "http://0.0.0.0/a",
+            "http://169.254.1.1/a",
+            "http://10.0.0.1/a",
+            "http://192.168.1.1/a",
+            "http://172.16.0.1/a",
+            "http://[::1]/a",
+            "http://[fe80::1]/a",
+            "http://[fc00::1]/a",
+        ] {
+            assert!(!is_public_http(u), "accepted {u}");
+        }
     }
 
     #[test]

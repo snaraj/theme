@@ -9,6 +9,12 @@ use std::env;
 use std::path::PathBuf;
 
 pub const MIN_WIDTH: u32 = 2560;
+/// The largest download the tool will accept, enforced at curl
+/// (`--max-filesize`) and re-checked from the saver against the file on disk.
+/// 100 MiB: a generous ceiling for a compressed wallpaper (even 8K JPEG/PNG
+/// sits far below it), while bounding scratch-disk and the whole-file read the
+/// saver performs — a fast endpoint cannot fill the filesystem or the heap.
+pub const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
 pub const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const FORMATS_ALL: &str = "jpg jpeg png webp gif bmp tif tiff";
 

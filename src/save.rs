@@ -392,6 +392,20 @@ pub fn save_into(
         libfd
     };
 
+    // Independent byte cap, BEFORE the whole-file read: curl's --max-filesize
+    // can be defeated by a chunked response with no Content-Length, so the
+    // saver re-checks the file on disk and fails closed over the ceiling
+    // rather than allocating a Vec of attacker-chosen size.
+    if let Ok(m) = fs::metadata(src)
+        && m.len() > crate::config::MAX_DOWNLOAD_BYTES
+    {
+        return Err(format!(
+            "refusing to save {} - {} bytes exceeds the {}-byte limit",
+            src.display(),
+            m.len(),
+            crate::config::MAX_DOWNLOAD_BYTES
+        ));
+    }
     let data = fs::read(src).map_err(|e| format!("cannot read the downloaded file: {e}"))?;
 
     for n in 1..=99u32 {
@@ -425,10 +439,14 @@ pub fn save_into(
                 // Occupied. Reuse ONLY a byte-identical regular file that is
                 // not a symlink: an alias to identical bytes is still not
                 // that file.
+                // NONBLOCK so a FIFO planted at the name returns from open
+                // immediately (a blocking O_RDONLY FIFO open waits forever for
+                // a writer) — the S_ISREG check below then rejects it. On a
+                // regular file NONBLOCK is a no-op.
                 let Ok(efd) = rustix::fs::openat(
                     &dirfd,
                     name.as_str(),
-                    OFlags::RDONLY | OFlags::NOFOLLOW,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
                     Mode::empty(),
                 ) else {
                     continue;
@@ -440,6 +458,12 @@ pub fn save_into(
                 if rustix::fs::FileType::from_raw_mode(est.st_mode)
                     != rustix::fs::FileType::RegularFile
                 {
+                    continue;
+                }
+                // An oversized occupant cannot equal our (capped) bytes, so do
+                // not read it into a Vec to find that out — skip to the next
+                // free name instead of matching allocation to its size.
+                if est.st_size as u64 > crate::config::MAX_DOWNLOAD_BYTES {
                     continue;
                 }
                 let mut existing = Vec::new();

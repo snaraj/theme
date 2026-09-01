@@ -146,6 +146,13 @@ pub fn cmd_url(cfg: &Config, link: &str, flags: &mut Flags) {
         if page_img.is_empty() {
             die("no og:image on that page — pass a direct image URL instead");
         }
+        // The og:image is REMOTE-supplied: it must be a public http(s) target,
+        // never file:, an option-shaped value, or the local/private network.
+        // (curl's --proto guard covers the direct user link; this covers the
+        // page-controlled hop, and rejects loopback the proto guard allows.)
+        if !crate::net::is_public_http(&page_img) {
+            die("that page's og:image is not a public http(s) image URL");
+        }
         if fetch_best(&page_img, &tmp).is_none() {
             die(&format!("download failed: {page_img}"));
         }
