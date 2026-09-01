@@ -15,9 +15,12 @@ image file ──decode──▶ ≤128×128 block-mean grid + full-res average
            ──emit────▶ kitty conf | alacritty TOML | OSC sequences | cache text
 ```
 
-- **decode** (`image` crate, decoders only): format sniffed from content,
-  never the extension. A single pass computes both the analysis grid and the
-  full-image average color.
+- **decode** (`image` crate): format sniffed from the content's magic bytes
+  via `with_guessed_format` — the extension is only a fallback when the
+  magic is unrecognized (`image::open` alone dispatches on the extension;
+  the PR #8 review caught that). Decoder allocation is bounded (512 MiB
+  default) and edges are capped at 16,384 px. A single pass computes both
+  the analysis grid and the full-image average color.
 - **extract**: in-house k-means++ (splitmix64-seeded) over at most 16,384
   samples. The seed is fixed by default, so the same bytes always produce the
   same palette — that is what makes the gold-file tests sound and the cache
@@ -33,7 +36,11 @@ image file ──decode──▶ ≤128×128 block-mean grid + full-res average
   whichever of white/black can *achievably* reach the floor; strongest
   endpoint when neither can. Slot 0 is never floored. One deliberate
   difference: Rust rounds half away from zero where Python rounded half to
-  even — off-by-one on exact midpoints only, invariant-tested.
+  even — off-by-one on exact midpoints only (common on the blend path at
+  round opacities, immaterial to readability), invariant-tested. Flooring
+  returns the `Floored` newtype, and the terminal emitters exist only on it:
+  skipping the floor before recoloring a terminal is a type error, not a
+  silent regression.
 - **cache**: read-through, keyed on (canonical path, mtime, size, options,
   engine version), stored in the line-oriented `pigment1` text format. A hit
   is a file read; corrupt entries re-derive instead of erroring.
@@ -78,9 +85,10 @@ wallrust, © prime-run, MIT license — see the repository above.
 
 ## Dependencies
 
-`image` (decoders only, exactly the `THEME_FORMATS` codecs: jpeg, png, webp,
-gif, bmp, tiff) is the sole runtime dependency — decoding hostile image bytes
-is precisely where a fuzzed, widely-audited crate beats in-house code.
+`image` (default features off, exactly the `THEME_FORMATS` codecs: jpeg,
+png, webp, gif, bmp, tiff) is the sole runtime dependency — decoding hostile
+image bytes is precisely where a fuzzed, widely-audited crate beats in-house
+code.
 `criterion` is dev-only. Everything else — PRNG, k-means, color math, WCAG
 contrast, FNV cache keys, emitters — is in-house (~1,700 lines including all
 tests and benches; wallrust is 2,163 with neither).

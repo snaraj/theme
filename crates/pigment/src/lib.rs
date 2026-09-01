@@ -9,7 +9,8 @@
 //! produce the same [`Palette`], so gold-file tests are sound and caches are
 //! stable across machines.
 
-#![deny(unsafe_code)]
+// unsafe_code is denied by the workspace lint table (root Cargo.toml) — the
+// single, gate-enforced source of truth per AGENTS.md.
 #![warn(missing_docs)]
 
 mod cache;
@@ -22,7 +23,7 @@ mod floor;
 
 pub use cache::{cache_key, cached_derive};
 pub use color::Rgb;
-pub use floor::effective_background;
+pub use floor::{Floored, effective_background};
 
 use std::path::Path;
 

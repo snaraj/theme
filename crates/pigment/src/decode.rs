@@ -7,6 +7,11 @@ use std::path::Path;
 /// k-means, which keeps derivation fast regardless of source resolution.
 const GRID: u32 = 128;
 
+/// Longest edge accepted from a decoder. Far beyond any wallpaper (8K is
+/// 7680x4320) while capping the post-decode RGB buffer, which is allocated
+/// outside the decoder's own `max_alloc` accounting.
+const MAX_EDGE: u32 = 16_384;
+
 pub(crate) struct Decoded {
     /// Block-mean downsample, row-major, at most GRID x GRID.
     pub pixels: Vec<Rgb>,
@@ -16,9 +21,22 @@ pub(crate) struct Decoded {
 }
 
 pub(crate) fn load(path: &Path) -> Result<Decoded, Error> {
-    // `image::open` sniffs the format from content, not the extension —
-    // the same content-over-extension doctrine the downloader enforces.
-    let img = image::open(path).map_err(|e| Error::Decode(format!("{}: {e}", path.display())))?;
+    // The format is sniffed from the CONTENT — `with_guessed_format` reads
+    // the magic bytes — matching the content-over-extension doctrine the
+    // downloader enforces. The path's extension is only the fallback when
+    // the magic is unrecognized. (`image::open` alone dispatches on the
+    // extension; PR #8 review proved that regresses extensionless and
+    // mislabeled files that decode fine under the shell CLI.)
+    let mut reader = image::ImageReader::open(path)
+        .and_then(image::ImageReader::with_guessed_format)
+        .map_err(|e| Error::Decode(format!("{}: {e}", path.display())))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_EDGE);
+    limits.max_image_height = Some(MAX_EDGE);
+    reader.limits(limits);
+    let img = reader
+        .decode()
+        .map_err(|e| Error::Decode(format!("{}: {e}", path.display())))?;
     let rgb = img.into_rgb8();
     let (w, h) = rgb.dimensions();
     if w == 0 || h == 0 {
@@ -122,6 +140,30 @@ mod tests {
         let d = load(&p).unwrap();
         std::fs::remove_file(&p).ok();
         assert_eq!(d.pixels.len(), 6);
+    }
+
+    #[test]
+    fn decodes_extensionless_path_by_content() {
+        let p = write_png("for-noext", 4, 4, |_, _| [1, 2, 3]);
+        let noext = p.with_extension("");
+        std::fs::rename(&p, &noext).unwrap();
+        let d = load(&noext);
+        std::fs::remove_file(&noext).ok();
+        if let Err(e) = &d {
+            panic!("extensionless valid PNG must decode by content: {e}");
+        }
+    }
+
+    #[test]
+    fn decodes_mislabeled_extension_by_content() {
+        let p = write_png("for-mislabel", 4, 4, |_, _| [9, 8, 7]);
+        let jpg = p.with_extension("jpg");
+        std::fs::rename(&p, &jpg).unwrap();
+        let d = load(&jpg);
+        std::fs::remove_file(&jpg).ok();
+        if let Err(e) = &d {
+            panic!("PNG bytes at a .jpg path must decode by content: {e}");
+        }
     }
 
     #[test]

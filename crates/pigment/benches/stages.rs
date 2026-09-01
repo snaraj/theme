@@ -44,21 +44,18 @@ fn benches(c: &mut Criterion) {
     });
 
     let p = derive(&img, &opts).unwrap();
+    let eff = effective_background(p.background(), 0.65, p.wallpaper_average);
     c.bench_function("floor_16_colors", |b| {
-        b.iter(|| {
-            let mut q = p.clone();
-            let eff = effective_background(q.background(), 0.65, q.wallpaper_average);
-            q.floor_against(eff, 4.5);
-            q
-        })
+        b.iter(|| p.clone().floor_against(eff, 4.5))
     });
 
+    let f = p.clone().floor_against(eff, 4.5);
     c.bench_function("emit_all_formats", |b| {
         b.iter(|| {
             (
-                p.to_kitty(),
-                p.to_alacritty(),
-                p.to_osc(),
+                f.to_kitty(),
+                f.to_alacritty(),
+                f.to_osc(),
                 p.to_cache_format(),
             )
         })

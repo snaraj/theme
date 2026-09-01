@@ -14,7 +14,7 @@ fn main() {
     let opacity: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let floor: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(4.5);
 
-    let mut palette = match derive(std::path::Path::new(&path), &Options::default()) {
+    let palette = match derive(std::path::Path::new(&path), &Options::default()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("derive: {e}");
@@ -22,6 +22,5 @@ fn main() {
         }
     };
     let eff = effective_background(palette.background(), opacity, palette.wallpaper_average);
-    palette.floor_against(eff, floor);
-    print!("{}", palette.to_kitty());
+    print!("{}", palette.floor_against(eff, floor).to_kitty());
 }

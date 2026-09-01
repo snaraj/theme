@@ -1,9 +1,14 @@
 //! Emitters. Strings out, nothing else — applying them (sockets, config
 //! files, ttys) is the CLI's job and jurisdiction.
+//!
+//! The terminal emitters live on [`Floored`], not [`Palette`]: forgetting
+//! the contrast floor ships an unreadable terminal silently, so the type
+//! system makes it unforgettable. Only the cache format — which stores the
+//! pre-floor palette on purpose — stays on [`Palette`].
 
-use crate::{Mode, Palette, Rgb};
+use crate::{Floored, Mode, Palette, Rgb};
 
-impl Palette {
+impl Floored {
     /// kitty color file, shaped like the `colors-kitty.conf` the include
     /// chain already reads (foreground/background/cursor + color0-15).
     pub fn to_kitty(&self) -> String {
@@ -56,7 +61,9 @@ impl Palette {
         out.push_str(&format!("\x1b]12;{}\x1b\\", spec(self.cursor)));
         out
     }
+}
 
+impl Palette {
     /// The plain-text cache/interchange format: a version tag, 16 color
     /// lines, then foreground, cursor, wallpaper average, and mode. Line
     /// oriented and greppable on purpose — no serializer dependency.
@@ -142,9 +149,15 @@ mod tests {
         }
     }
 
+    /// Wrap without mutation: a floor of 1.0 is an identity, since a
+    /// contrast ratio is >= 1 by definition.
+    fn floored() -> Floored {
+        sample().floor_against(Rgb::BLACK, 1.0)
+    }
+
     #[test]
     fn kitty_has_all_lines() {
-        let k = sample().to_kitty();
+        let k = floored().to_kitty();
         assert!(k.contains("foreground #e6e6e6"));
         assert!(k.contains("background #0064c8"));
         assert!(k.contains("cursor #e6e6e6"));
@@ -155,7 +168,7 @@ mod tests {
 
     #[test]
     fn alacritty_has_all_tables() {
-        let a = sample().to_alacritty();
+        let a = floored().to_alacritty();
         for t in [
             "[colors.primary]",
             "[colors.cursor]",
@@ -173,7 +186,7 @@ mod tests {
 
     #[test]
     fn osc_is_wellformed() {
-        let o = sample().to_osc();
+        let o = floored().to_osc();
         assert_eq!(o.matches("\x1b]4;").count(), 16);
         assert!(o.contains("\x1b]10;rgb:e6/e6/e6\x1b\\"));
         assert!(o.contains("\x1b]11;rgb:00/64/c8\x1b\\"));

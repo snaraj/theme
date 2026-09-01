@@ -72,15 +72,30 @@ pub(crate) fn floor_color(c: Rgb, eff: Rgb, floor: f64) -> Rgb {
     }
 }
 
+/// A palette whose text colors have passed the contrast floor — the only
+/// type the terminal emitters accept. Constructing one IS the proof the
+/// floor ran; a palette that skipped it cannot reach a terminal. Reads
+/// deref to [`Palette`].
+pub struct Floored(pub(crate) Palette);
+
+impl std::ops::Deref for Floored {
+    type Target = Palette;
+    fn deref(&self) -> &Palette {
+        &self.0
+    }
+}
+
 impl Palette {
     /// Floor every text color (slots 1-15 and the foreground) to at least
     /// `floor` contrast against `eff` — normally
-    /// [`effective_background`]`(self.background(), opacity, self.wallpaper_average)`.
-    pub fn floor_against(&mut self, eff: Rgb, floor: f64) {
+    /// [`effective_background`]`(self.background(), opacity, self.wallpaper_average)`
+    /// — and return the proof-of-floor wrapper the emitters require.
+    pub fn floor_against(mut self, eff: Rgb, floor: f64) -> Floored {
         for i in 1..16 {
             self.colors[i] = floor_color(self.colors[i], eff, floor);
         }
         self.foreground = floor_color(self.foreground, eff, floor);
+        Floored(self)
     }
 }
 
@@ -166,7 +181,7 @@ mod tests {
 
     #[test]
     fn background_slot_never_floored() {
-        let mut p = Palette {
+        let p = Palette {
             colors: [Rgb {
                 r: 18,
                 g: 18,
@@ -190,22 +205,22 @@ mod tests {
             mode: Mode::Dark,
         };
         let eff = effective_background(p.background(), 1.0, p.wallpaper_average);
-        p.floor_against(eff, 4.5);
+        let f = p.floor_against(eff, 4.5);
         assert_eq!(
-            p.colors[0],
+            f.colors[0],
             Rgb {
                 r: 18,
                 g: 18,
                 b: 24
             }
         );
-        assert!(p.foreground.contrast(eff) >= 4.5);
+        assert!(f.foreground.contrast(eff) >= 4.5);
         for i in 1..16 {
-            assert!(p.colors[i].contrast(eff) >= 4.5);
+            assert!(f.colors[i].contrast(eff) >= 4.5);
         }
         // Cursor untouched, matching the shell implementation.
         assert_eq!(
-            p.cursor,
+            f.cursor,
             Rgb {
                 r: 30,
                 g: 30,

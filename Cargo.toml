@@ -7,6 +7,11 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/snaraj/theme"
 
+# AGENTS.md: deny(unsafe_code) wired as workspace lints so the gate enforces
+# it; every crate opts in with `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
 [package]
 name = "theme"
 version = "0.0.1"
@@ -14,6 +19,9 @@ description = "One command that owns the desktop wallpaper and the terminal pale
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 pigment = { path = "crates/pigment" }

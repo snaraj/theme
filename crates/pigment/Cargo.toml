@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 # Sole runtime dependency (coordinator ruling, issue #2): decoders only, and
 # exactly the codecs THEME_FORMATS names — jpg/jpeg, png, webp, gif, bmp,
