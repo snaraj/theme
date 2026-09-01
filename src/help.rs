@@ -138,6 +138,7 @@ Library Commands:
 
 Info Commands:
   status          current theme, color-scheme swatches, variables
+  version, -V     version, repository, and maintainer
   help            this text (per-command: theme <command> --help)
 
 Usage:

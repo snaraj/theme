@@ -772,5 +772,19 @@ if printf '%s' "$who_out" | grep -q 'photo by Contributor'; then
     pass "the contributor's printable name still shows"
 else fail "the credit note lost the contributor's name entirely"; fi
 
+# --- version: three lines, exact shape; the number itself floats -------------
+vout=$(run "$lib" version 2>&1)
+if printf '%s\n' "$vout" | sed -n 1p | grep -Eq '^version: v[0-9]+\.[0-9]+\.[0-9]+$'; then
+    pass "version line has the v-prefixed semver shape"
+else fail "version line malformed: $(printf '%s' "$vout" | sed -n 1p)"; fi
+if [ "$(printf '%s\n' "$vout" | sed -n 2p)" = "github: https://github.com/snaraj/theme" ] \
+   && [ "$(printf '%s\n' "$vout" | sed -n 3p)" = "maintainer: Samuel Naranjo" ] \
+   && [ "$(printf '%s\n' "$vout" | wc -l | tr -d ' ')" = "3" ]; then
+    pass "version prints repo and maintainer, three lines exactly"
+else fail "version output shape drifted: $vout"; fi
+if [ "$(run "$lib" --version 2>&1)" = "$vout" ] && [ "$(run "$lib" -V 2>&1)" = "$vout" ]; then
+    pass "--version and -V alias the version command"
+else fail "--version/-V do not match the version output"; fi
+
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILURES"; fi
 [ "$fails" -eq 0 ]
