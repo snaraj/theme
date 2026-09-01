@@ -1256,5 +1256,28 @@ if [ "$note_rc" = 0 ] && ! grep -qF 'update to the latest' "$note_out" \
     pass "a planted FIFO neither hangs nor renders, and the stamp heals it"
 else fail "FIFO at the cache name broke (rc=$note_rc): $(ls -l "$notecache" 2>/dev/null)"; fi
 
+# --- custody depth: steering refused, benign symlinks legal (round 5) ------
+# A symlink held in a world-writable dir steers the endpoint wherever the
+# attacker likes — even at a perfectly clean 0700 target it must refuse
+# (the SPELLED chain is audited, not just the resolved one)…
+mkdir -p "$fixture/steer-target"
+chmod 700 "$fixture/steer-target"
+ln -s "$fixture/steer-target" "$fixture/hostile-cache/steer"
+chmod 777 "$fixture/hostile-cache"
+note_run THEME_CACHE_DIR="$fixture/hostile-cache/steer"
+if [ "$note_rc" = 0 ] && ! grep -qF 'update to the latest' "$note_out" \
+   && [ -z "$(ls -A "$fixture/steer-target")" ]; then
+    pass "a steered cache path refuses: clean target, but hostile spelled chain"
+else fail "endpoint steering accepted (rc=$note_rc): $(ls -A "$fixture/steer-target")"; fi
+chmod 700 "$fixture/hostile-cache"
+# …while a symlink held in CLEAN territory keeps working — every macOS path
+# crosses /var -> /private/var, so benign links must not break custody.
+ln -s "$fixture/steer-target" "$fixture/goodlink-cache"
+printf 'v9.9.9' >"$fixture/steer-target/update-check"
+note_run THEME_CACHE_DIR="$fixture/goodlink-cache"
+if grep -qF 'update to the latest theme version: v9.9.9' "$note_out"; then
+    pass "a benign symlinked cache path still carries custody"
+else fail "benign symlink broke custody: $(tail -3 "$note_out")"; fi
+
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILURES"; fi
 [ "$fails" -eq 0 ]

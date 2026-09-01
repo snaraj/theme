@@ -237,27 +237,89 @@ pub fn maybe_note(cfg: &Config) {
     }
 }
 
-/// Fail-closed custody of the cache directory (Codex round 4): the check
-/// cache is only touched through a directory fd whose fstat proves the dir
-/// is OURS and carries no group/world write bit — audited, never chmodded;
-/// created 0700 when absent. A dir that fails the audit gets NOTHING: no
-/// stamp, no read, no note — silence, exactly like every other failure
-/// mode here. O_NOFOLLOW on the open kills a symlink planted AT the dir
-/// name; the uid check kills an attacker-owned real dir swapped in through
-/// a writable ancestor (they cannot create one owned as us).
+/// Fail-closed custody of the cache directory (Codex rounds 4+5), through
+/// the saver's OWN audit machinery — [`crate::save::audit_dir`] /
+/// [`crate::save::audit_chain`], reused, not copied. Custody means ALL of:
+///
+/// 1. **Spelled-chain audit** — every component of the path as the user
+///    spelled it (the dirs that would HOLD any symlink) is self-or-root
+///    owned, free of group/world write, and free of foreign write-class
+///    ACLs. This kills endpoint steering: a symlink sitting in a
+///    world-writable ancestor refuses no matter where it points.
+/// 2. **Canonical-chain audit** — the resolved directory and every real
+///    ancestor pass the same owner/mode/ACL audit, FAIL-CLOSED when ACLs
+///    cannot be interrogated. (Symlinks into audited territory stay legal:
+///    every macOS path traverses `/var -> /private/var`.)
+/// 3. **Bound endpoint** — the dirfd comes from an openat O_NOFOLLOW walk
+///    of the canonical chain, its fstat must show our uid, directory
+///    type, and no group/world write, and its (dev, ino) must equal a
+///    fresh stat of the audited path — the fd IS the audited endpoint.
+///
+/// Created 0700 when absent; audited, never chmodded. Any failure gets
+/// NOTHING: no stamp, no read, no note, no network — silence.
 fn check_dir(cfg: &Config) -> Option<rustix::fd::OwnedFd> {
     let _ = rustix::fs::mkdir(&cfg.cache_dir, Mode::from_raw_mode(0o700));
-    let fd = rustix::fs::open(
-        &cfg.cache_dir,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .ok()?;
+    let platform = crate::save::native_platform();
+    let mut prefix = std::path::PathBuf::new();
+    for c in cfg.cache_dir.components() {
+        match c {
+            std::path::Component::RootDir => prefix.push("/"),
+            std::path::Component::Normal(n) => {
+                prefix.push(n);
+            }
+            _ => return None, // relative paths and dot-components: no custody
+        }
+        if prefix.parent().is_none() {
+            continue; // "/" itself is every chain's root; audited below
+        }
+        crate::save::audit_dir(&prefix, platform).ok()?;
+    }
+    let canon = std::fs::canonicalize(&cfg.cache_dir).ok()?;
+    crate::save::audit_chain(&canon, platform).ok()?;
+    let fd = open_chain_nofollow(&canon)?;
     let st = rustix::fs::fstat(&fd).ok()?;
-    if st.st_uid != rustix::process::getuid().as_raw() || (st.st_mode as u32) & 0o022 != 0 {
+    if !fd_custody_ok(&st, rustix::process::getuid().as_raw()) {
+        return None;
+    }
+    let now = rustix::fs::stat(&canon).ok()?;
+    if now.st_dev != st.st_dev || now.st_ino != st.st_ino {
         return None;
     }
     Some(fd)
+}
+
+/// Root-down openat walk of an absolute, canonical path: every component
+/// opens O_NOFOLLOW|O_DIRECTORY relative to the previous fd, so a symlink
+/// racing in anywhere along the chain refuses instead of being followed.
+fn open_chain_nofollow(path: &Path) -> Option<rustix::fd::OwnedFd> {
+    use std::path::Component;
+    let mut comps = path.components();
+    if comps.next() != Some(Component::RootDir) {
+        return None;
+    }
+    let mut fd = rustix::fs::open("/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).ok()?;
+    for c in comps {
+        let Component::Normal(name) = c else {
+            return None;
+        };
+        fd = rustix::fs::openat(
+            &fd,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .ok()?;
+    }
+    Some(fd)
+}
+
+/// The fd-level custody predicate, pure over the stat so the foreign-owner
+/// arm is testable without root — the same trick own_socket's test uses
+/// for its unforgeable-uid branch.
+fn fd_custody_ok(st: &rustix::fs::Stat, my_uid: u32) -> bool {
+    rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory
+        && st.st_uid == my_uid
+        && st.st_mode & 0o022 == 0
 }
 
 /// Stamp the check cache: content is the latest known tag (empty when the
@@ -1139,6 +1201,138 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
             std::fs::read_to_string(cache.join("update-check")).unwrap(),
             "v9.9.9"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_chain_walk_refuses_symlink_components() {
+        let d = tempdir();
+        std::fs::create_dir(d.join("real")).unwrap();
+        std::fs::create_dir(d.join("real").join("sub")).unwrap();
+        std::os::unix::fs::symlink(d.join("real"), d.join("link")).unwrap();
+        // A real chain opens; a symlink FINAL component refuses (the round-4
+        // O_NOFOLLOW that survived mutation, now pinned); so does an
+        // INTERMEDIATE one; so does a relative path.
+        assert!(open_chain_nofollow(&d.join("real").join("sub")).is_some());
+        assert!(open_chain_nofollow(&d.join("link")).is_none());
+        assert!(open_chain_nofollow(&d.join("link").join("sub")).is_none());
+        assert!(open_chain_nofollow(Path::new("relative/path")).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cache_custody_refuses_steering_and_hostile_ancestry() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir();
+        let wopen = d.join("wopen");
+        let real = d.join("real");
+        std::fs::create_dir(&wopen).unwrap();
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&real, wopen.join("link")).unwrap();
+        std::fs::create_dir(wopen.join("plain")).unwrap();
+        std::fs::set_permissions(wopen.join("plain"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        std::fs::set_permissions(&wopen, std::fs::Permissions::from_mode(0o777)).unwrap();
+        // Codex round-5 repro: symlink behind a world-writable ancestor,
+        // pointing at a perfectly clean 0700 dir — the SPELLED chain audit
+        // refuses the steering regardless of the target's own hygiene.
+        assert!(check_dir(&test_cfg(&wopen.join("link"))).is_none());
+        // A real 0700 dir under the same hostile ancestor refuses too.
+        assert!(check_dir(&test_cfg(&wopen.join("plain"))).is_none());
+        // Control: the clean dir reached directly is accepted…
+        assert!(check_dir(&test_cfg(&real)).is_some());
+        // …and reached through a symlink held in CLEAN territory it is
+        // still accepted (every macOS path crosses /var -> /private/var),
+        // with the stamp landing in the audited target.
+        std::os::unix::fs::symlink(&real, d.join("goodlink")).unwrap();
+        assert!(check_dir(&test_cfg(&d.join("goodlink"))).is_some());
+        write_check(&test_cfg(&d.join("goodlink")), "v7.7.7");
+        assert_eq!(
+            std::fs::read_to_string(real.join("update-check")).unwrap(),
+            "v7.7.7"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Platform-gated honestly: `chmod +a` is the Darwin ACL mechanism.
+    /// The POSIX arm is pinned on Linux below, and the pure getfacl
+    /// predicate (incl. its fail-closed missing-interrogator branch) is
+    /// pinned for every platform in save_tests::forced_posix_acl_predicate.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_foreign_write_acl_on_a_0700_cache_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir();
+        let cache = d.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let grant = "user:daemon allow add_file,delete_child";
+        let ok = Command::new("/bin/chmod")
+            .args(["+a", grant])
+            .arg(&cache)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "chmod +a failed");
+        assert!(
+            check_dir(&test_cfg(&cache)).is_none(),
+            "a 0700 mode must not outrank a foreign write ACL"
+        );
+        let _ = Command::new("/bin/chmod")
+            .args(["-a", grant])
+            .arg(&cache)
+            .status();
+        assert!(check_dir(&test_cfg(&cache)).is_some(), "control after -a");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Platform-gated honestly: setfacl/getfacl are the POSIX mechanism
+    /// (present on the Linux CI runner; the save fixture already depends
+    /// on getfacl there).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_posix_write_acl_on_the_cache_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir();
+        let cache = d.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            check_dir(&test_cfg(&cache)).is_some(),
+            "clean control first"
+        );
+        let ok = Command::new("setfacl")
+            .args(["-m", "u:root:rwx"])
+            .arg(&cache)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "setfacl failed — is the acl package missing?");
+        assert!(
+            check_dir(&test_cfg(&cache)).is_none(),
+            "a POSIX write ACL for another principal must refuse"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn foreign_owner_and_loose_modes_fail_fd_custody() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir();
+        let fd = rustix::fs::open(&d, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+        let st = rustix::fs::fstat(&fd).unwrap();
+        let me = rustix::process::getuid().as_raw();
+        assert!(fd_custody_ok(&st, me));
+        // The unforgeable-without-root arm, driven with a doctored uid —
+        // own_socket's test plays the same trick.
+        assert!(!fd_custody_ok(&st, me.wrapping_add(1)));
+        let loose = d.join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let lfd =
+            rustix::fs::open(&loose, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+        assert!(!fd_custody_ok(&rustix::fs::fstat(&lfd).unwrap(), me));
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -258,7 +258,7 @@ fn which(name: &str) -> Option<PathBuf> {
         .find(|c| c.is_file())
 }
 
-fn audit_dir(path: &Path, platform: AclPlatform) -> Result<(), String> {
+pub(crate) fn audit_dir(path: &Path, platform: AclPlatform) -> Result<(), String> {
     let st = rustix::fs::stat(path).map_err(|e| {
         format!(
             "refusing to save: {} could not be audited: {e}",
@@ -285,8 +285,9 @@ fn audit_dir(path: &Path, platform: AclPlatform) -> Result<(), String> {
 }
 
 /// Canonical, so a symlinked component is audited as what it really is; then
-/// every ancestor to the root.
-fn audit_chain(path: &Path, platform: AclPlatform) -> Result<(), String> {
+/// every ancestor to the root. Shared custody machinery: the update-check
+/// cache (update.rs) audits through this too, never through a copy.
+pub(crate) fn audit_chain(path: &Path, platform: AclPlatform) -> Result<(), String> {
     let mut q = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     loop {
         audit_dir(&q, platform)?;
