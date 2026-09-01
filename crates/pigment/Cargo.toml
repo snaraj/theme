@@ -1,0 +1,7 @@
+[package]
+name = "pigment"
+version = "0.0.1"
+description = "In-house wallpaper-to-palette color engine"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true

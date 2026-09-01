@@ -1,0 +1,19 @@
+[workspace]
+members = ["crates/pigment"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/snaraj/theme"
+
+[package]
+name = "theme"
+version = "0.0.1"
+description = "One command that owns the desktop wallpaper and the terminal palette together"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pigment = { path = "crates/pigment" }
