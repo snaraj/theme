@@ -136,7 +136,7 @@ fn main() {
             }
             commands::cmd_rm(&cfg, &args[1..]);
         }
-        "update" => update::cmd_update(),
+        "update" => update::cmd_update(&cfg, &flags.version_sel),
         "version" | "--version" | "-V" => {
             // Compile-time version — no runtime lookups.
             println!(

@@ -48,6 +48,11 @@ exists() { # $1 description, $2 yes|no, $3 path
     else fail "$1"; fi
 }
 
+# The update-available check is disabled for the WHOLE fixture — no case may
+# ever touch the real network; the footer-note section re-enables it per run
+# against a stubbed/failing curl.
+export THEME_NO_UPDATE_CHECK=1
+
 # The AMBIENT credential environment is neutralised once, here, for the whole
 # fixture; every case that needs a credential sets it explicitly.
 outer_token="${UNSPLASH_USER_TOKEN-}"
@@ -855,11 +860,18 @@ done
 [ "$k" = 1 ] && cat >/dev/null
 printf '%s\n' "$url" >>"$UPD_LOG"
 resp() { printf 'HTTP/2 %s\r\n%s\r\n\r\n' "$1" "$2" >"$hdr"; }
+release_json() { # $1 tag — STABLE asset names, no version infix (#14 r3)
+    local a="https://github.com/snaraj/theme/releases/download/$1"
+    printf '{"tag_name":"%s","assets":[{"name":"SHA256SUMS","browser_download_url":"%s/SHA256SUMS"},{"name":"theme-%s.tar.gz","browser_download_url":"%s/theme-%s.tar.gz"}]}' \
+        "$1" "$a" "$UPD_TRIPLE" "$a" "$UPD_TRIPLE"
+}
 case "$url" in
 *api.github.com/repos/snaraj/theme/releases/latest*)
-    a="https://github.com/snaraj/theme/releases/download/$UPD_TAG"
-    printf '{"tag_name":"%s","assets":[{"name":"SHA256SUMS","browser_download_url":"%s/SHA256SUMS"},{"name":"theme-%s-%s.tar.gz","browser_download_url":"%s/theme-%s-%s.tar.gz"}]}' \
-        "$UPD_TAG" "$a" "$UPD_TAG" "$UPD_TRIPLE" "$a" "$UPD_TAG" "$UPD_TRIPLE"
+    release_json "$UPD_TAG"
+    ;;
+*api.github.com/repos/snaraj/theme/releases/tags/*)
+    want="${url##*/}"
+    if [ "$want" = "$UPD_TAG" ]; then release_json "$want"; else exit 22; fi
     ;;
 */releases/download/*/SHA256SUMS*)
     : >"$out"; resp 302 "location: https://release-assets.githubusercontent.com/sums"
@@ -899,7 +911,11 @@ chmod +x "$updd/stubbin/curl"
 updlog="$updd/log"
 upd_out="$updd/out"
 upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
-    # a $() capture would strand both in a subshell); env pairs as args
+    # a $() capture would strand both in a subshell); env pairs, then an
+    # optional `--` followed by extra update arguments
+    local envs=()
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+    [ "${1:-}" = "--" ] && shift
     # rm first: macOS caches code-signing state by inode, and cp -f over a
     # previously-executed binary poisons it — the next exec dies SIGKILL.
     rm -f "$updd/bin/theme"
@@ -909,14 +925,14 @@ upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
         UPD_SUMS_FILE="$updd/sums" PATH="$updd/stubbin:$PATH" \
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
-        "$@" "$updd/bin/theme" update >"$upd_out" 2>&1
+        "${envs[@]}" "$updd/bin/theme" update "$@" >"$upd_out" 2>&1
     upd_rc=$?
 }
 upd_intact() { # target still byte-identical to the real binary, no temp left
     cmp -s "$THEME" "$updd/bin/theme" \
         && [ -z "$(find "$updd/bin" -name '.*update*' 2>/dev/null)" ]
 }
-printf '%s  theme-v9.9.9-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
+printf '%s  theme-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
 
 upd_run UPD_TAG="v$cur_ver"
 if [ "$upd_rc" = 0 ] && grep -qF "already up to date (v$cur_ver)" "$upd_out"; then
@@ -937,7 +953,7 @@ if [ -z "$(find "$updd/bin" -name '.*update*' 2>/dev/null)" ]; then
     pass "no install temp file survives success"
 else fail "an install temp file was left beside the binary"; fi
 
-printf '%064d  theme-v9.9.9-%s.tar.gz\n' 0 "$triple" >"$updd/sums"
+printf '%064d  theme-%s.tar.gz\n' 0 "$triple" >"$updd/sums"
 upd_run UPD_TAG=v9.9.9
 if [ "$upd_rc" != 0 ] && grep -q 'SHA256 verification FAILED' "$upd_out"; then
     pass "a corrupted hash is refused"
@@ -946,7 +962,7 @@ if upd_intact; then
     pass "the corrupted download never touched the binary"
 else fail "unverified bytes reached the install target"; fi
 
-printf '%s  theme-v9.9.9-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
+printf '%s  theme-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
 upd_run UPD_TAG=v9.9.9 UPD_EVIL=1
 if [ "$upd_rc" != 0 ] && grep -q 'refusing non-GitHub download host' "$upd_out"; then
     pass "a redirect off GitHub's hosts is refused"
@@ -971,12 +987,12 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
     badsha=$(shasum -a 256 "$badtar" | cut -d' ' -f1)
 fi
-printf '%s  theme-v9.9.9-%s.tar.gz\n' "$badsha" "$triple" >"$updd/sums"
+printf '%s  theme-%s.tar.gz\n' "$badsha" "$triple" >"$updd/sums"
 upd_run UPD_TAG=v9.9.9 UPD_PAYLOAD="$badtar"
 if [ "$upd_rc" != 0 ] && grep -q "no 'theme' binary" "$upd_out" && upd_intact; then
     pass "a verified archive without the binary is refused"
 else fail "member-less archive not refused: $(cat "$upd_out")"; fi
-printf '%s  theme-v9.9.9-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
+printf '%s  theme-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
 
 upd_run UPD_TAG=v9.9.9 UPD_BIG=1
 if [ "$upd_rc" != 0 ] && grep -q 'byte cap' "$upd_out" && upd_intact; then
@@ -985,6 +1001,121 @@ else fail "oversized download not refused: $(cat "$upd_out")"; fi
 if [ -z "$(find "$fixture/tmpdir" -type f -name 'theme.*' 2>/dev/null)" ]; then
     pass "update leaves no scratch residue on any path"
 else fail "update left scratch files behind"; fi
+
+# --- update and the footer note share ONE cache ----------------------------
+rm -f "$fixture/cache/update-check"
+upd_run UPD_TAG="v$cur_ver"
+if [ "$(cat "$fixture/cache/update-check" 2>/dev/null)" = "v$cur_ver" ]; then
+    pass "a latest-mode update stamps the shared check cache"
+else fail "theme update did not refresh the update-check cache"; fi
+
+# --- update --version: a specific release through the same pipeline --------
+rm -f "$fixture/cache/update-check"
+upd_run UPD_TAG=v9.9.9 -- --version 9.9.9
+if [ "$upd_rc" = 0 ] && grep -qF "theme v$cur_ver → v9.9.9" "$upd_out" \
+   && cmp -s "$inner" "$updd/bin/theme"; then
+    pass "--version installs the requested release"
+else fail "--version happy path broke: $(cat "$upd_out")"; fi
+if grep -q '/releases/tags/v9.9.9' "$updlog"; then
+    pass "--version normalizes and uses the by-tag endpoint"
+else fail "--version did not hit the by-tag endpoint: $(cat "$updlog")"; fi
+if [ ! -e "$fixture/cache/update-check" ]; then
+    pass "a --version fetch never stamps the latest-check cache"
+else fail "--version poisoned the update-check cache"; fi
+
+upd_run UPD_TAG=v9.9.9 -- --version '../../evil'
+if [ "$upd_rc" != 0 ] && grep -q 'takes a release version' "$upd_out" \
+   && [ ! -s "$updlog" ]; then
+    pass "an injection-shaped --version refuses before any network"
+else fail "--version injection reached further than the parser: $(cat "$upd_out")"; fi
+upd_run UPD_TAG=v9.9.9 -- --version
+if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ]; then
+    pass "a dangling --version refuses before any network"
+else fail "dangling --version was not refused: $(cat "$upd_out")"; fi
+
+upd_run UPD_TAG=v9.9.9 -- --version 0.0.0
+if grep -q 'warning: older versions may be unsupported or break — proceeding to v0.0.0' "$upd_out"; then
+    pass "a downgrade warns at launch and proceeds"
+else fail "downgrade warning missing: $(cat "$upd_out")"; fi
+if [ "$upd_rc" != 0 ] && grep -q 'no release v0.0.0' "$upd_out" && upd_intact; then
+    pass "a missing tag refuses cleanly with the binary intact"
+else fail "missing tag not refused cleanly: $(cat "$upd_out")"; fi
+
+# --- the update-available footer on the bare `theme` screen ----------------
+notecache="$fixture/notecache"
+mkdir -p "$notecache"
+failbin="$fixture/failbin"
+mkdir -p "$failbin"
+notefaillog="$fixture/notefail.log"
+: >"$notefaillog"
+cat >"$failbin/curl" <<'EOS'
+#!/bin/sh
+printf 'x\n' >>"$NOTE_FAIL_LOG"
+exit 6
+EOS
+chmod +x "$failbin/curl"
+note_out="$updd/note.out"
+note_run() { # bare `theme` with the check ENABLED; env-pair overrides last
+    env THEME_NO_UPDATE_CHECK= NOTE_FAIL_LOG="$notefaillog" \
+        THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$notecache" \
+        THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" KITTY_WINDOW_ID='' \
+        PATH="$failbin:$sweepbin:$PATH" "$@" "$THEME" >"$note_out" 2>&1
+    note_rc=$?
+}
+expect1="update to the latest theme version: v9.9.9 -> https://github.com/snaraj/theme/releases/tag/v9.9.9"
+expect2="to update run: theme update"
+
+printf 'v9.9.9' >"$notecache/update-check"
+note_run
+if [ "$(tail -2 "$note_out" | sed -n 1p)" = "$expect1" ] \
+   && [ "$(tail -2 "$note_out" | sed -n 2p)" = "$expect2" ]; then
+    pass "a newer cached release ends the screen with the two-line footer"
+else fail "footer shape drifted: $(tail -3 "$note_out")"; fi
+if [ ! -s "$notefaillog" ]; then
+    pass "a fresh cache spawns no network attempt"
+else fail "the note refreshed despite a fresh cache"; fi
+
+printf 'v%s' "$cur_ver" >"$notecache/update-check"
+note_run
+if ! grep -qF 'update to the latest' "$note_out"; then
+    pass "an up-to-date cache renders no footer"
+else fail "the footer rendered for the running version"; fi
+printf 'v0.0.0' >"$notecache/update-check"
+note_run
+if ! grep -qF 'update to the latest' "$note_out"; then
+    pass "a dev build newer than the latest renders no footer"
+else fail "the footer rendered for an older latest"; fi
+printf 'v9.9.9junk' >"$notecache/update-check"
+note_run
+if ! grep -qF 'update to the latest' "$note_out"; then
+    pass "a malformed cache is silently ignored"
+else fail "a malformed cache still rendered"; fi
+printf 'v9.9.9\033]52;c;steal\007' >"$notecache/update-check"
+note_run
+if ! grep -qF 'update to the latest' "$note_out" \
+   && ! grep -qF "$(printf '\033]')" "$note_out"; then
+    pass "a hostile cache renders neither a footer nor terminal protocol"
+else fail "hostile cache content reached the terminal"; fi
+
+rm -f "$notecache/update-check"
+note_run
+if [ "$note_rc" = 0 ] && ! grep -qiE 'update to the latest|error|curl' "$note_out"; then
+    pass "no cache + no network is silent and exits clean"
+else fail "the offline check leaked noise (rc=$note_rc): $(tail -3 "$note_out")"; fi
+if [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ] && [ -e "$notecache/update-check" ]; then
+    pass "the failed attempt was stamped into the cache"
+else fail "offline attempt accounting is wrong: $(wc -l <"$notefaillog") attempts"; fi
+note_run
+if [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ]; then
+    pass "one bounded attempt per TTL window, not per run"
+else fail "the note retried inside the TTL window"; fi
+
+rm -f "$notecache/update-check"
+note_run THEME_NO_UPDATE_CHECK=1
+if ! grep -qF 'update to the latest' "$note_out" \
+   && [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ]; then
+    pass "the kill-switch spawns nothing and renders nothing"
+else fail "THEME_NO_UPDATE_CHECK did not disable the check"; fi
 
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILURES"; fi
 [ "$fails" -eq 0 ]

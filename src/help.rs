@@ -153,6 +153,7 @@ Global Flags (any image command):
 Use \"theme <command> --help\" for more information about a given command.
 "
     );
+    crate::update::maybe_note(cfg);
 }
 
 pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
@@ -303,7 +304,7 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
 "
         ),
         "update" => print!(
-            "theme update
+            "theme update [--version <vX.Y.Z>]
 
   Check the latest GitHub release (snaraj/theme) and install it over
   this binary in one step, printing current → new. Already current is
@@ -313,8 +314,17 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
   install location is not writable the command says so and stops;
   theme never elevates.
 
-  Example:
+  --version installs a specific release instead of the latest — older
+  versions may be unsupported or break (a downgrade says so before it
+  proceeds), through the same verified pipeline.
+
+  The bare `theme` screen notes when a newer release exists (checked
+  at most once a day, silently); THEME_NO_UPDATE_CHECK=1 disables the
+  check. `theme update` itself always runs when you ask.
+
+  Examples:
     theme update
+    theme update --version v0.1.0
 "
         ),
         "help" | "" => usage(cfg),

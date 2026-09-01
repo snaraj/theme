@@ -14,6 +14,8 @@ pub struct Flags {
     pub desktop_only: bool,
     pub wallpaper: String,
     pub source_url: String,
+    /// `update --version <v>`: the requested release, empty = latest.
+    pub version_sel: String,
     pub args: Vec<String>,
 }
 
@@ -25,6 +27,7 @@ pub fn parse(argv: &[String]) -> Flags {
     let mut want_rotate = false;
     let mut want_n = false;
     let mut want_w = false;
+    let mut want_version = false;
     let mut list_n_raw = String::from("10");
     for a in argv {
         if want_rotate {
@@ -40,6 +43,11 @@ pub fn parse(argv: &[String]) -> Flags {
         if want_w {
             f.wallpaper = a.clone();
             want_w = false;
+            continue;
+        }
+        if want_version {
+            f.version_sel = a.clone();
+            want_version = false;
             continue;
         }
         match a.as_str() {
@@ -59,6 +67,13 @@ pub fn parse(argv: &[String]) -> Flags {
             s if s.starts_with("--wallpaper=") => {
                 f.wallpaper = s["--wallpaper=".len()..].to_string();
             }
+            // Leading `--version` is the version-command alias (falls
+            // through to args); AFTER a command token it is `update`'s
+            // release selector.
+            "--version" if !f.args.is_empty() => want_version = true,
+            s if s.starts_with("--version=") && !f.args.is_empty() => {
+                f.version_sel = s["--version=".len()..].to_string();
+            }
             _ => f.args.push(a.clone()),
         }
     }
@@ -70,6 +85,9 @@ pub fn parse(argv: &[String]) -> Flags {
     }
     if want_w {
         die("--wallpaper takes a wallpaper name");
+    }
+    if want_version {
+        die("--version takes a release version like v0.1.0");
     }
     if !matches!(f.rotate.as_str(), "" | "left" | "right") {
         die("--rotate takes left or right");

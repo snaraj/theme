@@ -28,7 +28,7 @@
 //! the temp and leaves the target untouched. An unwritable target
 //! directory is a clear error — never sudo.
 
-use crate::config::{MAX_DOWNLOAD_BYTES, UA};
+use crate::config::{Config, MAX_DOWNLOAD_BYTES, UA};
 use crate::json::Json;
 use crate::net::{curl_config, url_host};
 use crate::scratch;
@@ -39,8 +39,13 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
-const API_LATEST: &str = "https://api.github.com/repos/snaraj/theme/releases/latest";
+const RELEASES_API: &str = "https://api.github.com/repos/snaraj/theme/releases";
+/// How long a footer-note check result stays fresh. One bounded, silent
+/// refresh attempt per window, shared with `theme update` through the same
+/// cache file.
+const CHECK_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Every host an asset download may touch: the release-download URL itself
 /// plus GitHub's asset CDN (current, and the previous one it may still
 /// answer from). Any other Location refuses before curl is even spawned.
@@ -72,48 +77,53 @@ const TARGET: &str = "x86_64-unknown-linux-gnu";
 )))]
 const TARGET: &str = "";
 
-pub fn cmd_update() {
+pub fn cmd_update(cfg: &Config, want: &str) {
     if TARGET.is_empty() {
         die("no published release build for this platform — build from source");
     }
-    let body = curl_config(
-        "header = \"Accept: application/vnd.github+json\"\nheader = \"X-GitHub-Api-Version: 2022-11-28\"\n",
-        &[
-            "-fsg",
-            "--proto",
-            "=https",
-            "--max-redirs",
-            "0",
-            "--max-filesize",
-            "1048576",
-            "--max-time",
-            "30",
-            "-A",
-            UA,
-            "-K",
-            "-",
-            "--url",
-            API_LATEST,
-        ],
-    )
-    .unwrap_or_else(|| die("cannot reach the GitHub release API (no network or no release yet)"));
-    if body.len() as u64 > API_CAP {
-        die("release API answer exceeds its size cap");
-    }
-    let json = String::from_utf8(body)
-        .ok()
-        .and_then(|s| Json::parse(&s))
-        .unwrap_or_else(|| die("release API answered unparseable JSON"));
+    let current = env!("CARGO_PKG_VERSION");
+    // --version: STRICT shape validation BEFORE the string can touch a URL
+    // path, and the downgrade warning before any network — a warning, not a
+    // prompt.
+    let want_tag = if want.is_empty() {
+        None
+    } else {
+        let (v, canon) = parse_ver_arg(want)
+            .unwrap_or_else(|| die("--version takes a release version like v0.1.0"));
+        if let Some(cur) = parse_v3(&format!("v{current}"))
+            && v < cur
+        {
+            eprintln!(
+                "warning: older versions may be unsupported or break — proceeding to {canon}"
+            );
+        }
+        Some(canon)
+    };
+    let url = match &want_tag {
+        Some(t) => format!("{RELEASES_API}/tags/{t}"),
+        None => format!("{RELEASES_API}/latest"),
+    };
+    let json = fetch_release(&url, "30").unwrap_or_else(|| match &want_tag {
+        Some(t) => die(&format!(
+            "no release {t} — see https://github.com/snaraj/theme/releases (or the request failed)"
+        )),
+        None => die("cannot reach the GitHub release API (no network or no release yet)"),
+    });
 
     let tag = json
         .str_field("tag_name")
         .filter(|t| tag_shape_ok(t))
         .map(str::to_string)
         .unwrap_or_else(|| die("release has no usable tag"));
-    let current = env!("CARGO_PKG_VERSION");
-    if tag.trim_start_matches('v') == current {
-        println!("already up to date (v{current})");
-        return;
+    if want_tag.is_none() {
+        // Only a LATEST answer refreshes the footer-note cache — one source
+        // of truth shared with the update-available check. A --version fetch
+        // must not: stamping an older tag would hide the real latest.
+        write_check(cfg, &tag);
+        if tag.trim_start_matches('v') == current {
+            println!("already up to date (v{current})");
+            return;
+        }
     }
 
     // SHA256SUMS is the ground truth for both the asset NAME (the unique
@@ -151,6 +161,131 @@ pub fn cmd_update() {
     scratch::done(&staged);
     println!("theme v{current} → {tag}");
     println!("updated: {}", display_text(&target.display().to_string()));
+}
+
+/// One release-API request: hardened flags, bounded size, parsed JSON.
+/// `max_time` is the caller's latency budget — 30s for the explicit
+/// `theme update`, 2s for the silent footer-note refresh.
+fn fetch_release(url: &str, max_time: &str) -> Option<Json> {
+    let body = curl_config(
+        "header = \"Accept: application/vnd.github+json\"\nheader = \"X-GitHub-Api-Version: 2022-11-28\"\n",
+        &[
+            "-fsg",
+            "--proto",
+            "=https",
+            "--max-redirs",
+            "0",
+            "--max-filesize",
+            "1048576",
+            "--max-time",
+            max_time,
+            "-A",
+            UA,
+            "-K",
+            "-",
+            "--url",
+            url,
+        ],
+    )?;
+    if body.len() as u64 > API_CAP {
+        return None;
+    }
+    String::from_utf8(body).ok().and_then(|s| Json::parse(&s))
+}
+
+/// The update-available footer on the bare `theme` screen. Silent on every
+/// failure mode — offline, rate-limited, bad JSON, malformed cache — and
+/// printed ONLY when the cached latest is strictly newer than this build.
+/// THEME_NO_UPDATE_CHECK (non-empty) disables the check and the note.
+///
+/// Speed contract: the note reads one small cache file. At most one
+/// bounded refresh (2s hard cap) runs per [`CHECK_TTL`] window, and the
+/// attempt is stamped even on failure so an offline machine pays it once
+/// per window, not per run.
+pub fn maybe_note(cfg: &Config) {
+    let off = std::env::var("THEME_NO_UPDATE_CHECK")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if off {
+        return;
+    }
+    let path = cfg.cache_dir.join("update-check");
+    let fresh = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .map(|t| match std::time::SystemTime::now().duration_since(t) {
+            Ok(age) => age <= CHECK_TTL,
+            // A future mtime reads as fresh, not stale — the failure mode
+            // of a skewed clock must be silence, never a hot loop.
+            Err(_) => true,
+        })
+        .unwrap_or(false);
+    if !fresh {
+        let tag = fetch_release(&format!("{RELEASES_API}/latest"), "2")
+            .and_then(|j| {
+                j.str_field("tag_name")
+                    .filter(|t| tag_shape_ok(t))
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        write_check(cfg, &tag);
+    }
+    let cached = std::fs::read_to_string(&path).unwrap_or_default();
+    // The cached tag is REMOTE data headed for a terminal: it renders only
+    // if it parses as a strict numeric semver triple, and both printed
+    // values are RECONSTRUCTED from the parsed numbers — a remote-supplied
+    // string or URL is never echoed.
+    if let Some((a, b, c)) = newer_than(cached.trim(), env!("CARGO_PKG_VERSION")) {
+        println!(
+            "\nupdate to the latest theme version: v{a}.{b}.{c} -> https://github.com/snaraj/theme/releases/tag/v{a}.{b}.{c}"
+        );
+        println!("to update run: theme update");
+    }
+}
+
+/// Stamp the check cache: content is the latest known tag (empty when the
+/// refresh failed), mtime is the attempt time. Write-then-rename so a
+/// concurrent reader never sees a torn value.
+fn write_check(cfg: &Config, tag: &str) {
+    let _ = std::fs::create_dir_all(&cfg.cache_dir);
+    let tmp = cfg
+        .cache_dir
+        .join(format!(".update-check.{}", std::process::id()));
+    if std::fs::write(&tmp, tag).is_ok() {
+        let _ = std::fs::rename(&tmp, cfg.cache_dir.join("update-check"));
+    }
+}
+
+/// Strict numeric semver: `v<major>.<minor>.<patch>`, ASCII digits only —
+/// no prerelease, no build metadata, nothing that could smuggle bytes into
+/// a URL or the terminal.
+fn parse_v3(s: &str) -> Option<(u64, u64, u64)> {
+    let rest = s.strip_prefix('v')?;
+    let mut parts = rest.split('.');
+    let mut next = || {
+        parts
+            .next()
+            .filter(|p| !p.is_empty() && p.len() <= 10 && p.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|p| p.parse::<u64>().ok())
+    };
+    let v = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(v)
+}
+
+/// The remote triple, if it is strictly newer than the running build —
+/// equal and older (dev build) both answer None, so no note renders.
+fn newer_than(cached: &str, current: &str) -> Option<(u64, u64, u64)> {
+    let r = parse_v3(cached)?;
+    let c = parse_v3(&format!("v{current}"))?;
+    (r > c).then_some(r)
+}
+
+/// A user-supplied `--version` value: `vX.Y.Z` or `X.Y.Z`, normalized to
+/// the canonical tag. Anything else — including path shapes — refuses
+/// before the string can reach a URL.
+fn parse_ver_arg(s: &str) -> Option<((u64, u64, u64), String)> {
+    let bare = s.strip_prefix('v').unwrap_or(s);
+    let v = parse_v3(&format!("v{bare}"))?;
+    Some((v, format!("v{}.{}.{}", v.0, v.1, v.2)))
 }
 
 /// Release tags are API data: `v` + a short run of version characters,
@@ -399,6 +534,10 @@ fn install_over(target: &Path, tarball: &Path) -> Result<(), String> {
         return Err(format!("fsync failed: {e}"));
     }
     drop(tmp);
+    // rename(2), NEVER an in-place copy: macOS caches code-signing state by
+    // vnode, and overwriting a previously-executed binary's inode poisons
+    // it — the next exec dies SIGKILL. The rename swaps the directory entry
+    // to a fresh inode (atomic, and the running image keeps its old vnode).
     rustix::fs::renameat(&dirfd, tmp_name.as_str(), &dirfd, name).map_err(|e| {
         let _ = rustix::fs::unlinkat(&dirfd, tmp_name.as_str(), rustix::fs::AtFlags::empty());
         format!("cannot replace {}: {e}", target.display())
@@ -409,18 +548,20 @@ fn install_over(target: &Path, tarball: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    // The release chain's STABLE asset names (no version infix — #14 round
+    // 3 dropped the publish-job rename so latest/download URLs stay live).
     const SUMS: &str = "\
-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  theme-v1.2.3-aarch64-apple-darwin\n\
-fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-v1.2.3-x86_64-unknown-linux-gnu\n";
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  theme-aarch64-apple-darwin.tar.gz\n\
+fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-unknown-linux-gnu.tar.gz\n";
 
     #[test]
     fn sums_selection_is_unique_and_shape_checked() {
         let (hex, name) = pick_from_sums(SUMS, "aarch64-apple-darwin").unwrap();
-        assert_eq!(name, "theme-v1.2.3-aarch64-apple-darwin");
+        assert_eq!(name, "theme-aarch64-apple-darwin.tar.gz");
         assert!(hex.starts_with("0123"));
         // The `*` binary-marker form parses too.
         let (_, name) = pick_from_sums(SUMS, "x86_64-unknown-linux-gnu").unwrap();
-        assert_eq!(name, "theme-v1.2.3-x86_64-unknown-linux-gnu");
+        assert_eq!(name, "theme-x86_64-unknown-linux-gnu.tar.gz");
         // No entry and ambiguous entries both refuse.
         assert!(pick_from_sums(SUMS, "riscv64gc-unknown-none").is_err());
         let dup = format!("{SUMS}{SUMS}");
@@ -470,6 +611,47 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-v1.2.3-x
         assert!(!tag_shape_ok("v"));
         assert!(!tag_shape_ok("v0.1.0\x1b]52;x\x07"));
         assert!(!tag_shape_ok("v0.1.0/../../x"));
+    }
+
+    #[test]
+    fn strict_semver_triples_only() {
+        assert_eq!(parse_v3("v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_v3("v0.0.0"), Some((0, 0, 0)));
+        assert!(parse_v3("1.2.3").is_none()); // v required here
+        assert!(parse_v3("v1.2").is_none());
+        assert!(parse_v3("v1.2.3.4").is_none());
+        assert!(parse_v3("v1.2.3-rc.1").is_none());
+        assert!(parse_v3("v1.2.x").is_none());
+        assert!(parse_v3("v1.2.\u{1b}]52;c;x\u{7}3").is_none());
+        assert!(parse_v3("v99999999999999999999.0.0").is_none()); // overflow
+    }
+
+    #[test]
+    fn the_note_gate_fires_only_on_strictly_newer() {
+        assert_eq!(newer_than("v9.9.9", "0.0.1"), Some((9, 9, 9)));
+        assert_eq!(newer_than("v0.0.1", "0.0.1"), None); // equal
+        assert_eq!(newer_than("v0.0.0", "0.0.1"), None); // dev build newer
+        assert_eq!(newer_than("", "0.0.1"), None); // no data
+        assert_eq!(newer_than("v9.9.9junk", "0.0.1"), None); // malformed
+        assert_eq!(newer_than("v0.10.0", "0.9.9"), Some((0, 10, 0))); // numeric, not lexical
+    }
+
+    #[test]
+    fn version_arg_normalizes_or_refuses() {
+        assert_eq!(
+            parse_ver_arg("0.1.0"),
+            Some(((0, 1, 0), "v0.1.0".to_string()))
+        );
+        assert_eq!(
+            parse_ver_arg("v0.1.0"),
+            Some(((0, 1, 0), "v0.1.0".to_string()))
+        );
+        // Path shapes, flags, and junk refuse BEFORE any URL is built.
+        assert!(parse_ver_arg("../../evil").is_none());
+        assert!(parse_ver_arg("v0.1.0/../x").is_none());
+        assert!(parse_ver_arg("latest").is_none());
+        assert!(parse_ver_arg("").is_none());
+        assert!(parse_ver_arg("v0.1.0-rc.1").is_none());
     }
 
     fn sha_hex(b: &[u8]) -> String {
