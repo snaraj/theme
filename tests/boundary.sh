@@ -1481,6 +1481,7 @@ cat >"$fixture/narrowck.py" <<'EOS'
 import re, sys
 path, cols, imgrows, imgw = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 raw = open(path, encoding='utf-8', errors='replace').read()
+raw = raw.replace('\r', '')
 raw = re.sub(r'\x1b_G.*?\x1b\\', '', raw, flags=re.S)
 raw = re.sub(r'\x1b\].*?(\x07|\x1b\\)', '', raw)
 raw = re.sub(r'\x1b\[[0-9;:]*[A-Za-z]', '', raw)
@@ -1501,7 +1502,7 @@ else:
 starters = ('Apply Commands:', 'Library Commands:', 'Info Commands:', 'Usage:',
             'Global Flags', 'Use "', 'current theme:', 'mode:', 'color scheme:',
             'palette source:', 'palette image:', 'wallpaper dir:', 'variables:',
-            'update to the latest', 'to update run:', 'wallpapers')
+            'update to the latest', 'to update run:', 'wallpapers', 'theme v')
 for l in lines:
     if l and not l.startswith(' ') and not l.startswith(starters):
         sys.exit('column-0 line outside the known starters: %r' % l)
@@ -1543,6 +1544,74 @@ narrow_run 40 status
 if [ "$narrow_rc" = 0 ] && why=$(narrowck 40 0 0); then
     pass "a 40-column status wraps every value with a hanging indent"
 else fail "40-column status broke (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
+
+# --- the REAL terminal width, from the tty itself (issue #21) ---------------
+# v0.2.1 read only COLUMNS, which zsh does not export — every real terminal
+# fell to the wide default and the owner's 42-column kitty still tore. This
+# pin is the one that would have caught it: a genuine 42-column pty with
+# COLUMNS UNSET must stack. (The env-forced pins above stay: they pin the
+# pipe/test class, where COLUMNS is the explicit override.)
+cat >"$fixture/ptyrun.py" <<'EOS'
+import fcntl, os, pty, struct, subprocess, sys, termios
+cols, out, cmd = int(sys.argv[1]), sys.argv[2], sys.argv[3:]
+m, s = pty.openpty()
+fcntl.ioctl(s, termios.TIOCSWINSZ, struct.pack('HHHH', 24, cols, 0, 0))
+env = dict(os.environ)
+env.pop('COLUMNS', None)
+p = subprocess.Popen(cmd, stdout=s, stderr=s, env=env)
+os.close(s)
+buf = b''
+while True:
+    try:
+        d = os.read(m, 65536)
+    except OSError:
+        break
+    if not d:
+        break
+    buf += d
+p.wait()
+os.close(m)
+open(out, 'wb').write(buf.replace(b'\r\n', b'\n'))
+sys.exit(p.returncode)
+EOS
+narrow_pty() { # $1 cols, rest: theme args — a real tty answer, no COLUMNS
+    local c="$1"
+    shift
+    env KITTY_WINDOW_ID=1 PATH="$narrowbin:$sweepbin:$PATH" \
+        THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
+        THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
+        python3 "$fixture/ptyrun.py" "$c" "$narrow_out" "$THEME" "$@"
+    narrow_rc=$?
+}
+narrow_pty 42
+if [ "$narrow_rc" = 0 ] && why=$(narrowck 42 6 14) && ! grep -q '#.*THEME' "$narrow_out" \
+   && grep -q '^  THEME$' "$narrow_out"; then
+    pass "a real 42-column tty stacks with COLUMNS unset"
+else fail "the tty's own width was ignored (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
+
+# The title line opens the bare screen at every width, shaped like the
+# version subcommand's answer.
+if [ "$(head -1 "$narrow_out")" = "theme v$cur_ver" ]; then
+    pass "the narrow bare screen opens with 'theme v$cur_ver'"
+else fail "narrow title line wrong: $(head -1 "$narrow_out")"; fi
+narrow_run 100
+if [ "$(head -1 "$narrow_out")" = "theme v$cur_ver" ]; then
+    pass "the wide bare screen opens with 'theme v$cur_ver'"
+else fail "wide title line wrong: $(head -1 "$narrow_out")"; fi
+
+# --- no kitty, no protocol: absence is clean (portability doctrine) ---------
+# On an iTerm2-class terminal (no KITTY_WINDOW_ID) the screen must carry
+# ZERO kitty graphics bytes — no APC, no placeholder cells — and still
+# render its fields.
+env COLUMNS=42 KITTY_WINDOW_ID= PATH="$narrowbin:$sweepbin:$PATH" \
+    THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
+    THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
+    "$THEME" >"$narrow_out" 2>&1
+if [ "$?" = 0 ] && ! grep -q "$(printf '\033_G')" "$narrow_out" \
+   && ! grep -q '#' "$narrow_out" && grep -q '^  THEME$' "$narrow_out" \
+   && why=$(narrowck 42 0 0); then
+    pass "no kitty means no graphics bytes, fields intact"
+else fail "non-kitty degradation leaked protocol: ${why:-$(tail -3 "$narrow_out")}"; fi
 
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILURES"; fi
 [ "$fails" -eq 0 ]
