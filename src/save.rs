@@ -145,20 +145,52 @@ pub fn native_platform() -> AclPlatform {
     }
 }
 
-fn me() -> String {
-    Command::new("id")
-        .arg("-un")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+/// The one external interrogator left (darwin's `ls -lde`) must itself be
+/// beyond an attacker's reach before its output is trusted: reached by
+/// ABSOLUTE path — PATH plays no part in a custody decision — and both the
+/// binary and its directory must be root-owned with no group/world write.
+/// Shared with the update transport (round 8): the curl that fetches bytes
+/// destined for executable replacement passes the same bar.
+pub(crate) fn trusted_system_binary(p: &str) -> bool {
+    let clean = |q: &Path| {
+        rustix::fs::stat(q)
+            .map(|st| st.st_uid == 0 && st.st_mode & 0o022 == 0)
+            .unwrap_or(false)
+    };
+    let p = Path::new(p);
+    p.parent().map(clean).unwrap_or(false) && clean(p)
 }
 
-/// A REASON to refuse, or None. Only ALLOW entries granting a write-shaped
-/// right to someone who is not us count: a DENY entry restricts rather than
-/// grants, and every macOS home carries `group:everyone deny delete`.
-/// writesecurity/chown are included: they let a principal grant itself the
-/// direct rights a moment later.
+/// The ONE environment boundary for every spawn inside the security
+/// boundary — the update lane's curl (both the metadata request and every
+/// download hop) and the darwin ACL interrogator alike. A validated binary
+/// still inherits its parent's environment, and that channel alone restores
+/// single-actor control (round 9): CURL_CA_BUNDLE/SSL_CERT_FILE=/dev/null
+/// substitute the TLS trust anchors right through `-q`, and
+/// LD_PRELOAD/LD_AUDIT/LD_LIBRARY_PATH (DYLD_* on macOS) execute attacker
+/// code inside the trusted binary itself. So the child starts from an
+/// EMPTY environment — the allowlist is deliberately empty: this lane's
+/// children need no HOME (`-q` already refuses curlrc), no PATH (the
+/// binary is absolute and spawns nothing), no TMPDIR (every output lands
+/// at an absolute path we pass), no locale (we parse structural output
+/// only). Add a variable here only with a written justification.
+pub(crate) fn trusted_spawn(program: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_clear();
+    cmd
+}
+
+/// A REASON to refuse, or None — the STRICTEST, identity-free rule (round
+/// 7: a planted `id` on PATH laundered a foreign write ACL, and getfacl
+/// was PATH-resolved): any ALLOW entry carrying a write-shaped right
+/// refuses no matter WHOSE it is — the owner's own included — and anything
+/// the audit cannot fully interrogate refuses as unproven. No identity
+/// mapping means no subprocess to plant. An owner who deliberately ACLs
+/// their own library or cache is out of contract (documented in README).
+/// DENY entries still restrict rather than grant, so macOS's standard
+/// `group:everyone deny delete` keeps passing. writesecurity/chown count
+/// as write-shaped: they let a principal grant itself the rest a moment
+/// later.
 fn acl_write_grant(path: &Path, platform: AclPlatform) -> Option<String> {
     const GRANTS: [&str; 10] = [
         "write",
@@ -174,8 +206,14 @@ fn acl_write_grant(path: &Path, platform: AclPlatform) -> Option<String> {
     ];
     match platform {
         AclPlatform::Darwin => {
-            let user = me();
-            let out = match Command::new("/bin/ls").arg("-lde").arg(path).output() {
+            if !trusted_system_binary("/bin/ls") {
+                return Some("could not be audited for ACLs: /bin/ls failed validation".into());
+            }
+            let out = match trusted_spawn(Path::new("/bin/ls"))
+                .arg("-lde")
+                .arg(path)
+                .output()
+            {
                 Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
                 _ => return Some("could not be audited for ACLs: ls -lde failed".into()),
             };
@@ -202,9 +240,6 @@ fn acl_write_grant(path: &Path, platform: AclPlatform) -> Option<String> {
                 if hit.is_empty() {
                     continue;
                 }
-                if who == format!("user:{user}") || who == user {
-                    continue;
-                }
                 return Some(format!(
                     "has an ACL granting {who} {}, which lets them replace entries regardless of the mode",
                     hit.join(",")
@@ -212,53 +247,91 @@ fn acl_write_grant(path: &Path, platform: AclPlatform) -> Option<String> {
             }
             None
         }
-        AclPlatform::Posix => posix_acl_audit(path, which("getfacl").as_deref(), &me()),
+        AclPlatform::Posix => match read_posix_acl(path) {
+            Err(why) => Some(why),
+            Ok(None) => None,
+            Ok(Some(bytes)) => posix_acl_grant(&bytes),
+        },
     }
 }
 
-/// The posix half of the audit, pure over its inputs so the forced-platform
-/// tests can drive it on any OS: `getfacl` is the interrogator to run (None
-/// = not installed), `user` is who we are.
-fn posix_acl_audit(path: &Path, getfacl: Option<&Path>, user: &str) -> Option<String> {
-    let Some(getfacl) = getfacl else {
-        // An uninterrogable directory is an UNPROVEN one. Failing open here
-        // silently downgrades every non-darwin install to the mode-only
-        // check the review rejected.
-        return Some(
-            "cannot be audited for ACLs: getfacl is not installed - install it (Debian/Ubuntu: apt install acl)"
-                .into(),
-        );
-    };
-    let out = match Command::new(getfacl).arg("-cp").arg(path).output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        _ => return Some("could not be audited for ACLs: getfacl failed".into()),
-    };
-    for ln in out.lines() {
-        let f: Vec<&str> = ln.trim().split(':').collect();
-        if f.len() < 3 || ln.starts_with('#') {
-            continue;
+/// `system.posix_acl_access`, read IN-PROCESS via getxattr — no getfacl,
+/// no subprocess, nothing PATH-resolved. Ok(None) means exactly one thing:
+/// the filesystem answered "no ACL is set here" (NODATA).
+#[cfg(target_os = "linux")]
+fn read_posix_acl(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let mut buf = vec![0u8; 4096];
+    match rustix::fs::getxattr(path, "system.posix_acl_access", &mut buf) {
+        Ok(n) => {
+            buf.truncate(n);
+            Ok(Some(buf))
         }
-        let (kind, who, perm) = (f[0], f[1], f[2]);
-        if !(kind == "user" || kind == "group") || who.is_empty() || who == user {
-            continue;
-        }
-        if perm.contains('w') {
-            return Some(format!(
-                "has an ACL granting {kind}:{who} write, which lets them replace entries regardless of the mode"
-            ));
+        Err(e) => acl_xattr_verdict(e),
+    }
+}
+
+/// Verdict for a failed ACL-xattr read. ONLY NODATA — the documented "no
+/// ACL set" answer — passes as clean. OPNOTSUPP is NOT that answer: a
+/// filesystem that cannot hold the question cannot attest the directory
+/// either (round 8 — it previously laundered through as "no ACL"), so it
+/// refuses as unauditable along with every other errno.
+/// (Non-Linux production builds never reach it — only the injected-errno
+/// test does — hence the narrow dead_code allowance.)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn acl_xattr_verdict(e: rustix::io::Errno) -> Result<Option<Vec<u8>>, String> {
+    if e == rustix::io::Errno::NODATA {
+        Ok(None)
+    } else {
+        Err(format!(
+            "could not be audited for ACLs: getxattr failed: {e}"
+        ))
+    }
+}
+
+/// Outside Linux the POSIX arm has no in-process interrogator, and an
+/// uninterrogable directory is an UNPROVEN one. (Unreachable in practice:
+/// the native platform on macOS is Darwin; this arm exists for the
+/// forced-platform tests.)
+#[cfg(not(target_os = "linux"))]
+fn read_posix_acl(_path: &Path) -> Result<Option<Vec<u8>>, String> {
+    Err("could not be audited for ACLs: no in-process POSIX ACL reader on this platform".into())
+}
+
+/// The documented binary format of `system.posix_acl_access` (version 2):
+/// a u32 LE header, then 8-byte entries of (u16 tag, u16 perm, u32 id).
+/// Strict both ways: any NAMED user/group entry carrying the write bit
+/// refuses — whoever it names — and anything this parser cannot fully
+/// account for (bad length, unknown version, unknown tag) refuses as
+/// unauditable. Owner, owning-group, mask, and other entries express
+/// through the mode bits, which the mode audit already judges.
+fn posix_acl_grant(data: &[u8]) -> Option<String> {
+    if data.len() < 4 || !(data.len() - 4).is_multiple_of(8) {
+        return Some("could not be audited for ACLs: malformed ACL xattr".into());
+    }
+    if u32::from_le_bytes([data[0], data[1], data[2], data[3]]) != 2 {
+        return Some("could not be audited for ACLs: unknown ACL xattr version".into());
+    }
+    for e in data[4..].as_chunks::<8>().0 {
+        let tag = u16::from_le_bytes([e[0], e[1]]);
+        let perm = u16::from_le_bytes([e[2], e[3]]);
+        let id = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
+        match tag {
+            0x01 | 0x04 | 0x10 | 0x20 => {}
+            0x02 | 0x08 => {
+                if perm & 0x2 != 0 {
+                    let kind = if tag == 0x02 { "user" } else { "group" };
+                    return Some(format!(
+                        "has an ACL granting {kind} #{id} write, which lets them replace entries regardless of the mode"
+                    ));
+                }
+            }
+            _ => return Some("could not be audited for ACLs: unknown ACL entry tag".into()),
         }
     }
     None
 }
 
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(name))
-        .find(|c| c.is_file())
-}
-
-fn audit_dir(path: &Path, platform: AclPlatform) -> Result<(), String> {
+pub(crate) fn audit_dir(path: &Path, platform: AclPlatform) -> Result<(), String> {
     let st = rustix::fs::stat(path).map_err(|e| {
         format!(
             "refusing to save: {} could not be audited: {e}",
@@ -285,8 +358,9 @@ fn audit_dir(path: &Path, platform: AclPlatform) -> Result<(), String> {
 }
 
 /// Canonical, so a symlinked component is audited as what it really is; then
-/// every ancestor to the root.
-fn audit_chain(path: &Path, platform: AclPlatform) -> Result<(), String> {
+/// every ancestor to the root. Shared custody machinery: the update-check
+/// cache (update.rs) audits through this too, never through a copy.
+pub(crate) fn audit_chain(path: &Path, platform: AclPlatform) -> Result<(), String> {
     let mut q = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     loop {
         audit_dir(&q, platform)?;

@@ -42,7 +42,7 @@ mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 
 ```
 theme random | set <name> | unsplash [query|page-url] | url <link>
-theme list | preview [-w] <name> | status | version | rename | rm
+theme list | preview [-w] <name> | status | update | version | rename | rm
 ```
 
 `--rotate left|right`, `--extend[=hex]`, and `--desktop-only` (wallpaper
@@ -65,6 +65,14 @@ without recoloring the terminal) are accepted anywhere.
 - `THEME_CACHE_DIR` — palette cache root (default `~/.cache/theme`).
 - `THEME_CONTRAST` — minimum text-to-background contrast floor.
 - `THEME_NO_APPLY` — dry-run: announce what would happen, touch nothing.
+- `THEME_NO_UPDATE_CHECK` — disable the update-available note on the bare
+  `theme` screen. The check asks GitHub for the latest release tag at most
+  once every 24 hours (2-second cap, silent on failure, nothing sent but
+  the request itself), cached under `THEME_CACHE_DIR`; the explicit
+  `theme update` installs it and is never disabled by this. The cache is
+  only used while every directory on its path is owned by you and free of
+  write-granting ACLs — a cache you have deliberately ACL'd open is out of
+  contract and the check silently stands down.
 - `UNSPLASH_ACCESS_KEY` / `UNSPLASH_SECRET_KEY` / `UNSPLASH_USER_TOKEN` —
   Unsplash credentials (the macOS Keychain is consulted when unset; no
   credential ever appears on an argv).

@@ -2,17 +2,20 @@
 # Boundary fixture for the Rust `theme` binary — the port of the dotfiles
 # theme-boundary-tests.sh acceptance suite. Same doctrine: destructive verbs
 # act on library NAMES only; positives assert the MUTATION, not exit 0;
-# refusals leave victims untouched; the network boundary runs against a
-# deterministic PATH-stubbed curl; credentials never reach argv and a hostile
-# credential produces ZERO transfers; every command surface is swept with
-# OSC-52-poisoned inputs and may emit no terminal protocol.
+# refusals leave victims untouched; the network boundary runs against
+# deterministic curl stubs (PATH-resolved for the wallpaper/credential
+# lanes per the reviewed parity design; via the debug-only THEME_CURL seam
+# for the self-update lane, whose transport never consults PATH);
+# credentials never reach argv and a hostile credential produces ZERO
+# transfers; every command surface is swept with OSC-52-poisoned inputs
+# and may emit no terminal protocol.
 #
 # Two sections of the shell fixture extracted python from the script under
 # test and drove it directly (the descriptor-bound saver's check/use windows,
 # the ACL interrogator branches, and the contrast floor). Those trust
 # decisions now live in Rust and are driven natively — src/save_tests.rs
-# (FIFO-opened swap windows, forced-posix getfacl predicate, darwin ACL
-# allow/deny/writesecurity) and the floor regression in src/apply.rs — so
+# (FIFO-opened swap windows, the in-process POSIX ACL xattr parser, darwin
+# ACL allow/deny/writesecurity) and the floor regression in src/apply.rs — so
 # this file carries their END-TO-END shapes (world-writable ancestor, ACL'd
 # library, symlinked provider) through the real binary instead.
 #
@@ -47,6 +50,18 @@ exists() { # $1 description, $2 yes|no, $3 path
     elif [ "$2" = no ] && [ ! -e "$3" ]; then pass "$1"
     else fail "$1"; fi
 }
+
+# The update-available check is disabled for the WHOLE fixture — no case may
+# ever touch the real network; the footer-note section re-enables it per run
+# against a stubbed/failing curl.
+export THEME_NO_UPDATE_CHECK=1
+
+# The self-update/footer transport never consults PATH (round 8): those
+# sections drive a DEBUG build, whose THEME_CURL test seam (compiled OUT of
+# release) aims the trusted-transport lane at the deterministic stubs. One
+# release-binary pin proves the seam and PATH are both ignored there.
+THEME_DBG="${THEME_DEBUG_BIN:-$root/target/debug/theme}"
+[ -x "$THEME_DBG" ] || { echo "FAIL  no debug binary at $THEME_DBG (cargo build first — the update sections need its THEME_CURL seam)"; exit 1; }
 
 # The AMBIENT credential environment is neutralised once, here, for the whole
 # fixture; every case that needs a credential sets it explicitly.
@@ -758,7 +773,7 @@ help_run() { # $1 label, $2 TERM_PROGRAM, $3 TERM, $4… theme arguments
     printf '%s\n' "$o" >>"$help_all"
     return 0
 }
-for c in random set unsplash url list preview status rename rm help; do
+for c in random set unsplash url list preview status rename rm update help; do
     help_run "$c--help" TermSAFE xtermSAFE "$c" --help
 done
 help_run help-TERM_PROGRAM "TermSAFE$oscpay" xtermSAFE help
@@ -768,7 +783,7 @@ if [ -n "$help_bad" ]; then
 else pass "no help path emits environment data as terminal protocol"; fi
 help_missing=""
 for marker in 'hlibSAFE' 'TermSAFE' 'xtermSAFE' 'LinuxSAFE' \
-    'Apply Commands' 'theme random' 'theme unsplash' 'theme rm'; do
+    'Apply Commands' 'theme random' 'theme unsplash' 'theme rm' 'never elevates'; do
     grep -qF -- "$marker" "$help_all" || help_missing="$help_missing [$marker]"
 done
 if [ -z "$help_missing" ]; then
@@ -812,6 +827,621 @@ else fail "version output shape drifted: $vout"; fi
 if [ "$(run "$lib" --version 2>&1)" = "$vout" ] && [ "$(run "$lib" -V 2>&1)" = "$vout" ]; then
     pass "--version and -V alias the version command"
 else fail "--version/-V do not match the version output"; fi
+
+# --- update: verify-then-rename self-update against a stubbed GitHub --------
+# The invariant under test: the running binary is NEVER replaced by
+# unverified bytes. A copy of the real binary is the install target; a PATH
+# stub plays the whole GitHub flow (API → 302 → asset host), logging every
+# URL curl is asked for — so "refused" means curl was never spawned at it.
+updd="$fixture/upd"
+mkdir -p "$updd/bin" "$updd/stubbin"
+cur_ver=$(printf '%s\n' "$vout" | sed -n 1p | sed 's/^version: v//')
+case "$(uname -s)-$(uname -m)" in
+Darwin-arm64) triple=aarch64-apple-darwin ;;
+Darwin-x86_64) triple=x86_64-apple-darwin ;;
+Linux-aarch64) triple=aarch64-unknown-linux-gnu ;;
+*) triple=x86_64-unknown-linux-gnu ;;
+esac
+# The release asset shape: a tar.gz holding the single member `theme`
+# (SHA256SUMS digests the TARBALL, exactly as the release workflow builds).
+# Local macOS tar would add AppleDouble/pax entries for this machine's
+# provenance xattrs — entries the strict in-process walker rightly refuses
+# and the real runner-built assets don't have — so members are stripped and
+# archived with COPYFILE_DISABLE, reproducing the shipped shape.
+# python tarfile in USTAR format: byte-exact plain headers, arcname = the
+# path's basename, symlinks preserved as entries. (macOS provenance xattrs
+# are SIP-protected — local bsdtar smuggles them in no matter what.)
+mktar() { # $1 out.tar.gz  $2 srcdir  $3… member paths relative to srcdir
+    python3 - "$@" <<'PY'
+import os, sys, tarfile
+out, d, *members = sys.argv[1:]
+with tarfile.open(out, 'w:gz', format=tarfile.USTAR_FORMAT) as t:
+    for m in members:
+        t.add(os.path.join(d, m), arcname=os.path.basename(m), recursive=False)
+PY
+}
+inner="$updd/inner"
+printf 'NEW-RELEASE-BYTES-%s' "$triple" >"$updd/theme"
+cp "$updd/theme" "$inner"
+payload="$updd/payload.tar.gz"
+mktar "$payload" "$updd" theme
+rm -f "$updd/theme"
+if command -v sha256sum >/dev/null 2>&1; then
+    paysha=$(sha256sum "$payload" | cut -d' ' -f1)
+else
+    paysha=$(shasum -a 256 "$payload" | cut -d' ' -f1)
+fi
+# The stub learns its controls from the ctl FILE upd_run writes, never from
+# env: the binary env-clears every transport child (round 9), so the
+# environment provably cannot reach this script. PATH is pinned explicitly
+# because an env-cleared bash otherwise runs on its compiled-in default.
+printf '#!/bin/bash\nPATH=/usr/bin:/bin\n. "%s/ctl"\n' "$updd" >"$updd/stubbin/curl"
+cat >>"$updd/stubbin/curl" <<'EOS'
+out=""; hdr=""; url=""; k=0
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[$i]}" in
+    -o) out="${args[$((i + 1))]}" ;;
+    -D) hdr="${args[$((i + 1))]}" ;;
+    --url) url="${args[$((i + 1))]}" ;;
+    -K) k=1 ;;
+    esac
+done
+[ "$k" = 1 ] && cat >/dev/null
+printf '%s\n' "$url" >>"$UPD_LOG"
+resp() { printf 'HTTP/2 %s\r\n%s\r\n\r\n' "$1" "$2" >"$hdr"; }
+release_json() { # $1 tag — STABLE asset names, no version infix (#14 r3)
+    local a="https://github.com/snaraj/theme/releases/download/$1"
+    printf '{"tag_name":"%s","assets":[{"name":"SHA256SUMS","browser_download_url":"%s/SHA256SUMS"},{"name":"theme-%s.tar.gz","browser_download_url":"%s/theme-%s.tar.gz"}]}' \
+        "$1" "$a" "$UPD_TRIPLE" "$a" "$UPD_TRIPLE"
+}
+case "$url" in
+*api.github.com/repos/snaraj/theme/releases/latest*)
+    release_json "$UPD_TAG"
+    ;;
+*api.github.com/repos/snaraj/theme/releases/tags/*)
+    want="${url##*/}"
+    if [ "$want" = "$UPD_TAG" ]; then release_json "$want"; else exit 22; fi
+    ;;
+*/releases/download/*/SHA256SUMS*)
+    : >"$out"; resp 302 "location: https://release-assets.githubusercontent.com/sums"
+    ;;
+*release-assets.githubusercontent.com/sums*)
+    cp "$UPD_SUMS_FILE" "$out"; resp 200 "content-type: text/plain"
+    ;;
+*/releases/download/*/theme-*)
+    : >"$out"
+    if [ "${UPD_EVIL:-}" = 1 ]; then
+        resp 302 "location: https://evil.invalid/steal"
+    else
+        resp 302 "location: https://release-assets.githubusercontent.com/bin"
+    fi
+    ;;
+*release-assets.githubusercontent.com/bin*)
+    if [ "${UPD_PARTIAL:-}" = 1 ]; then
+        head -c 8 "$UPD_PAYLOAD" >"$out"
+        resp 200 "content-type: application/octet-stream"
+        exit 23
+    fi
+    if [ "${UPD_BIG:-}" = 1 ]; then
+        dd if=/dev/zero of="$out" bs=1048576 count=101 2>/dev/null
+        resp 200 "content-type: application/octet-stream"
+        exit 0
+    fi
+    cp "$UPD_PAYLOAD" "$out"; resp 200 "content-type: application/octet-stream"
+    ;;
+*evil.invalid*)
+    printf 'EVIL' >"$out"; resp 200 ""
+    ;;
+*) exit 6 ;;
+esac
+exit 0
+EOS
+chmod +x "$updd/stubbin/curl"
+updlog="$updd/log"
+upd_out="$updd/out"
+upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
+    # a $() capture would strand both in a subshell); env pairs, then an
+    # optional `--` followed by extra update arguments.
+    # UPD_* control pairs travel by the ctl FILE the stub sources, NOT env:
+    # the binary env-clears every transport child (round 9), so the
+    # environment provably cannot reach the stub. (UPD_TAR_MARKER stays in
+    # the theme process env on purpose — a hypothetical PATH-tar spawn
+    # would inherit it, which is exactly what that pin watches for.)
+    local envs=() ctl=() kv
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+        case "$1" in
+        UPD_TAR_MARKER=*) envs+=("$1") ;;
+        UPD_*) ctl+=("$1") ;;
+        *) envs+=("$1") ;;
+        esac
+        shift
+    done
+    [ "${1:-}" = "--" ] && shift
+    # rm first: macOS caches code-signing state by inode, and cp -f over a
+    # previously-executed binary poisons it — the next exec dies SIGKILL.
+    # DEBUG build: the trusted-transport lane only reaches the curl stub
+    # through the THEME_CURL seam — PATH curl is dead to it (round 8).
+    rm -f "$updd/bin/theme"
+    cp "$THEME_DBG" "$updd/bin/theme"
+    : >"$updlog"
+    {
+        printf "UPD_LOG='%s'\n" "$updlog"
+        printf "UPD_TRIPLE='%s'\n" "$triple"
+        printf "UPD_PAYLOAD='%s'\n" "$payload"
+        printf "UPD_SUMS_FILE='%s'\n" "$updd/sums"
+        for kv in ${ctl[@]+"${ctl[@]}"}; do printf '%s\n' "$kv"; done
+    } >"$updd/ctl"
+    env UPD_TAR_MARKER="$updd/tar-ran" THEME_CURL="$updd/stubbin/curl" \
+        PATH="$updd/stubbin:$PATH" \
+        THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
+        THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
+        "${envs[@]}" "$updd/bin/theme" update "$@" >"$upd_out" 2>&1
+    upd_rc=$?
+}
+upd_intact() { # target still byte-identical to the run binary, no temp left
+    cmp -s "$THEME_DBG" "$updd/bin/theme" \
+        && [ -z "$(find "$updd/bin" -name '.*update*' 2>/dev/null)" ]
+}
+printf '%s  theme-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
+
+upd_run UPD_TAG="v$cur_ver"
+if [ "$upd_rc" = 0 ] && grep -qF "already up to date (v$cur_ver)" "$upd_out"; then
+    pass "an up-to-date binary short-circuits"
+else fail "same-version update did not short-circuit: $(cat "$upd_out")"; fi
+if [ "$(wc -l <"$updlog" | tr -d ' ')" = 1 ]; then
+    pass "the short-circuit downloads no asset"
+else fail "same-version update still transferred: $(cat "$updlog")"; fi
+
+upd_run UPD_TAG=v9.9.9
+if [ "$upd_rc" = 0 ] && grep -qF "theme v$cur_ver → v9.9.9" "$upd_out"; then
+    pass "update prints current → new"
+else fail "update success output drifted: $(cat "$upd_out")"; fi
+if cmp -s "$inner" "$updd/bin/theme" && [ -x "$updd/bin/theme" ]; then
+    pass "the target holds exactly the verified member bytes, executable"
+else fail "installed bytes differ from the release payload"; fi
+if [ -z "$(find "$updd/bin" -name '.*update*' 2>/dev/null)" ]; then
+    pass "no install temp file survives success"
+else fail "an install temp file was left beside the binary"; fi
+
+printf '%064d  theme-%s.tar.gz\n' 0 "$triple" >"$updd/sums"
+upd_run UPD_TAG=v9.9.9
+if [ "$upd_rc" != 0 ] && grep -q 'SHA256 verification FAILED' "$upd_out"; then
+    pass "a corrupted hash is refused"
+else fail "corrupted hash not refused: $(cat "$upd_out")"; fi
+if upd_intact; then
+    pass "the corrupted download never touched the binary"
+else fail "unverified bytes reached the install target"; fi
+
+printf '%s  theme-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
+upd_run UPD_TAG=v9.9.9 UPD_EVIL=1
+if [ "$upd_rc" != 0 ] && grep -q 'refusing non-GitHub download host' "$upd_out"; then
+    pass "a redirect off GitHub's hosts is refused"
+else fail "foreign redirect host not refused: $(cat "$upd_out")"; fi
+if ! grep -q 'evil.invalid' "$updlog" && upd_intact; then
+    pass "the foreign host was never contacted and the binary is intact"
+else fail "curl was spawned at the foreign host or the binary changed"; fi
+
+upd_run UPD_TAG=v9.9.9 UPD_PARTIAL=1
+if [ "$upd_rc" != 0 ] && upd_intact; then
+    pass "an interrupted download leaves the binary untouched"
+else fail "a partial download reached the install path: $(cat "$upd_out")"; fi
+
+# A digest-VALID tarball that holds no `theme` member: verification passes,
+# the unpack must still refuse and leave the target alone.
+printf 'IMPOSTOR' >"$updd/not-theme"
+badtar="$updd/badtar.tar.gz"
+mktar "$badtar" "$updd" not-theme
+rm -f "$updd/not-theme"
+if command -v sha256sum >/dev/null 2>&1; then
+    badsha=$(sha256sum "$badtar" | cut -d' ' -f1)
+else
+    badsha=$(shasum -a 256 "$badtar" | cut -d' ' -f1)
+fi
+printf '%s  theme-%s.tar.gz\n' "$badsha" "$triple" >"$updd/sums"
+upd_run UPD_TAG=v9.9.9 UPD_PAYLOAD="$badtar"
+if [ "$upd_rc" != 0 ] && grep -q "not a single 'theme' binary" "$upd_out" && upd_intact; then
+    pass "a verified archive without the binary is refused"
+else fail "member-less archive not refused: $(cat "$upd_out")"; fi
+printf '%s  theme-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
+
+# --- the archive shape is enforced IN-PROCESS (Codex round-2 findings) -----
+# A PATH-planted tar must not be able to influence the installed bytes —
+# extraction is in-process now, so the stub must NEVER EVEN RUN.
+cat >"$updd/stubbin/tar" <<'EOS'
+#!/bin/sh
+: >"$UPD_TAR_MARKER"
+printf 'EVIL-TAR-BYTES'
+exit 0
+EOS
+chmod +x "$updd/stubbin/tar"
+rm -f "$updd/tar-ran"
+upd_run UPD_TAG=v9.9.9
+if [ "$upd_rc" = 0 ] && cmp -s "$inner" "$updd/bin/theme" && [ ! -e "$updd/tar-ran" ]; then
+    pass "a PATH-planted tar never executes and cannot touch the install"
+else fail "PATH tar influenced the install (marker: $([ -e "$updd/tar-ran" ] && echo ran))"; fi
+
+# Duplicate members concatenated FIRST+SECOND under the old extractor —
+# now any second entry refuses.
+mkdir -p "$updd/dupa" "$updd/dupb"
+printf 'FIRST' >"$updd/dupa/theme"
+printf 'SECOND' >"$updd/dupb/theme"
+duptar="$updd/dup.tar.gz"
+mktar "$duptar" "$updd" dupa/theme dupb/theme
+dupsha=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum "$duptar"; else shasum -a 256 "$duptar"; fi | cut -d' ' -f1)
+printf '%s  theme-%s.tar.gz\n' "$dupsha" "$triple" >"$updd/sums"
+upd_run UPD_TAG=v9.9.9 UPD_PAYLOAD="$duptar"
+if [ "$upd_rc" != 0 ] && grep -q "not a single 'theme' binary" "$upd_out" && upd_intact; then
+    pass "a duplicate-member archive refuses instead of concatenating"
+else fail "dup-member archive not refused: $(cat "$upd_out")"; fi
+
+# A symlink member (digest-valid) must refuse as a non-regular file.
+mkdir -p "$updd/lnk"
+ln -sf /etc/passwd "$updd/lnk/theme"
+lnktar="$updd/lnk.tar.gz"
+mktar "$lnktar" "$updd" lnk/theme
+lnksha=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum "$lnktar"; else shasum -a 256 "$lnktar"; fi | cut -d' ' -f1)
+printf '%s  theme-%s.tar.gz\n' "$lnksha" "$triple" >"$updd/sums"
+upd_run UPD_TAG=v9.9.9 UPD_PAYLOAD="$lnktar"
+if [ "$upd_rc" != 0 ] && grep -q "not a single 'theme' binary" "$upd_out" && upd_intact; then
+    pass "a link member refuses as non-regular"
+else fail "symlink member not refused: $(cat "$upd_out")"; fi
+
+# An uncompressed size over the cap (tiny gzip, 101MiB member) refuses at
+# the header, before a byte lands anywhere.
+mkdir -p "$updd/big"
+dd if=/dev/zero of="$updd/big/theme" bs=1048576 count=101 2>/dev/null
+bigtar="$updd/big.tar.gz"
+mktar "$bigtar" "$updd/big" theme
+rm -rf "$updd/big"
+bigsha=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum "$bigtar"; else shasum -a 256 "$bigtar"; fi | cut -d' ' -f1)
+printf '%s  theme-%s.tar.gz\n' "$bigsha" "$triple" >"$updd/sums"
+upd_run UPD_TAG=v9.9.9 UPD_PAYLOAD="$bigtar"
+if [ "$upd_rc" != 0 ] && grep -q 'byte cap' "$upd_out" && upd_intact; then
+    pass "an over-cap uncompressed member refuses with the target intact"
+else fail "decompression bomb not refused: $(cat "$upd_out")"; fi
+printf '%s  theme-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
+
+upd_run UPD_TAG=v9.9.9 UPD_BIG=1
+if [ "$upd_rc" != 0 ] && grep -q 'byte cap' "$upd_out" && upd_intact; then
+    pass "an oversized download is refused before install"
+else fail "oversized download not refused: $(cat "$upd_out")"; fi
+if [ -z "$(find "$fixture/tmpdir" -type f -name 'theme.*' 2>/dev/null)" ]; then
+    pass "update leaves no scratch residue on any path"
+else fail "update left scratch files behind"; fi
+
+# --- update and the footer note share ONE cache ----------------------------
+rm -f "$fixture/cache/update-check"
+upd_run UPD_TAG="v$cur_ver"
+if [ "$(cat "$fixture/cache/update-check" 2>/dev/null)" = "v$cur_ver" ]; then
+    pass "a latest-mode update stamps the shared check cache"
+else fail "theme update did not refresh the update-check cache"; fi
+
+# --- update --version: a specific release through the same pipeline --------
+rm -f "$fixture/cache/update-check"
+upd_run UPD_TAG=v9.9.9 -- --version 9.9.9
+if [ "$upd_rc" = 0 ] && grep -qF "theme v$cur_ver → v9.9.9" "$upd_out" \
+   && cmp -s "$inner" "$updd/bin/theme"; then
+    pass "--version installs the requested release"
+else fail "--version happy path broke: $(cat "$upd_out")"; fi
+if grep -q '/releases/tags/v9.9.9' "$updlog"; then
+    pass "--version normalizes and uses the by-tag endpoint"
+else fail "--version did not hit the by-tag endpoint: $(cat "$updlog")"; fi
+if [ ! -e "$fixture/cache/update-check" ]; then
+    pass "a --version fetch never stamps the latest-check cache"
+else fail "--version poisoned the update-check cache"; fi
+
+upd_run UPD_TAG=v9.9.9 -- --version '../../evil'
+if [ "$upd_rc" != 0 ] && grep -q 'takes a release version' "$upd_out" \
+   && [ ! -s "$updlog" ]; then
+    pass "an injection-shaped --version refuses before any network"
+else fail "--version injection reached further than the parser: $(cat "$upd_out")"; fi
+upd_run UPD_TAG=v9.9.9 -- --version
+if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ]; then
+    pass "a dangling --version refuses before any network"
+else fail "dangling --version was not refused: $(cat "$upd_out")"; fi
+
+# --- --version exists for update ONLY; update's grammar is strict ----------
+# (Codex round 3: the flag was consumed globally, so `rm victim --version x`
+# deleted the victim. Now every other verb refuses it pre-mutation, and any
+# residual update token refuses before a single transfer.)
+png1x1 "$lib/vic-flag.png" 1 2 3
+vic_sum=$(cksum <"$lib/vic-flag.png")
+check "rm refuses a foreign --version flag"      1 run "$lib" rm vic-flag --version v9.9.9
+if [ -f "$lib/vic-flag.png" ] && [ "$(cksum <"$lib/vic-flag.png")" = "$vic_sum" ]; then
+    pass "the rm victim survives byte-identical"
+else fail "rm mutated despite the refused flag"; fi
+check "rename refuses a foreign --version flag"  1 run "$lib" rename vic-flag renamed-vic --version v9.9.9
+if [ -f "$lib/vic-flag.png" ] && [ ! -e "$lib/renamed-vic.png" ] \
+   && [ "$(cksum <"$lib/vic-flag.png")" = "$vic_sum" ]; then
+    pass "the rename victim is untouched and no destination appeared"
+else fail "rename mutated despite the refused flag"; fi
+rm -f "$lib/vic-flag.png"
+upd_run UPD_TAG=v9.9.9 -- extraneous
+if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ]; then
+    pass "a residual update positional refuses with zero transfers"
+else fail "update accepted a stray positional: $(cat "$upd_out")"; fi
+upd_run UPD_TAG=v9.9.9 -- --rotate left
+if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ]; then
+    pass "a global flag is unknown to update and spawns zero transfers"
+else fail "update accepted --rotate: $(cat "$upd_out")"; fi
+upd_run UPD_TAG=v9.9.9 -- --version=
+if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ]; then
+    pass "an empty --version value refuses with zero transfers"
+else fail "update accepted an empty --version: $(cat "$upd_out")"; fi
+upd_run UPD_TAG=v9.9.9 -- --version 1.0.0 --version 2.0.0
+if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ]; then
+    pass "a duplicate --version refuses with zero transfers"
+else fail "update accepted duplicate --version: $(cat "$upd_out")"; fi
+
+upd_run UPD_TAG=v9.9.9 -- --version 0.0.0
+if grep -q 'warning: older versions may be unsupported or break — proceeding to v0.0.0' "$upd_out"; then
+    pass "a downgrade warns at launch and proceeds"
+else fail "downgrade warning missing: $(cat "$upd_out")"; fi
+if [ "$upd_rc" != 0 ] && grep -q 'no release v0.0.0' "$upd_out" && upd_intact; then
+    pass "a missing tag refuses cleanly with the binary intact"
+else fail "missing tag not refused cleanly: $(cat "$upd_out")"; fi
+
+# --- round 8: the update transport is not PATH's to give -------------------
+# A hostile curl planted FIRST on PATH must never execute in the update
+# lane — the lane runs only the trusted transport (the THEME_CURL seam in
+# this debug build; fixed root-owned candidates in release) — while a full
+# update through the stub still succeeds. Mirrors the tar-stub pin.
+plantbin="$updd/plantbin"
+mkdir -p "$plantbin"
+printf '#!/bin/sh\n: >"%s/hostile-curl-ran"\nprintf EVIL\nexit 0\n' "$updd" >"$plantbin/curl"
+chmod +x "$plantbin/curl"
+upd_run UPD_TAG=v9.9.9 PATH="$plantbin:$updd/stubbin:$PATH"
+if [ "$upd_rc" = 0 ] && grep -qF "theme v$cur_ver → v9.9.9" "$upd_out" \
+   && cmp -s "$inner" "$updd/bin/theme" && [ ! -e "$updd/hostile-curl-ran" ]; then
+    pass "a curl planted first on PATH never executes in the update lane"
+else fail "PATH curl reached the update transport (rc=$upd_rc): $(cat "$upd_out")"; fi
+
+# THEME_CURL= (empty) simulates "no candidate validates": the explicit
+# update refuses BEFORE any network with its own message and zero
+# transfers; the running binary stays byte-identical.
+upd_run THEME_CURL= UPD_TAG=v9.9.9
+if [ "$upd_rc" != 0 ] && grep -q 'no trusted system curl' "$upd_out" \
+   && [ ! -s "$updlog" ] && upd_intact; then
+    pass "a missing trusted transport is its own pre-network refusal"
+else fail "missing-transport refusal broke (rc=$upd_rc): $(cat "$upd_out")"; fi
+
+# The RELEASE binary carries no seam at all: with a hostile curl first on
+# PATH and THEME_CURL aimed at a second marker stub, the only transport it
+# may use is the validated system curl — the request 404s (online) or
+# fails to resolve (offline), both the same clean refusal; the markers
+# stay absent and the target byte-identical either way. (This one pin may
+# send a single credential-free GET to the real API when online — it is
+# the release transport itself under test, and nothing else can prove the
+# seam compiled out.)
+printf '#!/bin/sh\n: >"%s/seam-curl-ran"\nexit 0\n' "$updd" >"$plantbin/seamcurl"
+chmod +x "$plantbin/seamcurl"
+rm -f "$updd/bin/theme"
+cp "$THEME" "$updd/bin/theme"
+env PATH="$plantbin:$PATH" THEME_CURL="$plantbin/seamcurl" \
+    THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
+    THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
+    "$updd/bin/theme" update --version v99.99.99 >"$upd_out" 2>&1
+upd_rc=$?
+if [ "$upd_rc" != 0 ] && cmp -s "$THEME" "$updd/bin/theme" \
+   && [ ! -e "$updd/hostile-curl-ran" ] && [ ! -e "$updd/seam-curl-ran" ]; then
+    pass "the release binary ignores PATH and the seam alike"
+else fail "release transport was steerable (rc=$upd_rc): $(cat "$upd_out")"; fi
+
+# --- round 9: the environment channel is dead to the boundary ---------------
+# The parent exports the full hostile set — TLS-trust substitution
+# (CURL_CA_BUNDLE/SSL_CERT_*/CURL_SSL_BACKEND), loader injection (both the
+# LD_ and DYLD_ families), a proxy trio, and BASH_ENV, which WOULD execute
+# a marker script inside any bash child that inherited env — and a full
+# update through BOTH command shapes (metadata + two asset hops) still
+# succeeds with no marker: every transport child starts from an empty
+# environment, and the stub itself learns its controls from the ctl file
+# because env provably cannot reach it.
+# (DYLD_INSERT_LIBRARIES carries a REAL, inert system dylib: dyld
+# hard-kills any process it cannot load the insert into, and the theme
+# process's own launch env is the caller's domain, not this boundary's —
+# what is under test is that the variable never reaches a CHILD.)
+printf ': >"%s/envchan-ran"\n' "$updd" >"$updd/bashenv.sh"
+upd_run UPD_TAG=v9.9.9 \
+    BASH_ENV="$updd/bashenv.sh" \
+    CURL_CA_BUNDLE=/dev/null SSL_CERT_FILE=/dev/null SSL_CERT_DIR=/dev/null \
+    CURL_SSL_BACKEND=hostile LD_PRELOAD=/dev/null LD_AUDIT=/dev/null \
+    LD_LIBRARY_PATH=/dev/null DYLD_INSERT_LIBRARIES=/usr/lib/libz.1.dylib \
+    DYLD_LIBRARY_PATH=/dev/null https_proxy=http://127.0.0.1:9 \
+    HTTPS_PROXY=http://127.0.0.1:9 all_proxy=http://127.0.0.1:9
+if [ "$upd_rc" = 0 ] && grep -qF "theme v$cur_ver → v9.9.9" "$upd_out" \
+   && cmp -s "$inner" "$updd/bin/theme" && [ ! -e "$updd/envchan-ran" ]; then
+    pass "a fully hostile environment never reaches a boundary child"
+else fail "the environment channel leaked (rc=$upd_rc): $(cat "$upd_out")"; fi
+
+# --- the update-available footer on the bare `theme` screen ----------------
+notecache="$fixture/notecache"
+mkdir -p "$notecache"
+failbin="$fixture/failbin"
+mkdir -p "$failbin"
+notefaillog="$fixture/notefail.log"
+: >"$notefaillog"
+# The attempt log path is BAKED at generation — the child is env-cleared
+# (round 9), so a $NOTE_FAIL_LOG reference would see nothing.
+cat >"$failbin/curl" <<EOS
+#!/bin/sh
+printf 'x\n' >>"$notefaillog"
+exit 6
+EOS
+chmod +x "$failbin/curl"
+note_out="$updd/note.out"
+note_run() { # bare `theme` with the check ENABLED; env-pair overrides last.
+    # DEBUG build + THEME_CURL seam: the footer's trusted-transport lane
+    # reaches the failing stub by absolute path, never via PATH (round 8).
+    env THEME_NO_UPDATE_CHECK= \
+        THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$notecache" \
+        THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" KITTY_WINDOW_ID='' \
+        THEME_CURL="$failbin/curl" \
+        PATH="$failbin:$sweepbin:$PATH" "$@" "$THEME_DBG" >"$note_out" 2>&1
+    note_rc=$?
+}
+expect1="update to the latest theme version: v9.9.9 -> https://github.com/snaraj/theme/releases/tag/v9.9.9"
+expect2="to update run: theme update"
+
+printf 'v9.9.9' >"$notecache/update-check"
+note_run
+if [ "$(tail -2 "$note_out" | sed -n 1p)" = "$expect1" ] \
+   && [ "$(tail -2 "$note_out" | sed -n 2p)" = "$expect2" ]; then
+    pass "a newer cached release ends the screen with the two-line footer"
+else fail "footer shape drifted: $(tail -3 "$note_out")"; fi
+if [ ! -s "$notefaillog" ]; then
+    pass "a fresh cache spawns no network attempt"
+else fail "the note refreshed despite a fresh cache"; fi
+
+printf 'v%s' "$cur_ver" >"$notecache/update-check"
+note_run
+if ! grep -qF 'update to the latest' "$note_out"; then
+    pass "an up-to-date cache renders no footer"
+else fail "the footer rendered for the running version"; fi
+printf 'v0.0.0' >"$notecache/update-check"
+note_run
+if ! grep -qF 'update to the latest' "$note_out"; then
+    pass "a dev build newer than the latest renders no footer"
+else fail "the footer rendered for an older latest"; fi
+printf 'v9.9.9junk' >"$notecache/update-check"
+note_run
+if ! grep -qF 'update to the latest' "$note_out"; then
+    pass "a malformed cache is silently ignored"
+else fail "a malformed cache still rendered"; fi
+printf 'v9.9.9\033]52;c;steal\007' >"$notecache/update-check"
+note_run
+if ! grep -qF 'update to the latest' "$note_out" \
+   && ! grep -qF "$(printf '\033]')" "$note_out"; then
+    pass "a hostile cache renders neither a footer nor terminal protocol"
+else fail "hostile cache content reached the terminal"; fi
+
+rm -f "$notecache/update-check"
+note_run
+if [ "$note_rc" = 0 ] && ! grep -qiE 'update to the latest|error|curl' "$note_out"; then
+    pass "no cache + no network is silent and exits clean"
+else fail "the offline check leaked noise (rc=$note_rc): $(tail -3 "$note_out")"; fi
+if [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ] && [ -e "$notecache/update-check" ]; then
+    pass "the failed attempt was stamped into the cache"
+else fail "offline attempt accounting is wrong: $(wc -l <"$notefaillog") attempts"; fi
+note_run
+if [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ]; then
+    pass "one bounded attempt per TTL window, not per run"
+else fail "the note retried inside the TTL window"; fi
+
+rm -f "$notecache/update-check"
+note_run THEME_NO_UPDATE_CHECK=1
+if ! grep -qF 'update to the latest' "$note_out" \
+   && [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ]; then
+    pass "the kill-switch spawns nothing and renders nothing"
+else fail "THEME_NO_UPDATE_CHECK did not disable the check"; fi
+
+# Round 8, decided-and-stated: NO trusted transport ⇒ no network AND no
+# stamp — the TTL stamp rate-limits network ATTEMPTS, and none happened,
+# so a recovered transport a minute later must not find itself masked.
+rm -f "$notecache/update-check"
+note_run THEME_CURL=
+if [ "$note_rc" = 0 ] && [ ! -e "$notecache/update-check" ] \
+   && ! grep -qF 'update to the latest' "$note_out" \
+   && [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ]; then
+    pass "a missing transport neither stamps nor fetches nor renders"
+else fail "missing transport misbehaved (rc=$note_rc): $(ls -l "$notecache" 2>/dev/null)"; fi
+# ...but a still-fresh cache renders with no transport at all — displaying
+# already-earned data needs no network.
+printf 'v9.9.9' >"$notecache/update-check"
+note_run THEME_CURL=
+if [ "$note_rc" = 0 ] && grep -qF "$expect1" "$note_out"; then
+    pass "a fresh cache renders without any transport"
+else fail "the fresh-cache render needed a transport: $(tail -3 "$note_out")"; fi
+
+# --- the cache stamp is fail-closed (Codex round 4) ------------------------
+# An attacker-writable cache dir with a planted symlink: the old stamp
+# followed it and truncated the victim on a bare help. Now custody refuses
+# the dir outright — no write, no read, no note, no network attempt.
+hostile="$fixture/hostile-cache"
+mkdir -p "$hostile"
+printf 'twenty-four byte victim!' >"$fixture/stamp-victim"
+vic2_sum=$(cksum <"$fixture/stamp-victim")
+ln -s "$fixture/stamp-victim" "$hostile/update-check"
+chmod 777 "$hostile"
+before_ls=$(ls -a "$hostile")
+note_run THEME_CACHE_DIR="$hostile"
+after_ls=$(ls -a "$hostile")
+if [ "$note_rc" = 0 ] && ! grep -qF 'update to the latest' "$note_out" \
+   && [ "$(cksum <"$fixture/stamp-victim")" = "$vic2_sum" ] \
+   && [ "$before_ls" = "$after_ls" ] \
+   && [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ]; then
+    pass "a hostile cache dir is refused: victim intact, dir untouched, zero transfers"
+else fail "hostile cache dir was touched (rc=$note_rc): $(ls -al "$hostile")"; fi
+chmod 700 "$hostile"
+
+# A FIFO planted at the cache name in an otherwise-valid dir must neither
+# hang the bare command nor render — and the next stamp heals it into a
+# regular file by renameat-replacing the entry.
+rm -f "$notecache/update-check"
+mkfifo "$notecache/update-check"
+note_run
+if [ "$note_rc" = 0 ] && ! grep -qF 'update to the latest' "$note_out" \
+   && [ -f "$notecache/update-check" ] && [ ! -p "$notecache/update-check" ]; then
+    pass "a planted FIFO neither hangs nor renders, and the stamp heals it"
+else fail "FIFO at the cache name broke (rc=$note_rc): $(ls -l "$notecache" 2>/dev/null)"; fi
+
+# --- custody depth: steering refused, benign symlinks legal (round 5) ------
+# A symlink held in a world-writable dir steers the endpoint wherever the
+# attacker likes — even at a perfectly clean 0700 target it must refuse
+# (the SPELLED chain is audited, not just the resolved one)…
+mkdir -p "$fixture/steer-target"
+chmod 700 "$fixture/steer-target"
+ln -s "$fixture/steer-target" "$fixture/hostile-cache/steer"
+chmod 777 "$fixture/hostile-cache"
+note_run THEME_CACHE_DIR="$fixture/hostile-cache/steer"
+if [ "$note_rc" = 0 ] && ! grep -qF 'update to the latest' "$note_out" \
+   && [ -z "$(ls -A "$fixture/steer-target")" ]; then
+    pass "a steered cache path refuses: clean target, but hostile spelled chain"
+else fail "endpoint steering accepted (rc=$note_rc): $(ls -A "$fixture/steer-target")"; fi
+chmod 700 "$fixture/hostile-cache"
+# …a symlink AT the cache-dir name refuses outright (the leaf opens
+# O_NOFOLLOW — round-6 killer d), even into clean territory…
+ln -s "$fixture/steer-target" "$fixture/goodlink-cache"
+printf 'v9.9.9' >"$fixture/steer-target/update-check"
+note_run THEME_CACHE_DIR="$fixture/goodlink-cache"
+if [ "$note_rc" = 0 ] && ! grep -qF 'update to the latest' "$note_out"; then
+    pass "a symlink at the cache-dir name refuses silently"
+else fail "leaf symlink accepted (rc=$note_rc): $(tail -3 "$note_out")"; fi
+# …while an INTERMEDIATE benign symlink keeps working — every macOS path
+# crosses /var -> /private/var, so links inside audited territory must not
+# break custody.
+mkdir -p "$fixture/steer-target/sub"
+printf 'v9.9.9' >"$fixture/steer-target/sub/update-check"
+note_run THEME_CACHE_DIR="$fixture/goodlink-cache/sub"
+if grep -qF 'update to the latest theme version: v9.9.9' "$note_out"; then
+    pass "an intermediate benign symlink still carries custody"
+else fail "benign intermediate symlink broke custody: $(tail -3 "$note_out")"; fi
+
+# --- the audit itself shells NOTHING plantable (Codex round 7) -------------
+# id and getfacl are gone from the audit; ls is reached only at /bin/ls.
+# Planted lookalikes carrying markers prove none of them ever executes,
+# while the custody outcomes above stayed exactly as pinned.
+auditbin="$fixture/auditbin"
+mkdir -p "$auditbin"
+for tool in id getfacl ls; do
+    printf '#!/bin/sh\n: >"%s/audit-stub-ran-%s"\nexit 0\n' "$fixture" "$tool" >"$auditbin/$tool"
+    chmod +x "$auditbin/$tool"
+done
+printf 'v9.9.9' >"$notecache/update-check"
+note_run PATH="$auditbin:$failbin:$sweepbin:$PATH"
+if grep -qF 'update to the latest theme version: v9.9.9' "$note_out" \
+   && [ -z "$(ls "$fixture" | grep audit-stub-ran)" ]; then
+    pass "planted id/getfacl/ls never execute and custody is unchanged"
+else fail "an audit helper was PATH-resolved: $(ls "$fixture" | grep audit-stub-ran)"; fi
+
+# Refusal must create NOTHING (round-7 LOW): a hostile ancestor with an
+# ABSENT final component ends with no directory conjured at the target.
+chmod 777 "$fixture/hostile-cache"
+note_run THEME_CACHE_DIR="$fixture/hostile-cache/newcache"
+if [ "$note_rc" = 0 ] && [ ! -e "$fixture/hostile-cache/newcache" ]; then
+    pass "a refused chain conjures no directory at the steered target"
+else fail "refusal still created something: $(ls -A "$fixture/hostile-cache")"; fi
+chmod 700 "$fixture/hostile-cache"
 
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILURES"; fi
 [ "$fails" -eq 0 ]

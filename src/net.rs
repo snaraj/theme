@@ -2,8 +2,16 @@
 //!
 //! curl stays a SUBPROCESS on purpose: credentials travel to it as `-K -`
 //! stdin config lines (never argv, never `ps`-visible), and the boundary
-//! fixture drives every network case through a deterministic PATH-stubbed
-//! curl — an in-process HTTP client would erase both properties.
+//! fixture drives every network case through a deterministic stubbed curl —
+//! an in-process HTTP client would erase both properties.
+//!
+//! Two transport trust levels (round 8): the wallpaper/credential lanes
+//! resolve `curl` from PATH per the reviewed #12 parity design, but the
+//! SELF-UPDATE lane — where one binary supplies metadata, digest file, AND
+//! the hashed bytes about to replace the running executable — only ever
+//! runs a curl at a fixed absolute path that passes
+//! [`crate::save::trusted_system_binary`], validated before every use.
+//! PATH is never consulted there.
 
 use crate::config::{MAX_DOWNLOAD_BYTES, UA};
 use crate::ui::note;
@@ -434,6 +442,71 @@ pub fn curl_config(config: &str, args: &[&str]) -> Option<Vec<u8>> {
     }
 }
 
+/// Fixed absolute candidates for the self-update transport. Not PATH: a
+/// planted curl there controls the release metadata, the SHA256SUMS file,
+/// and the bytes hashed against it in one stroke, so PATH resolution would
+/// make the SHA-256 check self-referential (Codex round 8).
+#[cfg(target_os = "macos")]
+const CURL_CANDIDATES: [&str; 1] = ["/usr/bin/curl"];
+#[cfg(not(target_os = "macos"))]
+const CURL_CANDIDATES: [&str; 2] = ["/usr/bin/curl", "/bin/curl"];
+
+/// First candidate that passes [`crate::save::trusted_system_binary`]
+/// (root-owned binary in a root-owned, non-writable directory). Split from
+/// [`trusted_curl`] so the refusal path is drivable in unit tests with
+/// planted candidates.
+fn resolve_curl(cands: &[&str]) -> Option<std::path::PathBuf> {
+    cands
+        .iter()
+        .find(|c| crate::save::trusted_system_binary(c))
+        .map(std::path::PathBuf::from)
+}
+
+/// The one curl the self-update/footer lane may run, RE-VALIDATED on every
+/// call — never cached, never PATH-resolved. None means the lane must
+/// refuse (explicit `theme update`) or silently stand down (footer note).
+///
+/// TEST SEAM, debug builds only and compiled OUT of release: the boundary
+/// fixture drives this lane with a deterministic stub via THEME_CURL
+/// (empty value simulates "no trusted curl"). A release binary carries no
+/// read of the variable at all — the fixture pins that too.
+pub fn trusted_curl() -> Option<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Ok(p) = std::env::var("THEME_CURL") {
+        return if p.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(p))
+        };
+    }
+    resolve_curl(&CURL_CANDIDATES)
+}
+
+/// [`curl_config`] for the self-update lane: the caller passes the
+/// validated absolute curl from [`trusted_curl`], and the child runs
+/// through [`crate::save::trusted_spawn`] — an EMPTY environment, which
+/// supersedes the round-8 proxy scrub and closes the TLS-trust
+/// (CURL_CA_BUNDLE/SSL_CERT_*) and loader (LD_*/DYLD_*) channels too.
+/// `--noproxy '*'` stays on the argv as belt-and-braces; callers put `-q`
+/// FIRST in `args` — no curlrc.
+pub fn curl_config_trusted(program: &Path, config: &str, args: &[&str]) -> Option<Vec<u8>> {
+    let mut child = crate::save::trusted_spawn(program)
+        .args(args)
+        .args(["--noproxy", "*"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(config.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    if out.status.success() {
+        Some(out.stdout)
+    } else {
+        None
+    }
+}
+
 /// `file -b --mime-type` — content-typed, never extension-typed.
 pub fn mime_of(path: &Path) -> String {
     Command::new("file")
@@ -449,6 +522,51 @@ pub fn mime_of(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    /// Round 9, the metadata-request shape end-to-end: a child driven
+    /// through curl_config_trusted sees an EMPTY environment — the
+    /// parent's PATH and HOME along with any hostile
+    /// CURL_CA_BUNDLE/SSL_CERT_*/LD_*/DYLD_* — so no ambient variable can
+    /// substitute TLS trust or preload code into the trusted binary. (The
+    /// asset-hop shape builds from the same trusted_spawn boundary;
+    /// save_tests pins that function directly.)
+    #[test]
+    fn the_trusted_config_spawn_is_env_cleared() {
+        assert!(std::env::var_os("PATH").is_some());
+        let body = curl_config_trusted(Path::new("/bin/sh"), "", &["-c", "/usr/bin/env"]).unwrap();
+        // The shell manufactures PWD/SHLVL/_ for itself; NOTHING inherited
+        // may appear beside them — not PATH, not HOME, not a hostile var.
+        for line in String::from_utf8_lossy(&body).lines() {
+            assert!(
+                line.starts_with("PWD=") || line.starts_with("SHLVL=") || line.starts_with("_="),
+                "inherited environment crossed the boundary: {line}"
+            );
+        }
+    }
+
+    /// Round 8: the self-update transport resolver refuses a curl that is
+    /// not root-owned in a root-owned directory — a planted candidate in
+    /// user territory never resolves, and an invalid candidate ahead of the
+    /// system one is skipped, not trusted.
+    #[test]
+    fn update_transport_only_trusts_system_curl() {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-tmp")
+            .join(format!("net-curl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let planted = d.join("curl");
+        std::fs::write(&planted, "#!/bin/sh\nexit 0\n").unwrap();
+        let planted = planted.to_str().unwrap().to_string();
+        assert_eq!(resolve_curl(&[&planted]), None, "planted curl resolved");
+        assert_eq!(resolve_curl(&[]), None);
+        // The real system curl passes on every platform CI runs, and an
+        // invalid candidate listed first must not shadow it.
+        let sys = std::path::PathBuf::from("/usr/bin/curl");
+        assert_eq!(resolve_curl(&["/usr/bin/curl"]), Some(sys.clone()));
+        assert_eq!(resolve_curl(&[&planted, "/usr/bin/curl"]), Some(sys));
+        let _ = std::fs::remove_dir_all(&d);
+    }
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};

@@ -2,7 +2,7 @@
 //! flag-free — the shell dispatch's loop, typed.
 
 use crate::imaging::{extend_image, rotate_image};
-use crate::ui::die;
+use crate::ui::{die, display_text};
 use std::path::Path;
 
 #[derive(Default)]
@@ -15,6 +15,44 @@ pub struct Flags {
     pub wallpaper: String,
     pub source_url: String,
     pub args: Vec<String>,
+}
+
+/// `theme update`'s OWN argv grammar, parsed from the RAW argv — the global
+/// flag pass never runs for update, so nothing can swallow a typo before
+/// refusal, and `--version` exists for NO other command (a destructive verb
+/// handed `--version` refuses it like any unknown flag, before any side
+/// effect — Codex round 3). Accepted: zero or one `--version <v>` /
+/// `--version=<v>`, `-h`/`--help`. Anything else — positional or flag —
+/// refuses HERE, before any network call. Returns (want_help, version_sel).
+pub fn parse_update(rest: &[String]) -> (bool, String) {
+    let mut help = false;
+    let mut version = String::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        let value = match a.as_str() {
+            "-h" | "--help" => {
+                help = true;
+                continue;
+            }
+            "--version" => match it.next().filter(|v| !v.starts_with('-')) {
+                Some(v) => v.clone(),
+                None => die("--version takes a release version like v0.1.0"),
+            },
+            s if s.starts_with("--version=") => s["--version=".len()..].to_string(),
+            s => die(&format!(
+                "unknown argument '{}' for 'theme update' — try: theme update --help",
+                display_text(s)
+            )),
+        };
+        if value.is_empty() {
+            die("--version takes a release version like v0.1.0");
+        }
+        if !version.is_empty() {
+            die("theme update takes one --version at most");
+        }
+        version = value;
+    }
+    (help, version)
 }
 
 pub fn parse(argv: &[String]) -> Flags {
