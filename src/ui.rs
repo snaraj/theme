@@ -48,6 +48,47 @@ pub fn swatch_row(colors: &[String]) -> String {
     out
 }
 
+/// Word-wrap PLAIN text (no escapes) so no emitted line exceeds `cols`
+/// where geometry allows: the first line starts with `first`, every
+/// continuation with `cont` — a continuation never lands at column 0. A
+/// word wider than the window hard-splits. The window floors at 12
+/// characters: below `prefix + 12` a line may exceed a hopeless terminal
+/// instead of shredding into one-character columns (issue #19).
+pub fn wrap_prefixed(text: &str, cols: usize, first: &str, cont: &str) -> Vec<String> {
+    let win = |p: &str| cols.saturating_sub(p.chars().count()).max(12);
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let mut chars: Vec<char> = word.chars().collect();
+        loop {
+            let w = if out.is_empty() {
+                win(first)
+            } else {
+                win(cont)
+            };
+            let used = cur.chars().count();
+            let sep = if cur.is_empty() { 0 } else { 1 };
+            if used + sep + chars.len() <= w {
+                if sep == 1 {
+                    cur.push(' ');
+                }
+                cur.extend(chars.iter());
+                break;
+            }
+            if cur.is_empty() {
+                let take = w.min(chars.len());
+                cur.extend(chars.drain(..take));
+            }
+            let pfx = if out.is_empty() { first } else { cont };
+            out.push(format!("{pfx}{cur}"));
+            cur.clear();
+        }
+    }
+    let pfx = if out.is_empty() { first } else { cont };
+    out.push(format!("{pfx}{cur}"));
+    out
+}
+
 /// Parse exactly six hex digits into (r, g, b).
 pub fn parse_hex6(s: &str) -> Option<(u8, u8, u8)> {
     if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -87,6 +128,22 @@ mod tests {
     #[test]
     fn display_text_keeps_utf8() {
         assert_eq!(display_text("héllo…"), "héllo…");
+    }
+
+    /// The narrow-render wrap (issue #19): words fill the window, every
+    /// continuation carries its prefix (never column 0), an unbroken word
+    /// wider than the window hard-splits, and no line exceeds the width
+    /// while the window stays above its 12-character floor.
+    #[test]
+    fn wrapped_lines_fit_and_continuations_carry_their_prefix() {
+        let out = wrap_prefixed("alpha beta gamma delta epsilon", 14, "* ", "~ ");
+        assert_eq!(out, ["* alpha beta", "~ gamma delta", "~ epsilon"]);
+        assert!(out.iter().all(|l| l.chars().count() <= 14));
+        let out = wrap_prefixed("abcdefghijklmnopqrstuvwxyz", 14, "  ", "  ");
+        assert_eq!(out, ["  abcdefghijkl", "  mnopqrstuvwx", "  yz"]);
+        // Below prefix+12 the window floors at 12 rather than shredding.
+        let out = wrap_prefixed("abcdefghijklmn", 6, "    ", "    ");
+        assert_eq!(out, ["    abcdefghijkl", "    mn"]);
     }
 
     #[test]

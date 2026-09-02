@@ -7,7 +7,7 @@
 use crate::apply::wallpaper_get;
 use crate::config::Config;
 use crate::report::{include_line, render_preview, scheme_colors};
-use crate::ui::{display_text, swatch_row, truncate_ellipsis};
+use crate::ui::{display_text, swatch_row, truncate_ellipsis, wrap_prefixed};
 use std::path::Path;
 use std::process::Command;
 
@@ -16,6 +16,106 @@ fn columns() -> usize {
         .ok()
         .and_then(|c| c.parse().ok())
         .unwrap_or(100)
+}
+
+/// Bare-screen header geometry (issue #19): the image sits beside the live
+/// fields ONLY when the whole side-by-side row provably fits — 2 indent +
+/// image + 2 gap + 13 label column + the 32-cell swatch row. Anything
+/// narrower stacks: thumbnail above (clamped to the terminal, DROPPED below
+/// an 8-cell floor rather than torn), fields below as a label line with the
+/// value indented beneath, truncated/count-fitted to the width. A value
+/// never lands at column 0 and never interleaves an image row.
+const IMG_COLS: usize = 14;
+const IMG_ROWS: usize = 6;
+const IMG_FLOOR: usize = 8;
+const SIDE_MIN: usize = 2 + IMG_COLS + 2 + 13 + 32;
+
+/// The command table as data so one renderer owns the width discipline —
+/// same text as before, no growth (the help doctrine holds).
+const SECTIONS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Apply Commands:",
+        &[
+            (
+                "set",
+                "apply a wallpaper: local name/path, or any actionable link",
+            ),
+            (
+                "random",
+                "random wallpaper from the configured wallpaper folder",
+            ),
+            (
+                "unsplash",
+                "Unsplash photos: search, page-url, random; auth and status",
+            ),
+            (
+                "url",
+                "download a direct image URL or Pinterest pin, save it, apply it",
+            ),
+        ],
+    ),
+    (
+        "Library Commands:",
+        &[
+            (
+                "list, ls",
+                "wallpaper table: title + colorscheme (-v adds source, format, size, date)",
+            ),
+            (
+                "preview",
+                "one wallpaper up close: picture, colorscheme, title, location",
+            ),
+            (
+                "rename",
+                "rename a saved wallpaper, keeping the naming format",
+            ),
+            ("remove, rm", "delete saved wallpapers by name"),
+        ],
+    ),
+    (
+        "Info Commands:",
+        &[
+            ("status", "current theme, color-scheme swatches, variables"),
+            (
+                "update",
+                "replace this binary with the latest release (verified)",
+            ),
+            ("version, -V", "version, repository, and maintainer"),
+            ("help", "this text (per-command: theme <command> --help)"),
+        ],
+    ),
+];
+
+const FLAGS: &[(&str, &str)] = &[
+    ("--rotate left|right", "turn the image 90° before applying"),
+    (
+        "--extend[=RRGGBB]",
+        "centre flat art on a matching canvas (default 000000)",
+    ),
+    (
+        "--desktop-only",
+        "set the desktop wallpaper only; terminal colors stay",
+    ),
+];
+
+/// One key/description table: two columns with the description wrapped to a
+/// hanging indent while it keeps a real window; below that, the key on its
+/// own line and the description indented beneath — never at column 0.
+fn print_table(cols: usize, items: &[(&str, &str)], keyw: usize) {
+    for (k, d) in items {
+        if cols >= 2 + keyw + 2 + 20 {
+            let first = format!("  {k:<keyw$}  ");
+            let cont = " ".repeat(2 + keyw + 2);
+            for l in wrap_prefixed(d, cols, &first, &cont) {
+                println!("{l}");
+            }
+        } else {
+            println!("  {k}");
+            for l in wrap_prefixed(d, cols, "      ", "      ") {
+                println!("{l}");
+            }
+        }
+    }
 }
 
 fn cmd_out(cmd: &str, args: &[&str]) -> String {
@@ -41,17 +141,7 @@ pub fn usage(cfg: &Config) {
             .to_string()
     };
     let colors = scheme_colors(cfg);
-    let sw = if colors.is_empty() {
-        "<none>".to_string()
-    } else {
-        let eight: Vec<String> = colors.iter().take(8).cloned().collect();
-        let tail = if label.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", display_text(&label))
-        };
-        format!("{}{tail}", swatch_row(&eight))
-    };
+    let eight: Vec<String> = colors.iter().take(8).cloned().collect();
     let in_kitty = std::env::var("KITTY_WINDOW_ID")
         .map(|v| !v.is_empty())
         .unwrap_or(false);
@@ -85,74 +175,112 @@ pub fn usage(cfg: &Config) {
         Some(d) => display_text(d.file_stem().and_then(|s| s.to_str()).unwrap_or("")),
         None => "<none>".into(),
     };
-    let availw = columns().saturating_sub(18 + 13).max(12);
-    let name = truncate_ellipsis(&name, availw);
-    let rlines = [
-        String::new(),
-        format!("{:<12} {}", "THEME", name),
-        format!("{:<12} {}", "COLORSCHEME", sw),
-        format!("{:<12} {}", "TERMINAL", term),
-        format!("{:<12} {}", "OS", os),
-        String::new(),
-    ];
-    let pv = desk
-        .as_deref()
-        .filter(|d| d.is_file())
-        .and_then(|d| render_preview(d, 14, 6));
-    match pv {
-        Some(p) => {
-            print!("{}", p.apc);
-            for i in 0..6 {
-                let line = p
-                    .rows
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("{:<14}", ""));
-                println!(
-                    "  {line}  {}",
-                    rlines.get(i).map(String::as_str).unwrap_or("")
-                );
+    let cols = columns();
+    let desk_file = desk.as_deref().filter(|d| d.is_file());
+    if cols >= SIDE_MIN {
+        let sw = if eight.is_empty() {
+            "<none>".to_string()
+        } else {
+            // The scheme-name tail rides along only when it provably fits
+            // beside the 32 swatch cells.
+            let tail = display_text(&label);
+            let tail = if !tail.is_empty() && cols >= SIDE_MIN + 1 + tail.chars().count() {
+                format!(" {tail}")
+            } else {
+                String::new()
+            };
+            format!("{}{tail}", swatch_row(&eight))
+        };
+        let availw = cols.saturating_sub(18 + 13).max(12);
+        let name = truncate_ellipsis(&name, availw);
+        let rlines = [
+            String::new(),
+            format!("{:<12} {}", "THEME", name),
+            format!("{:<12} {}", "COLORSCHEME", sw),
+            format!("{:<12} {}", "TERMINAL", term),
+            format!("{:<12} {}", "OS", os),
+            String::new(),
+        ];
+        let pv = desk_file.and_then(|d| render_preview(d, IMG_COLS, IMG_ROWS));
+        match pv {
+            Some(p) => {
+                print!("{}", p.apc);
+                for i in 0..IMG_ROWS {
+                    let line = p
+                        .rows
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("{:<IMG_COLS$}", ""));
+                    println!(
+                        "  {line}  {}",
+                        rlines.get(i).map(String::as_str).unwrap_or("")
+                    );
+                }
             }
-        }
-        None => {
-            for line in &rlines {
-                if !line.is_empty() {
-                    println!("  {line}");
+            None => {
+                for line in &rlines {
+                    if !line.is_empty() {
+                        println!("  {line}");
+                    }
                 }
             }
         }
+    } else {
+        // STACKED: the image rows stay contiguous whatever the width, or
+        // the image is absent with dignity — never torn.
+        let tcols = cols.saturating_sub(2).min(IMG_COLS);
+        if tcols >= IMG_FLOOR
+            && let Some(p) = desk_file.and_then(|d| render_preview(d, tcols, IMG_ROWS))
+        {
+            print!("{}", p.apc);
+            for r in &p.rows {
+                println!("  {r}");
+            }
+        }
+        println!();
+        let vw = cols.saturating_sub(4).max(12);
+        let n = (cols.saturating_sub(4) / 4).clamp(1, 8);
+        let sw = if eight.is_empty() {
+            "<none>".to_string()
+        } else {
+            swatch_row(&eight[..n.min(eight.len())])
+        };
+        for (l, v) in [
+            ("THEME", truncate_ellipsis(&name, vw)),
+            ("COLORSCHEME", sw),
+            ("TERMINAL", term),
+            ("OS", truncate_ellipsis(&os, vw)),
+        ] {
+            println!("  {l}");
+            println!("    {v}");
+        }
     }
-    print!(
-        "
-Apply Commands:
-  set             apply a wallpaper: local name/path, or any actionable link
-  random          random wallpaper from the configured wallpaper folder
-  unsplash        Unsplash photos: search, page-url, random; auth and status
-  url             download a direct image URL or Pinterest pin, save it, apply it
-
-Library Commands:
-  list, ls        wallpaper table: title + colorscheme (-v adds source, format, size, date)
-  preview         one wallpaper up close: picture, colorscheme, title, location
-  rename          rename a saved wallpaper, keeping the naming format
-  remove, rm      delete saved wallpapers by name
-
-Info Commands:
-  status          current theme, color-scheme swatches, variables
-  update          replace this binary with the latest release (verified)
-  version, -V     version, repository, and maintainer
-  help            this text (per-command: theme <command> --help)
-
-Usage:
-  theme <command> [flags]
-
-Global Flags (any image command):
-  --rotate left|right    turn the image 90° before applying
-  --extend[=RRGGBB]      centre flat art on a matching canvas (default 000000)
-  --desktop-only         set the desktop wallpaper only; terminal colors stay
-
-Use \"theme <command> --help\" for more information about a given command.
-"
+    println!();
+    for (title, items) in SECTIONS {
+        println!("{title}");
+        print_table(cols, items, 14);
+        println!();
+    }
+    println!("Usage:\n  theme <command> [flags]\n");
+    // The parenthetical rides along only where it fits.
+    println!(
+        "{}",
+        if cols >= 33 {
+            "Global Flags (any image command):"
+        } else {
+            "Global Flags:"
+        }
     );
+    print_table(cols, FLAGS, 21);
+    println!();
+    for l in wrap_prefixed(
+        "Use \"theme <command> --help\" for more information about a given command.",
+        cols,
+        "",
+        "  ",
+    ) {
+        println!("{l}");
+    }
     crate::update::maybe_note(cfg);
 }
 

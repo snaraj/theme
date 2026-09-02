@@ -197,7 +197,9 @@ multi="$lib:$lib2"
 check  "a name in the SECOND dir resolves"      0 run "$multi" preview second-dir-only
 check  "rm resolves into the second dir too"    0 run "$multi" rm second-dir-only
 exists "second-dir file really deleted"         no "$lib2/second-dir-only.jpg"
-mstat=$(run_nokitty "$multi" status 2>&1)
+# COLUMNS wide enough that the list stays on one line — narrow terminals
+# wrap it with a hanging indent now (issue #19), pinned in its own section.
+mstat=$(COLUMNS=500 run_nokitty "$multi" status 2>&1)
 if printf '%s' "$mstat" | grep -qF "$multi"; then
     pass "status shows the whole directory list"
 else fail "status hides the extra library dirs"; fi
@@ -1442,6 +1444,105 @@ if [ "$note_rc" = 0 ] && [ ! -e "$fixture/hostile-cache/newcache" ]; then
     pass "a refused chain conjures no directory at the steered target"
 else fail "refusal still created something: $(ls -A "$fixture/hostile-cache")"; fi
 chmod 700 "$fixture/hostile-cache"
+
+# --- narrow terminals: the image is never torn, text never at column 0 -----
+# (issue #19) A stub kitten emits a deterministic APC + rows of '#' cells and
+# a stub wallpaper answers with a long-titled library file, so the checker
+# can SEE the image/text ordering. narrowck.py strips APC/OSC/CSI escapes
+# and asserts: no visible line wider than COLUMNS (0 skips the width check —
+# below prefix+12 the wrap floors rather than shredding), the '#' image rows
+# contiguous with the expected count and width (0 = image must be absent),
+# and no line at column 0 outside the known section starters.
+narrowbin="$fixture/narrowbin"
+mkdir -p "$narrowbin"
+narrowimg="$lib/narrow-check-quite-long-wallpaper-title.png"
+png1x1 "$narrowimg" 3 7 11
+cat >"$narrowbin/kitten" <<'EOS'
+#!/bin/bash
+place=""
+for a in "$@"; do case "$a" in --place=*) place="${a#--place=}" ;; esac; done
+w="${place%%x*}"
+rest="${place#*x}"
+h="${rest%%@*}"
+printf '\033_Ga=T,f=100,c=%s,r=%s\033\\' "$w" "$h"
+for ((i = 0; i < h; i++)); do
+    printf '\033[38;2;7;7;7m'
+    for ((j = 0; j < w; j++)); do printf '#'; done
+    printf '\n'
+done
+EOS
+chmod +x "$narrowbin/kitten"
+cat >"$narrowbin/wallpaper" <<EOS
+#!/bin/sh
+printf '%s\n' "$narrowimg"
+EOS
+chmod +x "$narrowbin/wallpaper"
+cat >"$fixture/narrowck.py" <<'EOS'
+import re, sys
+path, cols, imgrows, imgw = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+raw = open(path, encoding='utf-8', errors='replace').read()
+raw = re.sub(r'\x1b_G.*?\x1b\\', '', raw, flags=re.S)
+raw = re.sub(r'\x1b\].*?(\x07|\x1b\\)', '', raw)
+raw = re.sub(r'\x1b\[[0-9;:]*[A-Za-z]', '', raw)
+lines = raw.split('\n')
+if cols:
+    bad = [l for l in lines if len(l) > cols]
+    if bad:
+        sys.exit('WIDER than %d: %r' % (cols, bad[:3]))
+rows = [i for i, l in enumerate(lines) if re.search('#{%d}' % max(imgw, 1), l)]
+if imgrows == 0:
+    if any('#' in l for l in lines):
+        sys.exit('image present where it must be absent')
+else:
+    if len(rows) != imgrows:
+        sys.exit('expected %d image rows, saw %d' % (imgrows, len(rows)))
+    if rows != list(range(rows[0], rows[0] + imgrows)):
+        sys.exit('image rows are NOT contiguous: %r' % rows)
+starters = ('Apply Commands:', 'Library Commands:', 'Info Commands:', 'Usage:',
+            'Global Flags', 'Use "', 'current theme:', 'mode:', 'color scheme:',
+            'palette source:', 'palette image:', 'wallpaper dir:', 'variables:',
+            'update to the latest', 'to update run:', 'wallpapers')
+for l in lines:
+    if l and not l.startswith(' ') and not l.startswith(starters):
+        sys.exit('column-0 line outside the known starters: %r' % l)
+EOS
+narrow_out="$fixture/narrow.out"
+narrow_run() { # $1 COLUMNS, rest: theme args
+    local c="$1"
+    shift
+    env COLUMNS="$c" KITTY_WINDOW_ID=1 PATH="$narrowbin:$sweepbin:$PATH" \
+        THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
+        THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
+        "$THEME" "$@" >"$narrow_out" 2>&1
+    narrow_rc=$?
+}
+narrowck() { python3 "$fixture/narrowck.py" "$narrow_out" "$@" 2>&1; }
+
+narrow_run 100
+if [ "$narrow_rc" = 0 ] && why=$(narrowck 100 6 14) && grep -q '#.*THEME' "$narrow_out"; then
+    pass "wide bare screen keeps the side-by-side header"
+else fail "wide bare screen regressed (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
+narrow_run 40
+if [ "$narrow_rc" = 0 ] && why=$(narrowck 40 6 14) && ! grep -q '#.*THEME' "$narrow_out" \
+   && grep -q '^  THEME$' "$narrow_out"; then
+    pass "40 columns stacks: image whole above, fields below"
+else fail "40-column bare screen broke (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
+narrow_run 25
+if [ "$narrow_rc" = 0 ] && why=$(narrowck 25 6 14) && ! grep -q '#.*THEME' "$narrow_out"; then
+    pass "25 columns stacks with the image whole"
+else fail "25-column bare screen broke (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
+narrow_run 9
+if [ "$narrow_rc" = 0 ] && why=$(narrowck 0 0 0); then
+    pass "below the floor the image is absent with dignity, never torn"
+else fail "9-column bare screen broke (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
+narrow_run 25 preview narrow-check-quite-long-wallpaper-title
+if [ "$narrow_rc" = 0 ] && why=$(narrowck 25 10 23); then
+    pass "a 25-column preview clamps its thumbnail and wraps its fields"
+else fail "25-column preview broke (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
+narrow_run 40 status
+if [ "$narrow_rc" = 0 ] && why=$(narrowck 40 0 0); then
+    pass "a 40-column status wraps every value with a hanging indent"
+else fail "40-column status broke (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
 
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILURES"; fi
 [ "$fails" -eq 0 ]
