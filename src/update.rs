@@ -38,7 +38,6 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 const RELEASES_API: &str = "https://api.github.com/repos/snaraj/theme/releases";
@@ -583,12 +582,13 @@ fn fetch_asset(url: &str, dest: &Path, cap: u64) -> Result<(), String> {
             ));
         }
         let hdr = scratch::new();
-        // Trusted transport, RE-VALIDATED per hop, with the same scrub as
-        // the metadata request: `-q` first (no curlrc), --noproxy plus the
-        // proxy-env scrub (no ambient middlebox), PATH never consulted.
+        // Trusted transport, RE-VALIDATED per hop, under the SAME env
+        // boundary as the metadata request ([`crate::save::trusted_spawn`]
+        // — empty child env, round 9): `-q` first (no curlrc), --noproxy
+        // on the argv as belt-and-braces, PATH never consulted.
         let curl = crate::net::trusted_curl()
             .ok_or("no trusted system curl (a root-owned /usr/bin/curl)")?;
-        let mut cmd = Command::new(&curl);
+        let mut cmd = crate::save::trusted_spawn(&curl);
         cmd.args([
             "-q",
             "-sg",
@@ -611,7 +611,6 @@ fn fetch_asset(url: &str, dest: &Path, cap: u64) -> Result<(), String> {
         .arg(dest)
         .arg("--url")
         .arg(&here);
-        crate::net::scrub_proxy_env(&mut cmd);
         let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
         let head = std::fs::read_to_string(&hdr).unwrap_or_default();
         scratch::done(&hdr);
@@ -878,6 +877,7 @@ fn install_over(target: &Path, tarball: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     // The release chain's STABLE asset names (no version infix — #14 round
     // 3 dropped the publish-job rename so latest/download URLs stay live).

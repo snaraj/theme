@@ -282,6 +282,21 @@ fn forced_posix_acl_predicate() {
     assert!(why.contains("unknown ACL entry tag"), "{why}");
 }
 
+/// Round 9: every spawn inside the security boundary starts from an EMPTY
+/// environment. TLS-trust substitution (CURL_CA_BUNDLE/SSL_CERT_FILE to
+/// /dev/null flips a working request to error 77) and loader injection
+/// (LD_PRELOAD/LD_AUDIT/LD_LIBRARY_PATH, DYLD_* on macOS) all travel by
+/// inherited env, so the strongest proof is that NOTHING crosses: env(1)
+/// under the boundary prints not one variable, while this parent
+/// demonstrably carries PATH at minimum.
+#[test]
+fn boundary_spawns_carry_no_environment() {
+    assert!(std::env::var_os("PATH").is_some());
+    let out = trusted_spawn(Path::new("/usr/bin/env")).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
+}
+
 /// The xattr-read errno mapping, driven with INJECTED errnos (round 8):
 /// only NODATA — the filesystem's actual "no ACL set" answer — passes.
 /// OPNOTSUPP means the interrogation itself is unsupported, which is

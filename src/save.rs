@@ -161,6 +161,25 @@ pub(crate) fn trusted_system_binary(p: &str) -> bool {
     p.parent().map(clean).unwrap_or(false) && clean(p)
 }
 
+/// The ONE environment boundary for every spawn inside the security
+/// boundary — the update lane's curl (both the metadata request and every
+/// download hop) and the darwin ACL interrogator alike. A validated binary
+/// still inherits its parent's environment, and that channel alone restores
+/// single-actor control (round 9): CURL_CA_BUNDLE/SSL_CERT_FILE=/dev/null
+/// substitute the TLS trust anchors right through `-q`, and
+/// LD_PRELOAD/LD_AUDIT/LD_LIBRARY_PATH (DYLD_* on macOS) execute attacker
+/// code inside the trusted binary itself. So the child starts from an
+/// EMPTY environment — the allowlist is deliberately empty: this lane's
+/// children need no HOME (`-q` already refuses curlrc), no PATH (the
+/// binary is absolute and spawns nothing), no TMPDIR (every output lands
+/// at an absolute path we pass), no locale (we parse structural output
+/// only). Add a variable here only with a written justification.
+pub(crate) fn trusted_spawn(program: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_clear();
+    cmd
+}
+
 /// A REASON to refuse, or None — the STRICTEST, identity-free rule (round
 /// 7: a planted `id` on PATH laundered a foreign write ACL, and getfacl
 /// was PATH-resolved): any ALLOW entry carrying a write-shaped right
@@ -190,7 +209,11 @@ fn acl_write_grant(path: &Path, platform: AclPlatform) -> Option<String> {
             if !trusted_system_binary("/bin/ls") {
                 return Some("could not be audited for ACLs: /bin/ls failed validation".into());
             }
-            let out = match Command::new("/bin/ls").arg("-lde").arg(path).output() {
+            let out = match trusted_spawn(Path::new("/bin/ls"))
+                .arg("-lde")
+                .arg(path)
+                .output()
+            {
                 Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
                 _ => return Some("could not be audited for ACLs: ls -lde failed".into()),
             };

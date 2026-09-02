@@ -483,36 +483,27 @@ pub fn trusted_curl() -> Option<std::path::PathBuf> {
 }
 
 /// [`curl_config`] for the self-update lane: the caller passes the
-/// validated absolute curl from [`trusted_curl`], and the child env is
-/// scrubbed of every proxy-selecting variable (`--noproxy '*'` on the argv
-/// as well, for curl builds that ignore the env) so no ambient variable
-/// can interpose a middlebox between GitHub and bytes headed for
-/// executable replacement. Callers put `-q` FIRST in `args` — no curlrc.
+/// validated absolute curl from [`trusted_curl`], and the child runs
+/// through [`crate::save::trusted_spawn`] — an EMPTY environment, which
+/// supersedes the round-8 proxy scrub and closes the TLS-trust
+/// (CURL_CA_BUNDLE/SSL_CERT_*) and loader (LD_*/DYLD_*) channels too.
+/// `--noproxy '*'` stays on the argv as belt-and-braces; callers put `-q`
+/// FIRST in `args` — no curlrc.
 pub fn curl_config_trusted(program: &Path, config: &str, args: &[&str]) -> Option<Vec<u8>> {
-    let mut child = Command::new(program);
-    child
+    let mut child = crate::save::trusted_spawn(program)
         .args(args)
         .args(["--noproxy", "*"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    for k in PROXY_VARS {
-        child.env_remove(k);
-    }
-    let mut child = child.spawn().ok()?;
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
     child.stdin.take()?.write_all(config.as_bytes()).ok()?;
     let out = child.wait_with_output().ok()?;
     if out.status.success() {
         Some(out.stdout)
     } else {
         None
-    }
-}
-
-/// The proxy scrub, shared with the asset-download hops in `update.rs`.
-pub fn scrub_proxy_env(cmd: &mut Command) {
-    for k in PROXY_VARS {
-        cmd.env_remove(k);
     }
 }
 
@@ -531,6 +522,27 @@ pub fn mime_of(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    /// Round 9, the metadata-request shape end-to-end: a child driven
+    /// through curl_config_trusted sees an EMPTY environment — the
+    /// parent's PATH and HOME along with any hostile
+    /// CURL_CA_BUNDLE/SSL_CERT_*/LD_*/DYLD_* — so no ambient variable can
+    /// substitute TLS trust or preload code into the trusted binary. (The
+    /// asset-hop shape builds from the same trusted_spawn boundary;
+    /// save_tests pins that function directly.)
+    #[test]
+    fn the_trusted_config_spawn_is_env_cleared() {
+        assert!(std::env::var_os("PATH").is_some());
+        let body = curl_config_trusted(Path::new("/bin/sh"), "", &["-c", "/usr/bin/env"]).unwrap();
+        // The shell manufactures PWD/SHLVL/_ for itself; NOTHING inherited
+        // may appear beside them — not PATH, not HOME, not a hostile var.
+        for line in String::from_utf8_lossy(&body).lines() {
+            assert!(
+                line.starts_with("PWD=") || line.starts_with("SHLVL=") || line.starts_with("_="),
+                "inherited environment crossed the boundary: {line}"
+            );
+        }
+    }
 
     /// Round 8: the self-update transport resolver refuses a curl that is
     /// not root-owned in a root-owned directory — a planted candidate in

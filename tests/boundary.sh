@@ -871,8 +871,12 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
     paysha=$(shasum -a 256 "$payload" | cut -d' ' -f1)
 fi
-cat >"$updd/stubbin/curl" <<'EOS'
-#!/bin/bash
+# The stub learns its controls from the ctl FILE upd_run writes, never from
+# env: the binary env-clears every transport child (round 9), so the
+# environment provably cannot reach this script. PATH is pinned explicitly
+# because an env-cleared bash otherwise runs on its compiled-in default.
+printf '#!/bin/bash\nPATH=/usr/bin:/bin\n. "%s/ctl"\n' "$updd" >"$updd/stubbin/curl"
+cat >>"$updd/stubbin/curl" <<'EOS'
 out=""; hdr=""; url=""; k=0
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
@@ -938,9 +942,21 @@ updlog="$updd/log"
 upd_out="$updd/out"
 upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
     # a $() capture would strand both in a subshell); env pairs, then an
-    # optional `--` followed by extra update arguments
-    local envs=()
-    while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+    # optional `--` followed by extra update arguments.
+    # UPD_* control pairs travel by the ctl FILE the stub sources, NOT env:
+    # the binary env-clears every transport child (round 9), so the
+    # environment provably cannot reach the stub. (UPD_TAR_MARKER stays in
+    # the theme process env on purpose — a hypothetical PATH-tar spawn
+    # would inherit it, which is exactly what that pin watches for.)
+    local envs=() ctl=() kv
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+        case "$1" in
+        UPD_TAR_MARKER=*) envs+=("$1") ;;
+        UPD_*) ctl+=("$1") ;;
+        *) envs+=("$1") ;;
+        esac
+        shift
+    done
     [ "${1:-}" = "--" ] && shift
     # rm first: macOS caches code-signing state by inode, and cp -f over a
     # previously-executed binary poisons it — the next exec dies SIGKILL.
@@ -949,9 +965,15 @@ upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
     rm -f "$updd/bin/theme"
     cp "$THEME_DBG" "$updd/bin/theme"
     : >"$updlog"
-    env UPD_LOG="$updlog" UPD_TRIPLE="$triple" UPD_PAYLOAD="$payload" \
-        UPD_TAR_MARKER="$updd/tar-ran" THEME_CURL="$updd/stubbin/curl" \
-        UPD_SUMS_FILE="$updd/sums" PATH="$updd/stubbin:$PATH" \
+    {
+        printf "UPD_LOG='%s'\n" "$updlog"
+        printf "UPD_TRIPLE='%s'\n" "$triple"
+        printf "UPD_PAYLOAD='%s'\n" "$payload"
+        printf "UPD_SUMS_FILE='%s'\n" "$updd/sums"
+        for kv in ${ctl[@]+"${ctl[@]}"}; do printf '%s\n' "$kv"; done
+    } >"$updd/ctl"
+    env UPD_TAR_MARKER="$updd/tar-ran" THEME_CURL="$updd/stubbin/curl" \
+        PATH="$updd/stubbin:$PATH" \
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
         "${envs[@]}" "$updd/bin/theme" update "$@" >"$upd_out" 2>&1
@@ -1206,6 +1228,32 @@ if [ "$upd_rc" != 0 ] && cmp -s "$THEME" "$updd/bin/theme" \
     pass "the release binary ignores PATH and the seam alike"
 else fail "release transport was steerable (rc=$upd_rc): $(cat "$upd_out")"; fi
 
+# --- round 9: the environment channel is dead to the boundary ---------------
+# The parent exports the full hostile set — TLS-trust substitution
+# (CURL_CA_BUNDLE/SSL_CERT_*/CURL_SSL_BACKEND), loader injection (both the
+# LD_ and DYLD_ families), a proxy trio, and BASH_ENV, which WOULD execute
+# a marker script inside any bash child that inherited env — and a full
+# update through BOTH command shapes (metadata + two asset hops) still
+# succeeds with no marker: every transport child starts from an empty
+# environment, and the stub itself learns its controls from the ctl file
+# because env provably cannot reach it.
+# (DYLD_INSERT_LIBRARIES carries a REAL, inert system dylib: dyld
+# hard-kills any process it cannot load the insert into, and the theme
+# process's own launch env is the caller's domain, not this boundary's —
+# what is under test is that the variable never reaches a CHILD.)
+printf ': >"%s/envchan-ran"\n' "$updd" >"$updd/bashenv.sh"
+upd_run UPD_TAG=v9.9.9 \
+    BASH_ENV="$updd/bashenv.sh" \
+    CURL_CA_BUNDLE=/dev/null SSL_CERT_FILE=/dev/null SSL_CERT_DIR=/dev/null \
+    CURL_SSL_BACKEND=hostile LD_PRELOAD=/dev/null LD_AUDIT=/dev/null \
+    LD_LIBRARY_PATH=/dev/null DYLD_INSERT_LIBRARIES=/usr/lib/libz.1.dylib \
+    DYLD_LIBRARY_PATH=/dev/null https_proxy=http://127.0.0.1:9 \
+    HTTPS_PROXY=http://127.0.0.1:9 all_proxy=http://127.0.0.1:9
+if [ "$upd_rc" = 0 ] && grep -qF "theme v$cur_ver → v9.9.9" "$upd_out" \
+   && cmp -s "$inner" "$updd/bin/theme" && [ ! -e "$updd/envchan-ran" ]; then
+    pass "a fully hostile environment never reaches a boundary child"
+else fail "the environment channel leaked (rc=$upd_rc): $(cat "$upd_out")"; fi
+
 # --- the update-available footer on the bare `theme` screen ----------------
 notecache="$fixture/notecache"
 mkdir -p "$notecache"
@@ -1213,9 +1261,11 @@ failbin="$fixture/failbin"
 mkdir -p "$failbin"
 notefaillog="$fixture/notefail.log"
 : >"$notefaillog"
-cat >"$failbin/curl" <<'EOS'
+# The attempt log path is BAKED at generation — the child is env-cleared
+# (round 9), so a $NOTE_FAIL_LOG reference would see nothing.
+cat >"$failbin/curl" <<EOS
 #!/bin/sh
-printf 'x\n' >>"$NOTE_FAIL_LOG"
+printf 'x\n' >>"$notefaillog"
 exit 6
 EOS
 chmod +x "$failbin/curl"
@@ -1223,7 +1273,7 @@ note_out="$updd/note.out"
 note_run() { # bare `theme` with the check ENABLED; env-pair overrides last.
     # DEBUG build + THEME_CURL seam: the footer's trusted-transport lane
     # reaches the failing stub by absolute path, never via PATH (round 8).
-    env THEME_NO_UPDATE_CHECK= NOTE_FAIL_LOG="$notefaillog" \
+    env THEME_NO_UPDATE_CHECK= \
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$notecache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" KITTY_WINDOW_ID='' \
         THEME_CURL="$failbin/curl" \
