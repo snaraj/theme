@@ -2,10 +2,13 @@
 # Boundary fixture for the Rust `theme` binary — the port of the dotfiles
 # theme-boundary-tests.sh acceptance suite. Same doctrine: destructive verbs
 # act on library NAMES only; positives assert the MUTATION, not exit 0;
-# refusals leave victims untouched; the network boundary runs against a
-# deterministic PATH-stubbed curl; credentials never reach argv and a hostile
-# credential produces ZERO transfers; every command surface is swept with
-# OSC-52-poisoned inputs and may emit no terminal protocol.
+# refusals leave victims untouched; the network boundary runs against
+# deterministic curl stubs (PATH-resolved for the wallpaper/credential
+# lanes per the reviewed parity design; via the debug-only THEME_CURL seam
+# for the self-update lane, whose transport never consults PATH);
+# credentials never reach argv and a hostile credential produces ZERO
+# transfers; every command surface is swept with OSC-52-poisoned inputs
+# and may emit no terminal protocol.
 #
 # Two sections of the shell fixture extracted python from the script under
 # test and drove it directly (the descriptor-bound saver's check/use windows,
@@ -52,6 +55,13 @@ exists() { # $1 description, $2 yes|no, $3 path
 # ever touch the real network; the footer-note section re-enables it per run
 # against a stubbed/failing curl.
 export THEME_NO_UPDATE_CHECK=1
+
+# The self-update/footer transport never consults PATH (round 8): those
+# sections drive a DEBUG build, whose THEME_CURL test seam (compiled OUT of
+# release) aims the trusted-transport lane at the deterministic stubs. One
+# release-binary pin proves the seam and PATH are both ignored there.
+THEME_DBG="${THEME_DEBUG_BIN:-$root/target/debug/theme}"
+[ -x "$THEME_DBG" ] || { echo "FAIL  no debug binary at $THEME_DBG (cargo build first — the update sections need its THEME_CURL seam)"; exit 1; }
 
 # The AMBIENT credential environment is neutralised once, here, for the whole
 # fixture; every case that needs a credential sets it explicitly.
@@ -934,19 +944,21 @@ upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
     [ "${1:-}" = "--" ] && shift
     # rm first: macOS caches code-signing state by inode, and cp -f over a
     # previously-executed binary poisons it — the next exec dies SIGKILL.
+    # DEBUG build: the trusted-transport lane only reaches the curl stub
+    # through the THEME_CURL seam — PATH curl is dead to it (round 8).
     rm -f "$updd/bin/theme"
-    cp "$THEME" "$updd/bin/theme"
+    cp "$THEME_DBG" "$updd/bin/theme"
     : >"$updlog"
     env UPD_LOG="$updlog" UPD_TRIPLE="$triple" UPD_PAYLOAD="$payload" \
-        UPD_TAR_MARKER="$updd/tar-ran" \
+        UPD_TAR_MARKER="$updd/tar-ran" THEME_CURL="$updd/stubbin/curl" \
         UPD_SUMS_FILE="$updd/sums" PATH="$updd/stubbin:$PATH" \
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
         "${envs[@]}" "$updd/bin/theme" update "$@" >"$upd_out" 2>&1
     upd_rc=$?
 }
-upd_intact() { # target still byte-identical to the real binary, no temp left
-    cmp -s "$THEME" "$updd/bin/theme" \
+upd_intact() { # target still byte-identical to the run binary, no temp left
+    cmp -s "$THEME_DBG" "$updd/bin/theme" \
         && [ -z "$(find "$updd/bin" -name '.*update*' 2>/dev/null)" ]
 }
 printf '%s  theme-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
@@ -1148,6 +1160,52 @@ if [ "$upd_rc" != 0 ] && grep -q 'no release v0.0.0' "$upd_out" && upd_intact; t
     pass "a missing tag refuses cleanly with the binary intact"
 else fail "missing tag not refused cleanly: $(cat "$upd_out")"; fi
 
+# --- round 8: the update transport is not PATH's to give -------------------
+# A hostile curl planted FIRST on PATH must never execute in the update
+# lane — the lane runs only the trusted transport (the THEME_CURL seam in
+# this debug build; fixed root-owned candidates in release) — while a full
+# update through the stub still succeeds. Mirrors the tar-stub pin.
+plantbin="$updd/plantbin"
+mkdir -p "$plantbin"
+printf '#!/bin/sh\n: >"%s/hostile-curl-ran"\nprintf EVIL\nexit 0\n' "$updd" >"$plantbin/curl"
+chmod +x "$plantbin/curl"
+upd_run UPD_TAG=v9.9.9 PATH="$plantbin:$updd/stubbin:$PATH"
+if [ "$upd_rc" = 0 ] && grep -qF "theme v$cur_ver → v9.9.9" "$upd_out" \
+   && cmp -s "$inner" "$updd/bin/theme" && [ ! -e "$updd/hostile-curl-ran" ]; then
+    pass "a curl planted first on PATH never executes in the update lane"
+else fail "PATH curl reached the update transport (rc=$upd_rc): $(cat "$upd_out")"; fi
+
+# THEME_CURL= (empty) simulates "no candidate validates": the explicit
+# update refuses BEFORE any network with its own message and zero
+# transfers; the running binary stays byte-identical.
+upd_run THEME_CURL= UPD_TAG=v9.9.9
+if [ "$upd_rc" != 0 ] && grep -q 'no trusted system curl' "$upd_out" \
+   && [ ! -s "$updlog" ] && upd_intact; then
+    pass "a missing trusted transport is its own pre-network refusal"
+else fail "missing-transport refusal broke (rc=$upd_rc): $(cat "$upd_out")"; fi
+
+# The RELEASE binary carries no seam at all: with a hostile curl first on
+# PATH and THEME_CURL aimed at a second marker stub, the only transport it
+# may use is the validated system curl — the request 404s (online) or
+# fails to resolve (offline), both the same clean refusal; the markers
+# stay absent and the target byte-identical either way. (This one pin may
+# send a single credential-free GET to the real API when online — it is
+# the release transport itself under test, and nothing else can prove the
+# seam compiled out.)
+printf '#!/bin/sh\n: >"%s/seam-curl-ran"\nexit 0\n' "$updd" >"$plantbin/seamcurl"
+chmod +x "$plantbin/seamcurl"
+rm -f "$updd/bin/theme"
+cp "$THEME" "$updd/bin/theme"
+env PATH="$plantbin:$PATH" THEME_CURL="$plantbin/seamcurl" \
+    THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
+    THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
+    "$updd/bin/theme" update --version v99.99.99 >"$upd_out" 2>&1
+upd_rc=$?
+if [ "$upd_rc" != 0 ] && cmp -s "$THEME" "$updd/bin/theme" \
+   && [ ! -e "$updd/hostile-curl-ran" ] && [ ! -e "$updd/seam-curl-ran" ]; then
+    pass "the release binary ignores PATH and the seam alike"
+else fail "release transport was steerable (rc=$upd_rc): $(cat "$upd_out")"; fi
+
 # --- the update-available footer on the bare `theme` screen ----------------
 notecache="$fixture/notecache"
 mkdir -p "$notecache"
@@ -1162,11 +1220,14 @@ exit 6
 EOS
 chmod +x "$failbin/curl"
 note_out="$updd/note.out"
-note_run() { # bare `theme` with the check ENABLED; env-pair overrides last
+note_run() { # bare `theme` with the check ENABLED; env-pair overrides last.
+    # DEBUG build + THEME_CURL seam: the footer's trusted-transport lane
+    # reaches the failing stub by absolute path, never via PATH (round 8).
     env THEME_NO_UPDATE_CHECK= NOTE_FAIL_LOG="$notefaillog" \
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$notecache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" KITTY_WINDOW_ID='' \
-        PATH="$failbin:$sweepbin:$PATH" "$@" "$THEME" >"$note_out" 2>&1
+        THEME_CURL="$failbin/curl" \
+        PATH="$failbin:$sweepbin:$PATH" "$@" "$THEME_DBG" >"$note_out" 2>&1
     note_rc=$?
 }
 expect1="update to the latest theme version: v9.9.9 -> https://github.com/snaraj/theme/releases/tag/v9.9.9"
@@ -1223,6 +1284,24 @@ if ! grep -qF 'update to the latest' "$note_out" \
    && [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ]; then
     pass "the kill-switch spawns nothing and renders nothing"
 else fail "THEME_NO_UPDATE_CHECK did not disable the check"; fi
+
+# Round 8, decided-and-stated: NO trusted transport ⇒ no network AND no
+# stamp — the TTL stamp rate-limits network ATTEMPTS, and none happened,
+# so a recovered transport a minute later must not find itself masked.
+rm -f "$notecache/update-check"
+note_run THEME_CURL=
+if [ "$note_rc" = 0 ] && [ ! -e "$notecache/update-check" ] \
+   && ! grep -qF 'update to the latest' "$note_out" \
+   && [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ]; then
+    pass "a missing transport neither stamps nor fetches nor renders"
+else fail "missing transport misbehaved (rc=$note_rc): $(ls -l "$notecache" 2>/dev/null)"; fi
+# ...but a still-fresh cache renders with no transport at all — displaying
+# already-earned data needs no network.
+printf 'v9.9.9' >"$notecache/update-check"
+note_run THEME_CURL=
+if [ "$note_rc" = 0 ] && grep -qF "$expect1" "$note_out"; then
+    pass "a fresh cache renders without any transport"
+else fail "the fresh-cache render needed a transport: $(tail -3 "$note_out")"; fi
 
 # --- the cache stamp is fail-closed (Codex round 4) ------------------------
 # An attacker-writable cache dir with a planted symlink: the old stamp

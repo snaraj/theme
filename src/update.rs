@@ -30,7 +30,7 @@
 
 use crate::config::{Config, MAX_DOWNLOAD_BYTES, UA};
 use crate::json::Json;
-use crate::net::{curl_config, url_host};
+use crate::net::{curl_config_trusted, url_host};
 use crate::scratch;
 use crate::ui::{die, display_text};
 use rustix::fs::{Mode, OFlags};
@@ -99,6 +99,14 @@ pub fn cmd_update(cfg: &Config, want: &str) {
         }
         Some(canon)
     };
+    // The transport bar, stated up front with its own message: replacing
+    // the running executable through a curl that is not the root-owned
+    // system one is refused outright — PATH is never consulted here.
+    if crate::net::trusted_curl().is_none() {
+        die(
+            "no trusted system curl (a root-owned /usr/bin/curl) — refusing to fetch a binary through an unvetted transport",
+        );
+    }
     let url = match &want_tag {
         Some(t) => format!("{RELEASES_API}/tags/{t}"),
         None => format!("{RELEASES_API}/latest"),
@@ -166,10 +174,19 @@ pub fn cmd_update(cfg: &Config, want: &str) {
 /// One release-API request: hardened flags, bounded size, parsed JSON.
 /// `max_time` is the caller's latency budget — 30s for the explicit
 /// `theme update`, 2s for the silent footer-note refresh.
+///
+/// The transport is the TRUSTED curl only — resolved and re-validated per
+/// call, never PATH (round 8: one planted curl would control metadata,
+/// digest file, and hashed bytes at once, making SHA-256 self-referential).
+/// `-q` sits FIRST on the argv so no curlrc can inject options, and
+/// [`curl_config_trusted`] scrubs every proxy variable from the child env.
 fn fetch_release(url: &str, max_time: &str) -> Option<Json> {
-    let body = curl_config(
+    let curl = crate::net::trusted_curl()?;
+    let body = curl_config_trusted(
+        &curl,
         "header = \"Accept: application/vnd.github+json\"\nheader = \"X-GitHub-Api-Version: 2022-11-28\"\n",
         &[
+            "-q",
             "-fsg",
             "--proto",
             "=https",
@@ -215,6 +232,15 @@ pub fn maybe_note(cfg: &Config) {
     let Some(dirfd) = check_dir(cfg) else { return };
     let (fresh, mut cached) = read_check(&dirfd);
     if !fresh {
+        // No trusted transport ⇒ no network AND no stamp (decided, round
+        // 8): the TTL stamp exists to rate-limit NETWORK attempts, and no
+        // attempt happened — validating a candidate is one local stat, so
+        // there is nothing to throttle and a masked window would only hide
+        // a transport that recovers a minute later. A still-fresh cache
+        // above renders fine without any transport at all.
+        if crate::net::trusted_curl().is_none() {
+            return;
+        }
         let tag = fetch_release(&format!("{RELEASES_API}/latest"), "2")
             .and_then(|j| {
                 j.str_field("tag_name")
@@ -557,29 +583,36 @@ fn fetch_asset(url: &str, dest: &Path, cap: u64) -> Result<(), String> {
             ));
         }
         let hdr = scratch::new();
-        let ok = Command::new("curl")
-            .args([
-                "-sg",
-                "--proto",
-                "=https",
-                "--max-redirs",
-                "0",
-                "--max-filesize",
-                &cap.to_string(),
-                "--max-time",
-                "300",
-                "-A",
-                UA,
-                "-D",
-            ])
-            .arg(&hdr)
-            .arg("-o")
-            .arg(dest)
-            .arg("--url")
-            .arg(&here)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        // Trusted transport, RE-VALIDATED per hop, with the same scrub as
+        // the metadata request: `-q` first (no curlrc), --noproxy plus the
+        // proxy-env scrub (no ambient middlebox), PATH never consulted.
+        let curl = crate::net::trusted_curl()
+            .ok_or("no trusted system curl (a root-owned /usr/bin/curl)")?;
+        let mut cmd = Command::new(&curl);
+        cmd.args([
+            "-q",
+            "-sg",
+            "--noproxy",
+            "*",
+            "--proto",
+            "=https",
+            "--max-redirs",
+            "0",
+            "--max-filesize",
+            &cap.to_string(),
+            "--max-time",
+            "300",
+            "-A",
+            UA,
+            "-D",
+        ])
+        .arg(&hdr)
+        .arg("-o")
+        .arg(dest)
+        .arg("--url")
+        .arg(&here);
+        crate::net::scrub_proxy_env(&mut cmd);
+        let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
         let head = std::fs::read_to_string(&hdr).unwrap_or_default();
         scratch::done(&hdr);
         if !ok {

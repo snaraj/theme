@@ -149,7 +149,9 @@ pub fn native_platform() -> AclPlatform {
 /// beyond an attacker's reach before its output is trusted: reached by
 /// ABSOLUTE path — PATH plays no part in a custody decision — and both the
 /// binary and its directory must be root-owned with no group/world write.
-fn trusted_system_binary(p: &str) -> bool {
+/// Shared with the update transport (round 8): the curl that fetches bytes
+/// destined for executable replacement passes the same bar.
+pub(crate) fn trusted_system_binary(p: &str) -> bool {
     let clean = |q: &Path| {
         rustix::fs::stat(q)
             .map(|st| st.st_uid == 0 && st.st_mode & 0o022 == 0)
@@ -231,8 +233,8 @@ fn acl_write_grant(path: &Path, platform: AclPlatform) -> Option<String> {
 }
 
 /// `system.posix_acl_access`, read IN-PROCESS via getxattr — no getfacl,
-/// no subprocess, nothing PATH-resolved. Ok(None) means no ACL is set (or
-/// the filesystem cannot hold one, which is the same guarantee).
+/// no subprocess, nothing PATH-resolved. Ok(None) means exactly one thing:
+/// the filesystem answered "no ACL is set here" (NODATA).
 #[cfg(target_os = "linux")]
 fn read_posix_acl(path: &Path) -> Result<Option<Vec<u8>>, String> {
     let mut buf = vec![0u8; 4096];
@@ -241,10 +243,25 @@ fn read_posix_acl(path: &Path) -> Result<Option<Vec<u8>>, String> {
             buf.truncate(n);
             Ok(Some(buf))
         }
-        Err(rustix::io::Errno::NODATA) | Err(rustix::io::Errno::OPNOTSUPP) => Ok(None),
-        Err(e) => Err(format!(
+        Err(e) => acl_xattr_verdict(e),
+    }
+}
+
+/// Verdict for a failed ACL-xattr read. ONLY NODATA — the documented "no
+/// ACL set" answer — passes as clean. OPNOTSUPP is NOT that answer: a
+/// filesystem that cannot hold the question cannot attest the directory
+/// either (round 8 — it previously laundered through as "no ACL"), so it
+/// refuses as unauditable along with every other errno.
+/// (Non-Linux production builds never reach it — only the injected-errno
+/// test does — hence the narrow dead_code allowance.)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn acl_xattr_verdict(e: rustix::io::Errno) -> Result<Option<Vec<u8>>, String> {
+    if e == rustix::io::Errno::NODATA {
+        Ok(None)
+    } else {
+        Err(format!(
             "could not be audited for ACLs: getxattr failed: {e}"
-        )),
+        ))
     }
 }
 

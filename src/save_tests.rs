@@ -282,6 +282,20 @@ fn forced_posix_acl_predicate() {
     assert!(why.contains("unknown ACL entry tag"), "{why}");
 }
 
+/// The xattr-read errno mapping, driven with INJECTED errnos (round 8):
+/// only NODATA — the filesystem's actual "no ACL set" answer — passes.
+/// OPNOTSUPP means the interrogation itself is unsupported, which is
+/// inability to audit, not a clean bill; it and every other errno refuse.
+#[test]
+fn acl_xattr_errno_mapping() {
+    use rustix::io::Errno;
+    assert!(matches!(acl_xattr_verdict(Errno::NODATA), Ok(None)));
+    let unsup = acl_xattr_verdict(Errno::OPNOTSUPP).unwrap_err();
+    assert!(unsup.contains("could not be audited"), "{unsup}");
+    let denied = acl_xattr_verdict(Errno::ACCESS).unwrap_err();
+    assert!(denied.contains("could not be audited"), "{denied}");
+}
+
 /// macOS-native ACL semantics, end-to-end where chmod +a exists: an ALLOW
 /// grant to another principal refuses, a DENY ace is not mistaken for one,
 /// and writesecurity (ACL administration) counts as a grant.
