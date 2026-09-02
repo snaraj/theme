@@ -470,18 +470,20 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
     let src = wall_source(&img);
     let dims = img_size(&img);
     let bytes = human_bytes(&img);
-    let sw = wall_scheme(cfg, &img)
-        .map(|scheme| {
-            let mut s = String::new();
-            for c in &scheme {
-                if let Some((r, g, b)) = crate::ui::parse_hex6(c) {
-                    s.push_str(&format!("\x1b[48;2;{r};{g};{b}m    \x1b[0m "));
-                }
+    // Swatch geometry is width-aware (issue #19): 5 visible cells per
+    // swatch beside the label when the full row fits, else as many as fit
+    // on their own line under the label — truncated, never torn.
+    let cols = columns();
+    let scheme = wall_scheme(cfg, &img).unwrap_or_default();
+    let sw_fit = |n: usize| {
+        let mut s = String::new();
+        for c in scheme.iter().take(n) {
+            if let Some((r, g, b)) = crate::ui::parse_hex6(c) {
+                s.push_str(&format!("\x1b[48;2;{r};{g};{b}m    \x1b[0m "));
             }
-            s
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "-".into());
+        }
+        s
+    };
 
     // Every field that HAS a value, and none that don't: an empty field is
     // omitted, never rendered blank.
@@ -513,8 +515,13 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
 
     // Thumbnail above, fields below — stacked, so a long value can never
     // interleave with the image rows; values wrap with a hanging indent.
-    let cols = columns();
-    if let Some(p) = render_preview(&img, 24, 10) {
+    // The thumb clamps to the terminal (issue #19): narrower than its 24
+    // cells it shrinks, and below an 8-cell floor it is absent with
+    // dignity — torn is forbidden.
+    let pw = cols.saturating_sub(2).min(24);
+    if pw >= 8
+        && let Some(p) = render_preview(&img, pw, 10)
+    {
         print!("{}", p.apc);
         for r in &p.rows {
             println!("  {r}");
@@ -526,7 +533,14 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
             println!("{line}");
         }
     }
-    println!("  {:<12} {sw}", "COLORSCHEME");
+    if scheme.is_empty() {
+        println!("  {:<12} -", "COLORSCHEME");
+    } else if cols >= 15 + 8 * 5 {
+        println!("  {:<12} {}", "COLORSCHEME", sw_fit(8));
+    } else {
+        println!("  COLORSCHEME");
+        println!("    {}", sw_fit((cols.saturating_sub(4) / 5).max(1)));
+    }
     for line in wrap_field("LOCATION", &loc, cols) {
         println!("{line}");
     }
@@ -534,8 +548,15 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
 
 /// One metadata line, wrapped at the terminal edge with a hanging indent to
 /// the value column — the invariant is that a wrapped value can never
-/// visually merge with the next label's line.
+/// visually merge with the next label's line. Narrower than the value
+/// column + a 12-character window, the label takes its own line and the
+/// value wraps indented beneath it (issue #19) — never at column 0.
 fn wrap_field(label: &str, value: &str, cols: usize) -> Vec<String> {
+    if cols < 15 + 12 {
+        let mut out = vec![format!("  {label}")];
+        out.extend(crate::ui::wrap_prefixed(value, cols, "    ", "    "));
+        return out;
+    }
     let width = cols.saturating_sub(15).max(12);
     let chars: Vec<char> = value.chars().collect();
     let mut out = Vec::new();
@@ -620,17 +641,33 @@ pub fn cmd_status(cfg: &Config) {
     } else {
         "<none>".into()
     };
-    println!("current theme:   {shown}");
+    // Long values wrap with a hanging indent to the 17-column value column
+    // (issue #19) — a continuation never lands at column 0 — and the
+    // swatch row renders only as many swatches as the width holds.
+    let cols = columns();
+    let vwrap = |first: &str, value: &str| {
+        let cont = " ".repeat(first.chars().count());
+        for line in crate::ui::wrap_prefixed(value, cols, first, &cont) {
+            println!("{line}");
+        }
+    };
+    vwrap("current theme:   ", &shown);
     println!("mode:            {mode}");
     let colors = scheme_colors(cfg);
     if colors.is_empty() {
         println!("color scheme:    <none>");
-    } else {
+    } else if cols >= 17 + 32 {
         println!("color scheme:    {}", crate::ui::swatch_row(&colors));
+    } else {
+        let n = (cols.saturating_sub(17) / 4).max(1);
+        println!(
+            "color scheme:    {}",
+            crate::ui::swatch_row(&colors[..n.min(colors.len())])
+        );
     }
-    println!(
-        "palette source:  {}",
-        if inc_d.is_empty() { "<none>" } else { &inc_d }
+    vwrap(
+        "palette source:  ",
+        if inc_d.is_empty() { "<none>" } else { &inc_d },
     );
     let cur_path = Path::new(&current);
     let size_note = if !current.is_empty() && cur_path.is_file() {
@@ -638,44 +675,51 @@ pub fn cmd_status(cfg: &Config) {
     } else {
         String::new()
     };
-    println!(
-        "palette image:   {}{size_note}",
-        if current_d.is_empty() {
-            "<none>"
-        } else {
-            &current_d
-        }
+    vwrap(
+        "palette image:   ",
+        &format!(
+            "{}{size_note}",
+            if current_d.is_empty() {
+                "<none>"
+            } else {
+                &current_d
+            }
+        ),
     );
-    println!(
-        "wallpaper dir:   {} ({} images)",
-        display_text(&cfg.wallpaper_dirs_display),
-        all_images(cfg).len()
+    vwrap(
+        "wallpaper dir:   ",
+        &format!(
+            "{} ({} images)",
+            display_text(&cfg.wallpaper_dirs_display),
+            all_images(cfg).len()
+        ),
     );
     println!("variables:");
-    if std::env::var("UNSPLASH_ACCESS_KEY")
+    let key_state = if std::env::var("UNSPLASH_ACCESS_KEY")
         .map(|v| !v.is_empty())
         .unwrap_or(false)
     {
-        println!("  UNSPLASH_ACCESS_KEY   set (env)");
+        "set (env)"
     } else if crate::unsplash::keychain_read("unsplash-access-key").is_some() {
-        println!("  UNSPLASH_ACCESS_KEY   set (Keychain: unsplash-access-key)");
+        "set (Keychain: unsplash-access-key)"
     } else {
-        println!("  UNSPLASH_ACCESS_KEY   not set (theme unsplash --help)");
-    }
-    println!(
-        "  THEME_WALLPAPER_DIR   {}",
-        display_text(&cfg.wallpaper_dirs_display)
+        "not set (theme unsplash --help)"
+    };
+    vwrap("  UNSPLASH_ACCESS_KEY   ", key_state);
+    vwrap(
+        "  THEME_WALLPAPER_DIR   ",
+        &display_text(&cfg.wallpaper_dirs_display),
     );
-    println!(
-        "  THEME_FORMATS         {}",
-        display_text(&cfg.formats_display())
+    vwrap(
+        "  THEME_FORMATS         ",
+        &display_text(&cfg.formats_display()),
     );
-    println!(
-        "  THEME_CONTRAST        {}",
-        display_text(&std::env::var("THEME_CONTRAST").unwrap_or_else(|_| "4.5".into()))
+    vwrap(
+        "  THEME_CONTRAST        ",
+        &display_text(&std::env::var("THEME_CONTRAST").unwrap_or_else(|_| "4.5".into())),
     );
-    println!(
-        "  THEME_CACHE_DIR       {}",
-        display_text(&cfg.cache_dir.display().to_string())
+    vwrap(
+        "  THEME_CACHE_DIR       ",
+        &display_text(&cfg.cache_dir.display().to_string()),
     );
 }
