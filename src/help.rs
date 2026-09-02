@@ -12,10 +12,7 @@ use std::path::Path;
 use std::process::Command;
 
 fn columns() -> usize {
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(100)
+    crate::ui::term_cols()
 }
 
 /// Bare-screen header geometry (issue #19): the image sits beside the live
@@ -175,6 +172,9 @@ pub fn usage(cfg: &Config) {
         Some(d) => display_text(d.file_stem().and_then(|s| s.to_str()).unwrap_or("")),
         None => "<none>".into(),
     };
+    // The title line opens every bare screen — the same compile-time
+    // version the `version` subcommand reports.
+    println!("theme v{}", env!("CARGO_PKG_VERSION"));
     let cols = columns();
     let desk_file = desk.as_deref().filter(|d| d.is_file());
     if cols >= SIDE_MIN {

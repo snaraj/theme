@@ -16,17 +16,10 @@ use std::process::Command;
 const PREVIEW_COLS: usize = 7;
 
 fn columns() -> usize {
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|c| c.parse().ok())
-        .or_else(|| {
-            Command::new("tput")
-                .arg("cols")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        })
-        .unwrap_or(100)
+    // One width authority for every screen: the tty itself first, then
+    // COLUMNS, then the conservative stacked default — the PATH-resolved
+    // tput probe is gone with it (issue #21).
+    crate::ui::term_cols()
 }
 
 fn in_kitty() -> bool {

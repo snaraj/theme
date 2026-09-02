@@ -48,6 +48,30 @@ pub fn swatch_row(colors: &[String]) -> String {
     out
 }
 
+/// Terminal width, from the terminal ITSELF first (issue #21): the v0.2.1
+/// narrow fix read only the COLUMNS env var, which zsh does not export —
+/// so every real terminal fell to the wide default and the 42-column
+/// owner window still tore. Order, per class:
+///
+/// 1. stdout is a tty → POSIX `tcgetwinsize` (identical on macOS/Linux,
+///    any terminal emulator — the emulator's own answer).
+/// 2. stdout is NOT a tty (pipe/file) → the layout belongs to the pipe,
+///    not the invoking terminal: COLUMNS when the caller says so
+///    (tests, `COLUMNS=… theme | less`), else a conservative 60 that
+///    prefers the stacked shape — a pipe has no image worth defending,
+///    and /dev/tty is deliberately NOT consulted.
+pub fn term_cols() -> usize {
+    if let Ok(ws) = rustix::termios::tcgetwinsize(std::io::stdout())
+        && ws.ws_col > 0
+    {
+        return ws.ws_col as usize;
+    }
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(60)
+}
+
 /// Word-wrap PLAIN text (no escapes) so no emitted line exceeds `cols`
 /// where geometry allows: the first line starts with `first`, every
 /// continuation with `cont` — a continuation never lands at column 0. A
