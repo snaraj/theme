@@ -996,31 +996,87 @@ fn date_secs(s: &str) -> Option<i64> {
 
 // -------------------------------------------------------------- the rewrite
 
-/// The slots this store documents, and ONLY those: `Displays/<uuid>`,
-/// `Spaces/<uuid>/Default`, `Spaces/<uuid>/Displays/<uuid>`,
-/// `SystemDefault` and `AllSpacesAndDisplays`. Scoping by PATH rather than
-/// by the presence of a `Desktop` key is what keeps this tool out of
-/// subtrees it does not own — a future macOS state that happens to be
-/// shaped like a slot is not one, and rewriting it would be a change
-/// nobody asked for. Whatever a slot's `Desktop` turns out to be is
-/// returned as it is, so [`check_shape`] can refuse what it does not
-/// understand rather than this walk hiding it.
-fn slots(tree: &Plist) -> Vec<&Plist> {
+/// Every node on a documented path, with the path that named it and
+/// whether it is a SLOT — a dict that may hold a `Desktop`. The documented
+/// paths are `Displays/<uuid>`, `Spaces/<uuid>/Default`,
+/// `Spaces/<uuid>/Displays/<uuid>`, `SystemDefault` and
+/// `AllSpacesAndDisplays`, and nothing else: scoping by PATH rather than by
+/// the presence of a `Desktop` key keeps this tool out of subtrees it does
+/// not own, because a future macOS state shaped like a slot is not one.
+///
+/// One walk for the reader and the validator both, so they can never
+/// disagree about where a slot is. (The mutable twin, [`for_each_slot`],
+/// mirrors it — Rust cannot share a traversal across `&` and `&mut`.)
+/// Whatever a slot's `Desktop` turns out to be comes back as it is, so
+/// [`check_shape`] refuses what it does not understand rather than this
+/// walk hiding it.
+fn documented(tree: &Plist) -> Vec<(String, &Plist, bool)> {
     let mut out = Vec::new();
-    out.extend(tree.get("SystemDefault"));
-    out.extend(tree.get("AllSpacesAndDisplays"));
-    if let Some(Plist::Dict(displays)) = tree.get("Displays") {
-        out.extend(displays.iter().map(|(_, v)| v));
+    for key in ["SystemDefault", "AllSpacesAndDisplays"] {
+        out.extend(tree.get(key).map(|n| (key.to_string(), n, true)));
     }
-    if let Some(Plist::Dict(spaces)) = tree.get("Spaces") {
-        for (_, space) in spaces {
-            out.extend(space.get("Default"));
-            if let Some(Plist::Dict(per)) = space.get("Displays") {
-                out.extend(per.iter().map(|(_, v)| v));
+    if let Some(displays) = tree.get("Displays") {
+        out.push(("Displays".into(), displays, false));
+        for (id, n) in identified(displays) {
+            out.push((format!("Displays/{id}"), n, true));
+        }
+    }
+    if let Some(spaces) = tree.get("Spaces") {
+        out.push(("Spaces".into(), spaces, false));
+        for (id, space) in identified(spaces) {
+            out.push((format!("Spaces/{id}"), space, false));
+            out.extend(
+                space
+                    .get("Default")
+                    .map(|n| (format!("Spaces/{id}/Default"), n, true)),
+            );
+            if let Some(per) = space.get("Displays") {
+                out.push((format!("Spaces/{id}/Displays"), per, false));
+                for (did, n) in identified(per) {
+                    out.push((format!("Spaces/{id}/Displays/{did}"), n, true));
+                }
             }
         }
     }
     out
+}
+
+/// The UUID-keyed children of a dict, and only those. A container that is
+/// not a dict has none — which lets the walk stop descending into a shape
+/// it does not understand without stopping [`check_shape`] refusing it.
+fn identified(v: &Plist) -> Vec<(&str, &Plist)> {
+    match v {
+        Plist::Dict(e) => e
+            .iter()
+            .filter(|(k, _)| is_uuid(k))
+            .map(|(k, v)| (k.as_str(), v))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The key shape every real display and Space carries: an UPPERCASE UUID,
+/// `8-4-4-4-12` hex. Read off the live store — two displays keyed like
+/// `37D8832A-2D66-02CA-B9F7-8F30A301B230`, eleven Spaces keyed like
+/// `0E0343BF-208F-457B-96D4-B20F792B2853`, and every per-Space display map
+/// keyed the same way. A child keyed anything else is not an identifier
+/// macOS minted, so it is not a slot and not ours to touch.
+fn is_uuid(k: &str) -> bool {
+    let mut parts = k.split('-');
+    [8, 4, 4, 4, 12].iter().all(|n| {
+        parts.next().is_some_and(|p| {
+            p.len() == *n && p.bytes().all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
+        })
+    }) && parts.next().is_none()
+}
+
+/// The slots themselves, out of that same walk.
+fn slots(tree: &Plist) -> Vec<&Plist> {
+    documented(tree)
+        .into_iter()
+        .filter(|(_, _, slot)| *slot)
+        .map(|(_, node, _)| node)
+        .collect()
 }
 
 /// The same five paths, for the rewrite. A visitor rather than a list
@@ -1033,15 +1089,20 @@ fn for_each_slot(tree: &mut Plist, mut f: impl FnMut(&mut Plist)) {
         }
     }
     if let Some(Plist::Dict(displays)) = tree.get_mut("Displays") {
-        displays.iter_mut().for_each(|(_, v)| f(v));
+        displays
+            .iter_mut()
+            .filter(|(k, _)| is_uuid(k))
+            .for_each(|(_, v)| f(v));
     }
     if let Some(Plist::Dict(spaces)) = tree.get_mut("Spaces") {
-        for (_, space) in spaces.iter_mut() {
+        for (_, space) in spaces.iter_mut().filter(|(k, _)| is_uuid(k)) {
             if let Some(slot) = space.get_mut("Default") {
                 f(slot);
             }
             if let Some(Plist::Dict(per)) = space.get_mut("Displays") {
-                per.iter_mut().for_each(|(_, v)| f(v));
+                per.iter_mut()
+                    .filter(|(k, _)| is_uuid(k))
+                    .for_each(|(_, v)| f(v));
             }
         }
     }
@@ -1141,19 +1202,25 @@ fn template(tree: &Plist, uri: &str, after: Option<i64>, budget: &Cell<usize>) -
         .map(|(_, r)| r.clone())
 }
 
-/// Refuse before anything is written: every shape the rewrite goes on to
-/// assume is checked here, so a store we do not recognise is one we leave
-/// alone rather than half-convert.
+/// Refuse before anything is written: EVERY container on a documented path
+/// must be the dictionary the rewrite is about to treat it as, and so must
+/// every record in one. Absent is fine — a store need not have Spaces yet —
+/// but present-and-wrong is a store we do not recognise, and the refusal
+/// names the path so it can be looked at rather than guessed about.
 fn check_shape(tree: &Plist) -> Result<(), String> {
     if !matches!(tree, Plist::Dict(_)) {
         return Err("the store's root is not a dictionary".into());
     }
-    let odd = |v: &Plist| !matches!(v, Plist::Dict(_));
-    if tree.get("AllSpacesAndDisplays").is_some_and(odd) {
-        return Err("the store's all-Spaces slot is not a dictionary".into());
-    }
-    if desktops(tree).into_iter().any(odd) {
-        return Err("the store has a wallpaper slot that is not a dictionary".into());
+    for (path, node, slot) in documented(tree) {
+        if !matches!(node, Plist::Dict(_)) {
+            return Err(format!("the store's {path} is not a dictionary"));
+        }
+        if slot
+            && let Some(desktop) = node.get("Desktop")
+            && !matches!(desktop, Plist::Dict(_))
+        {
+            return Err(format!("the store's {path}/Desktop is not a record"));
+        }
     }
     Ok(())
 }
@@ -1196,11 +1263,9 @@ fn rewrite(tree: &mut Plist, template: &Plist) -> Result<usize, String> {
     Ok(n)
 }
 
-/// What a wallpaper change actually consists of. Everything else a record
-/// carries — `LastUse` included, which is the agent's business and not
-/// ours — belongs to whoever put it there.
-const OVERLAID: [&str; 2] = ["Content", "LastSet"];
-
+/// One slot. A wallpaper change consists of exactly two facts — `Content`
+/// and `LastSet` — and everything else a record carries, its `LastUse`
+/// included, is the agent's account of its own doings rather than ours.
 fn rewrite_slot(slot: &mut Plist, template: &Plist, n: &mut usize) {
     // A `linked` slot keeps ONE record for both the desktop and the
     // screensaver, so it has no Desktop key to replace. Split it: the
@@ -1220,13 +1285,39 @@ fn rewrite_slot(slot: &mut Plist, template: &Plist, n: &mut usize) {
     // carry state this tool has never heard of, and replacing it wholesale
     // would rewrite facts that were never ours to state.
     if let Some(mut dest) = slot.get("Desktop").cloned() {
-        for key in OVERLAID {
-            if let Some(v) = template.get(key) {
-                dest.set(key, v.clone());
+        // Content is merged DEEP: unknown state can sit at any level of it,
+        // not just the top. LastSet is a single fact and is simply set.
+        if let Some(content) = template.get("Content") {
+            match dest.get_mut("Content") {
+                Some(into) => merge(into, content),
+                None => dest.set("Content", content.clone()),
             }
+        }
+        if let Some(set) = template.get("LastSet") {
+            dest.set("LastSet", set.clone());
         }
         slot.set("Desktop", dest);
         *n += 1;
+    }
+}
+
+/// Overlay `src` onto `dest` at every dict level: the template's keys win,
+/// keys only the destination carries stay, however deep they sit.
+///
+/// ARRAYS are replaced whole, and `Choices` is the reason — that array IS
+/// the wallpaper, and the helper supplies the complete choice. Merging it
+/// element-wise would splice a new picture into an old one's options and
+/// produce a choice neither of them made.
+fn merge(dest: &mut Plist, src: &Plist) {
+    let (Plist::Dict(_), Plist::Dict(fields)) = (&*dest, src) else {
+        *dest = src.clone();
+        return;
+    };
+    for (key, val) in fields {
+        match dest.get_mut(key) {
+            Some(into) => merge(into, val),
+            None => dest.set(key, val.clone()),
+        }
     }
 }
 
@@ -1552,7 +1643,7 @@ impl<'a> Paused<'a> {
     fn release(mut self) -> Result<(), String> {
         // Nothing was ever paused, so nothing is owed and nothing needs
         // restarting: the next agent launchd starts reads the store fresh.
-        let Some(pid) = self.held.take() else {
+        let Some(pid) = self.held else {
             return Ok(());
         };
         // The identity is re-asked before the CONT — but the CONT goes out
@@ -1561,6 +1652,12 @@ impl<'a> Paused<'a> {
         // does nothing at all.
         let ours = self.agent.pid();
         let resumed = self.agent.resume(pid);
+        // The debt is discharged only by a CONT that LANDED. Reporting a
+        // failed one is not the same as having resumed, so until it lands
+        // the guard keeps the pid and Drop gets one more attempt.
+        if resumed.is_ok() {
+            self.held = None;
+        }
         if !matches!(&ours, Ok(Some(p)) if *p == pid) {
             let why = ours
                 .err()
@@ -1585,9 +1682,10 @@ impl<'a> Paused<'a> {
     }
 }
 
-/// Best effort, for a PANIC only: every ordinary exit goes through
-/// [`finish`], which releases explicitly and reports what failed. An
-/// unwinding stack has nobody left to report to, so it just tries.
+/// The last attempt, on two paths: an unwinding stack, which has nobody
+/// left to report to; and a resume that was tried and REFUSED, whose debt
+/// stays with the guard until a CONT actually lands. An ordinary successful
+/// release clears the pid, so this does nothing after one.
 impl Drop for Paused<'_> {
     fn drop(&mut self) {
         if let Some(pid) = self.held {
@@ -1757,10 +1855,16 @@ mod tests {
         image(OLD_B64, "2026-08-01T00:00:00Z")
     }
 
+    /// A display or Space key of the shape macOS mints: uppercase
+    /// 8-4-4-4-12 hex. Synthetic — this machine's real identifiers are not
+    /// a thing to bake into a fixture.
+    fn uuid(n: u64) -> String {
+        format!("DEADBEEF-0000-0000-0000-{n:012X}")
+    }
+
     /// A store holding these records as `Spaces/<uuid>/Default/Desktop` —
-    /// the documented shape, which since round 6 is the only one the walk
-    /// looks at. A record parked under an undocumented key is invisible to
-    /// it by design.
+    /// the documented shape, which is the only one the walk looks at. A
+    /// record parked under any other key is invisible to it by design.
     fn spaces_with(records: Vec<Plist>) -> Plist {
         d(vec![(
             "Spaces",
@@ -1770,7 +1874,7 @@ mod tests {
                     .enumerate()
                     .map(|(i, r)| {
                         (
-                            format!("SPACE-{i}"),
+                            uuid(i as u64),
                             d(vec![("Default", d(vec![("Desktop", r)]))]),
                         )
                     })
@@ -1792,16 +1896,16 @@ mod tests {
             ])
         };
         let all = d(vec![("Idle", idle()), ("Type", s("idle"))]);
-        let displays = d(vec![("DISPLAY-ONE", slot()), ("DISPLAY-TWO", slot())]);
-        let two = d(vec![
-            ("Default", slot()),
-            ("Displays", d(vec![("DISPLAY-ONE", slot())])),
+        let displays = Plist::Dict(vec![(uuid(1), slot()), (uuid(2), slot())]);
+        let two = Plist::Dict(vec![
+            ("Default".into(), slot()),
+            ("Displays".into(), Plist::Dict(vec![(uuid(1), slot())])),
         ]);
         let three = d(vec![("Linked", linked()), ("Type", s("linked"))]);
-        let spaces = d(vec![
-            ("SPACE-ONE", d(vec![("Default", slot())])),
-            ("SPACE-TWO", two),
-            ("SPACE-THREE", d(vec![("Default", three)])),
+        let spaces = Plist::Dict(vec![
+            (uuid(11), d(vec![("Default", slot())])),
+            (uuid(12), two),
+            (uuid(13), d(vec![("Default", three)])),
         ]);
         let default = d(vec![
             ("Desktop", old()),
@@ -1889,7 +1993,7 @@ mod tests {
         let three = tree
             .get("Spaces")
             .unwrap()
-            .get("SPACE-THREE")
+            .get(&uuid(13))
             .unwrap()
             .get("Default")
             .unwrap();
@@ -2081,6 +2185,39 @@ mod tests {
         );
     }
 
+    /// `Content` is merged field by field, so a key Apple parks beside the
+    /// choices survives a wallpaper change. Arrays are replaced whole:
+    /// `Choices` IS the wallpaper, and a per-element merge would leave a
+    /// choice list no version of macOS ever wrote.
+    #[test]
+    fn an_unknown_content_field_survives_but_an_unknown_choice_field_does_not() {
+        let template = image(NEW_B64, "2026-09-03T06:44:55Z");
+        let mut dest = image(OLD_B64, "2026-09-01T12:30:10Z");
+        {
+            let content = dest.get_mut("Content").unwrap();
+            content.set("FutureAppleState", s("keep"));
+            let Some(Plist::Array(choices)) = content.get_mut("Choices") else {
+                unreachable!("the fixture is not the real Content shape")
+            };
+            choices[0].set("FutureChoiceState", s("lost"));
+        }
+        let mut tree = d(vec![("SystemDefault", d(vec![("Desktop", dest)]))]);
+        rewrite(&mut tree, &template).unwrap();
+
+        let got = tree.get("SystemDefault").unwrap().get("Desktop").unwrap();
+        let content = got.get("Content").unwrap();
+        let fresh = template.get("Content").unwrap();
+        // Outside the replaced array, so the merge keeps it.
+        assert_eq!(content.get("FutureAppleState"), Some(&s("keep")));
+        // Inside it, so it goes: Choices is the template's, entire.
+        assert_eq!(content.get("Choices"), fresh.get("Choices"));
+        assert_eq!(
+            content.get("EncodedOptionValues"),
+            fresh.get("EncodedOptionValues")
+        );
+        assert_eq!(got.get("LastSet"), template.get("LastSet"));
+    }
+
     /// The walk is scoped to the slot PATHS the store documents. A subtree
     /// that merely looks like a slot is not one, and an unknown key beside
     /// a real slot is nobody's business but its owner's.
@@ -2102,18 +2239,93 @@ mod tests {
         ]);
         let mut tree = d(vec![
             ("FutureAppleState", future.clone()),
-            ("Spaces", d(vec![("SPACE-ONE", space)])),
+            ("Spaces", Plist::Dict(vec![(uuid(1), space)])),
         ]);
         rewrite(&mut tree, &template).unwrap();
 
         // Byte-identical: not split, not seeded, not counted.
         assert_eq!(tree.get("FutureAppleState"), Some(&future));
-        let one = tree.get("Spaces").unwrap().get("SPACE-ONE").unwrap();
+        let one = tree.get("Spaces").unwrap().get(&uuid(1)).unwrap();
         assert_eq!(one.get("Unknown"), Some(&s("keep me")));
         // While the real slot beside it IS rewritten.
         let real = one.get("Default").unwrap().get("Desktop").unwrap();
         assert_eq!(real.get("Content"), template.get("Content"));
         assert_eq!(real.get("LastSet"), template.get("LastSet"));
+    }
+
+    /// A slot is named by an identifier macOS minted. A sibling of the real
+    /// displays, keyed anything else and shaped exactly like one of them,
+    /// is not a display and is not rewritten.
+    #[test]
+    fn a_display_keyed_by_anything_but_a_uuid_is_not_a_slot() {
+        let template = image(NEW_B64, "2026-09-03T06:44:55Z");
+        let impostor = d(vec![
+            ("Desktop", image(OLD_B64, "2026-09-01T12:30:10Z")),
+            ("Idle", idle()),
+            ("Type", s("individual")),
+        ]);
+        let mut tree = Plist::Dict(vec![(
+            "Displays".into(),
+            Plist::Dict(vec![
+                (uuid(1), impostor.clone()),
+                ("FutureAppleState".into(), impostor.clone()),
+                // Lowercase hex is not the shape macOS mints either.
+                (
+                    "deadbeef-0000-0000-0000-000000000001".into(),
+                    impostor.clone(),
+                ),
+            ]),
+        )]);
+        rewrite(&mut tree, &template).unwrap();
+        let displays = tree.get("Displays").unwrap();
+        assert_eq!(displays.get("FutureAppleState"), Some(&impostor));
+        assert_eq!(
+            displays.get("deadbeef-0000-0000-0000-000000000001"),
+            Some(&impostor)
+        );
+        // The UUID sibling, identical in every other way, IS rewritten.
+        let real = displays.get(&uuid(1)).unwrap().get("Desktop").unwrap();
+        assert_eq!(real.get("Content"), template.get("Content"));
+    }
+
+    /// Every container on a documented path must be what the rewrite is
+    /// about to treat it as. Present-and-wrong refuses, by name, and writes
+    /// nothing — even when a perfectly good slot sits beside it.
+    #[test]
+    fn a_wrong_typed_container_refuses_by_name() {
+        let template = image(NEW_B64, "2026-09-03T06:44:55Z");
+        let good = d(vec![("Desktop", image(OLD_B64, "2026-09-01T12:30:10Z"))]);
+        let cases = [
+            (
+                "Displays",
+                d(vec![
+                    ("Displays", s("odd")),
+                    ("SystemDefault", good.clone()),
+                ]),
+            ),
+            (
+                &format!("Spaces/{}", uuid(1)),
+                Plist::Dict(vec![(
+                    "Spaces".into(),
+                    Plist::Dict(vec![(uuid(1), s("odd"))]),
+                )]),
+            ),
+            (
+                &format!("Spaces/{}/Displays", uuid(1)),
+                Plist::Dict(vec![(
+                    "Spaces".into(),
+                    Plist::Dict(vec![(uuid(1), d(vec![("Displays", s("odd"))]))]),
+                )]),
+            ),
+            ("Spaces", d(vec![("Spaces", s("odd"))])),
+            ("SystemDefault", d(vec![("SystemDefault", s("odd"))])),
+        ];
+        for (path, case) in cases {
+            let mut tree = case.clone();
+            let e = rewrite(&mut tree, &template).unwrap_err();
+            assert!(e.contains(path), "{e} should have named {path}");
+            assert_eq!(tree, case, "a refusal changed the tree");
+        }
     }
 
     /// `levels` arrays, each holding `fan` references to the next, with a
@@ -2232,6 +2444,8 @@ mod tests {
         pids: std::cell::RefCell<Vec<Option<i32>>>,
         /// What the process table says after a STOP.
         stops: bool,
+        /// How many resumes are refused before one lands.
+        refusals: std::cell::Cell<usize>,
         log: std::cell::RefCell<Vec<(&'static str, i32)>>,
     }
 
@@ -2243,12 +2457,18 @@ mod tests {
                 fails: fails.to_vec(),
                 pids: std::cell::RefCell::new(pids.to_vec()),
                 stops: true,
+                refusals: std::cell::Cell::new(0),
                 log: std::cell::RefCell::new(Vec::new()),
             }
         }
         /// A STOP the kernel accepts and the process never obeys.
         fn that_never_stops(mut self) -> Fake {
             self.stops = false;
+            self
+        }
+        /// A CONT that is refused `n` times before it lands.
+        fn that_refuses_resumes(self, n: usize) -> Fake {
+            self.refusals.set(n);
             self
         }
         fn did(&self, op: &'static str, pid: i32) -> Result<(), String> {
@@ -2289,6 +2509,11 @@ mod tests {
             self.did("pause", pid)
         }
         fn resume(&self, pid: i32) -> Result<(), String> {
+            if self.refusals.get() > 0 {
+                self.refusals.set(self.refusals.get() - 1);
+                self.log.borrow_mut().push(("resume", pid));
+                return Err("cannot resume the wallpaper agent: refused".into());
+            }
             self.did("resume", pid)
         }
         fn reload(&self, pid: i32) -> Result<(), String> {
@@ -2451,9 +2676,13 @@ mod tests {
         let e = paused(&agent, Some(7)).release().unwrap_err();
         assert!(e.contains("cannot resume"), "{e}");
         assert!(e.contains("cannot restart"), "{e}");
+        // The trailing resume is Drop's: the explicit one was REFUSED, so
+        // the debt stayed with the guard rather than being reported away.
         assert_eq!(
             agent.ops(),
-            ["pause", "stopped", "pid", "resume", "pid", "restart"]
+            [
+                "pause", "stopped", "pid", "resume", "pid", "restart", "resume"
+            ]
         );
 
         // One failing on its own still surfaces, from either side.
@@ -2529,6 +2758,34 @@ mod tests {
         assert!(e.contains("did not stop"), "{e}");
         assert_eq!(std::fs::read(&path).unwrap(), before, "it wrote anyway");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resume that was REFUSED is not a resume. Reporting one is not the
+    /// same as having done it, so the debt stays with the guard until a
+    /// CONT actually lands — an agent must never be left frozen because the
+    /// attempt to unfreeze it was merely mentioned.
+    #[test]
+    fn a_refused_resume_is_retried_until_one_lands() {
+        // The stop cannot be confirmed, so `new` compensates with a CONT
+        // (refused, 1); it hands the debt back; the explicit release tries
+        // again (refused, 2); Drop makes the one that lands (3).
+        let agent = Fake::new(&[Some(7)], &[])
+            .that_never_stops()
+            .that_refuses_resumes(2);
+        let Err((first, owed)) = Paused::new(&agent, Some(7)) else {
+            panic!("an unconfirmed stop must not yield a guard");
+        };
+        assert!(first.contains("could not be resumed"), "{first}");
+        let second = owed
+            .expect("the debt must come back with the guard")
+            .release()
+            .unwrap_err();
+        assert!(second.contains("cannot resume"), "{second}");
+
+        // `release` consumed the guard, so Drop has already run.
+        let ops = agent.ops();
+        assert_eq!(ops.iter().filter(|o| **o == "resume").count(), 3, "{ops:?}");
+        assert_eq!(ops.last(), Some(&"resume"), "the last try was not Drop's");
     }
 
     /// A teardown failure never replaces the reason we were tearing down,
