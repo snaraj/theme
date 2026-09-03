@@ -16,10 +16,12 @@ with a `SHA256SUMS` to verify against — everything below resolves to those
 same four tarballs. The Linux builds need glibc 2.34 or newer, and are
 verified on Ubuntu 22.04 and 24.04, Debian 12, Fedora 44 and Arch.
 
-**Homebrew** — macOS and Linux:
+**Homebrew** — macOS and Linux. Homebrew 6 requires a third-party tap to be
+trusted; the middle line grants that to this one formula and nothing else:
 
 ```sh
 brew tap snaraj/theme https://github.com/snaraj/theme
+brew trust --formula snaraj/theme/theme
 brew install snaraj/theme/theme
 ```
 
