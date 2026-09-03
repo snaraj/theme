@@ -33,8 +33,8 @@ curl -fsSL -o "$work/SHA256SUMS" "$base/SHA256SUMS" || exit 1
 # and macOS and GNU base64 spell the decode flag differently.
 png=iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==
 probe='
-set -e
-cd /m && grep " $TGZ$" SHA256SUMS | sha256sum -c - >/dev/null
+set -euo pipefail; cd /m && line=$(grep " $TGZ$" SHA256SUMS || true)
+[ "$(printf "%s\n" "$line" | grep -c .)" = 1 ] || { echo "no unique SHA256SUMS line for $TGZ"; exit 1; }; printf "%s\n" "$line" | sha256sum -c - >/dev/null
 mkdir -p /t/lib && cd /t && tar -xzf "/m/$TGZ"
 printf %s "$PNG" | base64 -d >/t/lib/tiny.png
 export THEME_NO_APPLY=1 THEME_NO_UPDATE_CHECK=1 THEME_CACHE_DIR=/t/cache \
@@ -49,7 +49,7 @@ try ./theme preview tiny.png
 fails=0
 for img in $IMAGES; do
     if out=$(docker run --rm --platform "$platform" -e TGZ="$tgz" -e PNG="$png" \
-        -v "$work":/m:ro "$img" sh -c "$probe" 2>&1); then
+        -v "$work":/m:ro "$img" bash -c "$probe" 2>&1); then
         printf 'PASS  %-20s %s: 7 commands\n' "$img" "$arch"
     else
         printf 'FAIL  %-20s %s\n' "$img" "$(printf '%s' "$out" | tail -1)"

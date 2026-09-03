@@ -134,7 +134,10 @@ fn main() {
         "get" => {
             // The library half of `set`: same sources, same saver, and then
             // it STOPS — the file lands and is shown, nothing is applied.
-            let arg = args.get(1).map(String::as_str).unwrap_or("");
+            if args.len() != 2 {
+                die("theme get takes exactly one link");
+            }
+            let arg = args[1].as_str();
             if !arg.contains("://") {
                 die(
                     "usage: theme get <link> [--mkdir <folder>]   (links only — a library name has nothing to download)",

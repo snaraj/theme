@@ -755,8 +755,36 @@ for bad in ../x .hidden a/b; do
 done
 check  "--mkdir swallows no following flag"    1 run_get https://img.invalid/nope.png --mkdir --rotate
 check  "get refuses a library name"            1 run_get name-not-a-link
+# A second positional is a grammar error, refused before any fetch — the same
+# `theme get takes exactly one link` message the arm dies with pre-side-effect.
+check  "'get' with an extra positional is refused" 1 run_get https://img.invalid/nope2.png unexpected
+getextraerr=$(run_get https://img.invalid/nope2.png unexpected 2>&1)
+case "$getextraerr" in
+*"theme get takes exactly one link"*) pass "the extra-positional refusal names its cause" ;;
+*) fail "the extra-positional refusal message is wrong: $getextraerr" ;;
+esac
+# A dangling --mkdir (nothing following it) is refused the same way rotate/-n
+# already were — no value ever means no fetch.
+check  "a dangling --mkdir on 'get' is refused"     1 run_get https://img.invalid/nope3.png --mkdir
+getdangleerr=$(run_get https://img.invalid/nope3.png --mkdir 2>&1)
+case "$getdangleerr" in
+*"--mkdir takes one folder name"*) pass "the dangling --mkdir refusal names its cause" ;;
+*) fail "the dangling --mkdir refusal message is wrong: $getdangleerr" ;;
+esac
+# A SECOND --mkdir that dangles must still refuse even though the first one
+# already left a valid name behind — the bug this fixture pins.
+check  "--mkdir studies --mkdir (re-dangled) is refused" 1 \
+    run_get https://img.invalid/nope4.png --mkdir studies --mkdir
+getredangleerr=$(run_get https://img.invalid/nope4.png --mkdir studies --mkdir 2>&1)
+case "$getredangleerr" in
+*"--mkdir takes one folder name"*) pass "the re-dangled --mkdir refusal names its cause" ;;
+*) fail "the re-dangled --mkdir refusal message is wrong: $getredangleerr" ;;
+esac
 if [ ! -s "$getlog" ]; then pass "a refused get never reaches the network"
 else fail "a refused get still ran curl: $(cat "$getlog")"; fi
+# The well-formed grammar still downloads after the fix above.
+run_get https://img.invalid/study2.png --mkdir studies2 >/dev/null 2>&1
+exists "well-formed 'get --mkdir' still downloads" yes "$getlib/studies2/study2.png"
 check  "rm refuses get's --mkdir"              1 run "$lib" rm keepme.jpg --mkdir x
 exists "and the named victim survives"         yes "$lib/keepme.jpg"
 

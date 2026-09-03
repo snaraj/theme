@@ -125,6 +125,9 @@ pub fn parse(argv: &[String]) -> Flags {
     if want_w {
         die("--wallpaper takes a wallpaper name");
     }
+    if want_mkdir {
+        die("--mkdir takes one folder name (no slashes, no leading dot or dash)");
+    }
     // --mkdir is the ONE caller-chosen component of a save path: one library
     // folder name, fenced here — before dispatch, so no traversal reaches the
     // saver's own guard, and nothing is downloaded first. A dangling
