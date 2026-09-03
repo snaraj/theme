@@ -11,11 +11,27 @@ the background image as the driver.
 
 ## Install
 
-Prebuilt binaries for macOS and Linux ship on the
-[releases page](https://github.com/snaraj/theme/releases), each release with
-a `SHA256SUMS` to verify against.
+Every release ships prebuilt binaries for macOS and Linux (arm64 and x86_64)
+with a `SHA256SUMS` to verify against — everything below resolves to those
+same four tarballs.
 
-**macOS**
+**Homebrew** — macOS and Linux:
+
+```sh
+brew tap snaraj/theme https://github.com/snaraj/theme
+brew install snaraj/theme/theme
+```
+
+**Debian, Ubuntu, Fedora, RHEL** — take the `.deb` or `.rpm` for your
+architecture from the
+[releases page](https://github.com/snaraj/theme/releases), then
+`sudo apt install ./theme_*.deb` or `sudo dnf install ./theme-*.rpm`.
+Both want glibc 2.39 or newer (Ubuntu 24.04, Debian 13, Fedora 40) and say
+so rather than installing a binary that cannot run.
+
+**Arch** — `theme-bin` on the AUR.
+
+**Anywhere else** — the tarball, one file, no installer:
 
 ```sh
 curl -fsSLO https://github.com/snaraj/theme/releases/latest/download/theme-aarch64-apple-darwin.tar.gz
@@ -23,18 +39,14 @@ tar -xzf theme-aarch64-apple-darwin.tar.gz
 mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 ```
 
-**Linux**
-
-```sh
-curl -fsSLO https://github.com/snaraj/theme/releases/latest/download/theme-x86_64-unknown-linux-gnu.tar.gz
-tar -xzf theme-x86_64-unknown-linux-gnu.tar.gz
-mkdir -p ~/.local/bin && mv theme ~/.local/bin/
-```
-
-- Intel Mac: `theme-x86_64-apple-darwin.tar.gz` · ARM Linux:
-  `theme-aarch64-unknown-linux-gnu.tar.gz`
+- Other targets: `theme-x86_64-apple-darwin.tar.gz`,
+  `theme-x86_64-unknown-linux-gnu.tar.gz`,
+  `theme-aarch64-unknown-linux-gnu.tar.gz`.
 - `~/.local/bin` must be on your `PATH`.
-- Or build from source: `cargo build --release`.
+- From source:
+  `cargo install --git https://github.com/snaraj/theme --locked`.
+- No Snap or Flatpak build: their sandboxes cut off the kitty socket, the
+  wallpaper store and `/dev/tty`, which is the entire job. No Windows build.
 
 ## Use
 

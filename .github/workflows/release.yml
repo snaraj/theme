@@ -28,18 +28,70 @@ jobs:
             runner: macos-latest
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+            deb: amd64
+            rpm: x86_64
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            deb: arm64
+            rpm: aarch64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - run: tar -C target/${{ matrix.target }}/release -czf theme-${{ matrix.target }}.tar.gz theme
+      # Distro packages beside the tarball, built by the runner's OWN distro
+      # tools — nothing third-party sits in the packaging path. Their names
+      # carry the version, never a target triple, so `theme update` still
+      # finds exactly one asset. A non-tag run packages 0.0.0.
+      - if: matrix.deb != ''
+        env:
+          BIN: target/${{ matrix.target }}/release/theme
+          DEB: ${{ matrix.deb }}
+          RPM: ${{ matrix.rpm }}
+        run: |
+          VER=$([ "$GITHUB_REF_TYPE" = tag ] && echo "${GITHUB_REF_NAME#v}" || echo 0.0.0)
+          sudo apt-get update -qq && sudo apt-get install -y -qq rpm binutils
+          # The glibc floor read OFF THE BINARY, never hardcoded: apt has to
+          # refuse on an old distro, not install a command that cannot run.
+          LIBC=$(objdump -T "$BIN" | sed -n 's/.*GLIBC_\([0-9.]*\).*/\1/p' | sort -uV | tail -1)
+          install -D -m755 "$BIN" pkg/usr/bin/theme && mkdir -p pkg/DEBIAN
+          cat >pkg/DEBIAN/control <<EOF
+          Package: theme
+          Version: $VER
+          Architecture: $DEB
+          Depends: libc6 (>= $LIBC)
+          Maintainer: Samuel Naranjo <39077795+snaraj@users.noreply.github.com>
+          Homepage: https://github.com/snaraj/theme
+          Section: utils
+          Priority: optional
+          Description: Wallpaper and terminal palette driven by one command
+           The background image drives the desktop and the terminal together.
+          EOF
+          dpkg-deb --build --root-owner-group pkg "theme_${VER}_${DEB}.deb"
+          install -D -m755 "$BIN" rpmroot/BUILDROOT/usr/bin/theme
+          cat >theme.spec <<EOF
+          Name: theme
+          Version: $VER
+          Release: 1
+          Summary: Wallpaper and terminal palette driven by one command
+          License: MIT
+          URL: https://github.com/snaraj/theme
+          BuildArch: $RPM
+          %description
+          The background image drives the desktop and the terminal together.
+          %files
+          /usr/bin/theme
+          EOF
+          rpmbuild -bb --define "_topdir $PWD/rpmroot" --buildroot "$PWD/rpmroot/BUILDROOT" theme.spec
+          mv "rpmroot/RPMS/$RPM/theme-$VER-1.$RPM.rpm" .
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: theme-${{ matrix.target }}
-          path: theme-${{ matrix.target }}.tar.gz
+          path: |
+            theme-${{ matrix.target }}.tar.gz
+            theme_*.deb
+            theme-*.rpm
           if-no-files-found: error
 
   publish:
@@ -52,12 +104,30 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
-      # Asset names stay version-free: `releases/latest/download/<name>`
-      # needs a stable name, and the release itself carries the version.
-      - run: sha256sum theme-*.tar.gz > SHA256SUMS
+      # Tarball names stay version-free: `releases/latest/download/<name>`
+      # needs a stable name. One checksum file over EVERY asset — the deb
+      # and the rpm carry no signature, so this over TLS is their integrity.
+      - run: sha256sum theme-*.tar.gz theme_*.deb theme-*.rpm > SHA256SUMS
       - env:
           GH_TOKEN: ${{ github.token }}
         run: >
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
           --verify-tag --title "theme $GITHUB_REF_NAME"
-          --generate-notes theme-*.tar.gz SHA256SUMS
+          --generate-notes theme-*.tar.gz theme_*.deb theme-*.rpm SHA256SUMS
+
+  # The tap formula has to point at the release just published. A runner
+  # holds no signing key and main requires signed commits, so the commit is
+  # made through the contents API — GitHub signs that one — and arrives as a
+  # PR the OWNER merges. The elevated scopes stay inside this job.
+  formula:
+    if: github.ref_type == 'tag'
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/bump-formula.sh "$GITHUB_REF_NAME"

@@ -515,31 +515,35 @@ fn asset_url(release: &Json, name: &str) -> Option<String> {
         .then(|| url.to_string())
 }
 
-/// The unique SHA256SUMS entry whose filename names `target`. Lines are
-/// `<64-hex>  <name>` (` *name` binary-marker form accepted). Zero or
-/// multiple matches refuse — a release that cannot name this platform
-/// unambiguously does not get installed.
+/// The SHA256SUMS entry for this platform's tarball, matched on the EXACT
+/// asset name `theme-<target>.tar.gz`. Lines are `<64-hex>  <name>`
+/// (` *name` binary-marker form accepted). Exact, not "contains": the
+/// release also carries distro packages, and any future asset that merely
+/// mentioned the triple would make every update refuse as ambiguous.
+/// Zero or multiple matches still refuse — a release that cannot name this
+/// platform unambiguously does not get installed.
 fn pick_from_sums(sums: &str, target: &str) -> Result<(String, String), String> {
-    let mut hit: Option<(String, String)> = None;
+    let asset = format!("theme-{target}.tar.gz");
+    let mut hit: Option<String> = None;
     for line in sums.lines() {
         let line = line.trim_end_matches('\r');
         let (hex, name) = match line.split_once(' ') {
             Some(t) => t,
             None => continue,
         };
-        let name = name.trim_start().trim_start_matches('*');
         if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
             continue;
         }
-        if name.is_empty() || name.contains('/') || !name.contains(target) {
+        if name.trim_start().trim_start_matches('*') != asset {
             continue;
         }
         if hit.is_some() {
             return Err(format!("SHA256SUMS names more than one {target} asset"));
         }
-        hit = Some((hex.to_ascii_lowercase(), name.to_string()));
+        hit = Some(hex.to_ascii_lowercase());
     }
-    hit.ok_or_else(|| format!("SHA256SUMS has no entry for {target}"))
+    hit.map(|hex| (hex, asset))
+        .ok_or_else(|| format!("SHA256SUMS has no entry for {target}"))
 }
 
 /// First line + Location of a `curl -D` header dump.
@@ -897,6 +901,18 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
         assert!(pick_from_sums(SUMS, "riscv64gc-unknown-none").is_err());
         let dup = format!("{SUMS}{SUMS}");
         assert!(pick_from_sums(&dup, "aarch64-apple-darwin").is_err());
+        // The release digests its distro packages in the same SHA256SUMS,
+        // so a substring match would read them as a second candidate and
+        // refuse every update.
+        let with_pkgs = format!(
+            "{SUMS}\
+             1111111111111111111111111111111111111111111111111111111111111111  theme_0.2.2_arm64.deb\n\
+             2222222222222222222222222222222222222222222222222222222222222222  theme-aarch64-apple-darwin.deb\n\
+             3333333333333333333333333333333333333333333333333333333333333333  theme-aarch64-apple-darwin.rpm\n"
+        );
+        let (hex, name) = pick_from_sums(&with_pkgs, "aarch64-apple-darwin").unwrap();
+        assert_eq!(name, "theme-aarch64-apple-darwin.tar.gz");
+        assert!(hex.starts_with("0123"));
         // A short or non-hex digest never selects.
         assert!(
             pick_from_sums("abc  theme-aarch64-apple-darwin\n", "aarch64-apple-darwin").is_err()

@@ -27,3 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: cargo test --workspace --locked
+      # Tapping the checkout is what makes Homebrew judge the formula by its
+      # FORMULA rules — a bare path gets generic Ruby cops. Read-only and
+      # nothing installed; `brew audit` stays out (see Formula/theme.rb).
+      - run: brew tap snaraj/theme "$GITHUB_WORKSPACE" && brew style snaraj/theme
