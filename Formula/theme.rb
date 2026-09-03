@@ -1,5 +1,8 @@
 # The tap lives in the product repository, so `brew tap snaraj/theme
 # https://github.com/snaraj/theme` needs no second repository kept in step.
+# Homebrew 6 will not use a third-party tap until it is trusted, so the
+# install is: tap, `brew trust --formula snaraj/theme/theme` (the narrowest
+# grant — never the whole tap), then `brew install snaraj/theme/theme`.
 # The release chain rewrites the version, the four URLs and the four sha256
 # lines from the published SHA256SUMS — the trailing `# <target>` comments
 # are its anchors, keep them. The version is STATED, not left to Homebrew's
