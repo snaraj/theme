@@ -13,7 +13,8 @@ the background image as the driver.
 
 Every release ships prebuilt binaries for macOS and Linux (arm64 and x86_64)
 with a `SHA256SUMS` to verify against — everything below resolves to those
-same four tarballs.
+same four tarballs. The Linux builds need glibc 2.34 or newer, and are
+verified on Ubuntu 22.04 and 24.04, Debian 12, Fedora 44 and Arch.
 
 **Homebrew** — macOS and Linux:
 
@@ -26,8 +27,8 @@ brew install snaraj/theme/theme
 architecture from the
 [releases page](https://github.com/snaraj/theme/releases), then
 `sudo apt install ./theme_*.deb` or `sudo dnf install ./theme-*.rpm`. Each
-declares the glibc it needs (2.39 today), so an older distro refuses the
-install rather than leaving you a command that cannot run.
+declares that glibc floor, so a distro below it refuses the install rather
+than leaving you a command that cannot run.
 
 **Anywhere else** — the tarball, one file, no installer:
 

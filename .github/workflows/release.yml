@@ -26,12 +26,17 @@ jobs:
             runner: macos-latest
           - target: x86_64-apple-darwin
             runner: macos-latest
+          # The Linux legs build on the OLDEST image still offered, never
+          # the newest: a glibc symbol version is a floor the binary
+          # inherits from its build host, and 24.04 stamped an unflagged
+          # GLIBC_2.39 verneed (std's weak pidfd probe) that makes the
+          # loader refuse on 22.04 and Debian 12. Do not "modernize" these.
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             deb: amd64
             rpm: x86_64
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             deb: arm64
             rpm: aarch64
     runs-on: ${{ matrix.runner }}
