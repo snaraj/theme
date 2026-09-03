@@ -17,10 +17,31 @@
 //! chain, descriptor-bound open, identity re-checked at the rename. The
 //! screensaver (`Idle`) records are copied through untouched — a wallpaper
 //! change may not silently pick an aerial.
+//!
+//! Why launchd NAMES the agent here but never signals it: under System
+//! Integrity Protection macOS refuses both service-level primitives for an
+//! Apple LaunchAgent. Measured on macOS 26.6.2:
+//!
+//! ```text
+//! $ launchctl kill SIGSTOP gui/501/com.apple.wallpaper.agent
+//! Not privileged to signal service.
+//! $ launchctl kickstart -k gui/501/com.apple.wallpaper.agent
+//! Could not kickstart service "com.apple.wallpaper.agent": 150:
+//! Operation not permitted while System Integrity Protection is engaged
+//! ```
+//!
+//! `launchctl print` still answers, and kill(2) from the same uid still
+//! reaches the pid it names. So launchd is the IDENTITY and the kernel is
+//! the SIGNAL path: stop the pid launchd named, verify from the process
+//! table that it really stopped, and re-ask launchd for that identity
+//! before every later signal. Binding a pid any harder than that needs
+//! privileges this tool does not have and will not ask for — which is also
+//! why a pid is never carried forward on trust.
 
 use crate::save::{trusted_spawn, trusted_system_binary};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
+use rustix::process::{Pid, Signal, kill_process};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -33,6 +54,7 @@ const STORE: &str = "Library/Application Support/com.apple.wallpaper/Store/Index
 const PLUTIL: &str = "/usr/bin/plutil";
 const LAUNCHCTL: &str = "/bin/launchctl";
 const LS: &str = "/bin/ls";
+const PS: &str = "/bin/ps";
 /// The agent is a launchd SERVICE — `gui/<uid>/com.apple.wallpaper.agent`,
 /// a LaunchAgent running WallpaperAgent.app. Coordinating with the service
 /// rather than with a pid is what makes the handshake atomic: launchd
@@ -1262,19 +1284,26 @@ fn copy_xattrs(from: &OwnedFd, to: &OwnedFd) -> Result<(), String> {
     Ok(())
 }
 
-/// The wallpaper agent as launchd sees it: a SERVICE with four operations.
-/// Behind one seam, so every failure path below has a test that runs no
-/// launchctl and disturbs nothing.
+/// The wallpaper agent, split the way SIP forces it to be split: launchd
+/// owns the identity, the kernel owns the signals. Behind one seam, so
+/// every failure path below has a test that runs no launchctl, spawns no
+/// ps, and signals nothing.
 trait Agent {
-    /// The service's pid, or None when launchd is not running it. Only ever
-    /// a snapshot — it tells "the same instance throughout" from "it
-    /// restarted underneath us", and is never a thing we signal.
+    /// launchd's own answer for the service's pid, or None when it is not
+    /// running the agent. Re-asked before every signal rather than carried
+    /// forward: a pid is a snapshot, and launchd relaunches on demand.
     fn pid(&self) -> Result<Option<i32>, String>;
-    fn pause(&self) -> Result<(), String>;
-    fn resume(&self) -> Result<(), String>;
-    /// Kill and relaunch: the service's OWN restart, which is what makes it
-    /// read the store we just wrote instead of rewriting it from memory.
-    fn reload(&self) -> Result<(), String>;
+    /// SIGSTOP this exact pid.
+    fn pause(&self, pid: i32) -> Result<(), String>;
+    /// SIGCONT this exact pid.
+    fn resume(&self, pid: i32) -> Result<(), String>;
+    /// SIGTERM this exact pid and wait for it to go. launchd starts the
+    /// service again on demand, and the new one reads the store off disk —
+    /// which is the whole point of the restart.
+    fn reload(&self, pid: i32) -> Result<(), String>;
+    /// Is this pid ACTUALLY stopped? A STOP that returned Ok says only that
+    /// the signal was accepted, and the store has to hold still.
+    fn stopped(&self, pid: i32) -> Result<bool, String>;
 }
 
 struct Launchd;
@@ -1296,14 +1325,20 @@ impl Launchd {
             .map_err(|e| format!("cannot run launchctl: {e}"))
     }
 
-    /// A run whose only interesting answer is whether it worked.
-    fn ok(args: &[&str], what: &str) -> Result<(), String> {
-        let out = Launchd::run(args)?;
-        match out.status.success() {
-            true => Ok(()),
-            false => Err(format!(
-                "cannot {what} the wallpaper agent: {}",
-                first_line(&out.stderr)
+    /// One signal to the pid launchd named — never to a name, never to a
+    /// list. ESRCH is not a failure here: the instance we were told about
+    /// may have gone already, and the caller's identity checks are what
+    /// notice that.
+    fn send(pid: i32, sig: Signal, what: &str) -> Result<(), String> {
+        let Some(p) = Pid::from_raw(pid) else {
+            return Err(format!(
+                "cannot {what} the wallpaper agent: {pid} is not a pid"
+            ));
+        };
+        match kill_process(p, sig) {
+            Ok(()) | Err(Errno::SRCH) => Ok(()),
+            Err(e) => Err(format!(
+                "cannot {what} the wallpaper agent (pid {pid}): {e}"
             )),
         }
     }
@@ -1332,16 +1367,48 @@ impl Agent for Launchd {
             .and_then(|n| n.trim().parse().ok()))
     }
 
-    fn pause(&self) -> Result<(), String> {
-        Launchd::ok(&["kill", "SIGSTOP", &Launchd::target()], "pause")
+    fn pause(&self, pid: i32) -> Result<(), String> {
+        Launchd::send(pid, Signal::STOP, "pause")
     }
 
-    fn resume(&self) -> Result<(), String> {
-        Launchd::ok(&["kill", "SIGCONT", &Launchd::target()], "resume")
+    fn resume(&self, pid: i32) -> Result<(), String> {
+        Launchd::send(pid, Signal::CONT, "resume")
     }
 
-    fn reload(&self) -> Result<(), String> {
-        Launchd::ok(&["kickstart", "-k", &Launchd::target()], "restart")
+    fn reload(&self, pid: i32) -> Result<(), String> {
+        Launchd::send(pid, Signal::TERM, "restart")?;
+        // Signal 0 until it answers ESRCH: an agent still alive is one that
+        // never re-read the store, and could yet write over it from memory.
+        for _ in 0..20 {
+            match Pid::from_raw(pid) {
+                Some(p) if rustix::process::test_kill_process(p).is_ok() => {}
+                _ => return Ok(()),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err(format!(
+            "the wallpaper agent did not exit after SIGTERM (pid {pid})"
+        ))
+    }
+
+    /// `ps -o stat=` prints the state code; `T` in the first column is a
+    /// stopped process (measured on macOS 26: `TN` stopped, `SN` running).
+    fn stopped(&self, pid: i32) -> Result<bool, String> {
+        if !trusted_system_binary(PS) {
+            return Err("no trusted /bin/ps".into());
+        }
+        let out = trusted_spawn(Path::new(PS))
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map_err(|e| format!("cannot run ps: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "the wallpaper agent (pid {pid}) is no longer there"
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .trim_start()
+            .starts_with('T'))
     }
 }
 
@@ -1361,9 +1428,10 @@ fn first_line(err: &[u8]) -> String {
 /// roll back — and a guard, because the resume is owed on every path.
 struct Paused<'a> {
     agent: &'a dyn Agent,
-    /// Cleared the moment `release` takes responsibility for reporting, so
-    /// Drop is left holding only the panic.
-    held: bool,
+    /// The pid we actually stopped — the one every later signal must still
+    /// find launchd running. Taken the moment `release` accepts
+    /// responsibility for reporting, so Drop is left holding only the panic.
+    held: Option<i32>,
 }
 
 impl<'a> Paused<'a> {
@@ -1374,11 +1442,26 @@ impl<'a> Paused<'a> {
     /// Pausing it would only fail, and failing there would cost a sync that
     /// had nothing to coordinate in the first place.
     fn new(agent: &'a dyn Agent, running: Option<i32>) -> Result<Paused<'a>, String> {
-        if running.is_none() {
-            return Ok(Paused { agent, held: false });
+        let Some(pid) = running else {
+            return Ok(Paused { agent, held: None });
+        };
+        agent.pause(pid)?;
+        // A STOP that was ACCEPTED is not a process that stopped. The whole
+        // transaction rests on the store holding still, so ask the process
+        // table what state it actually reached — and on ANY answer but yes,
+        // including one we could not read, put it back the way we found it
+        // rather than walking away from a frozen agent.
+        let confirmed = agent.stopped(pid);
+        if !matches!(confirmed, Ok(true)) {
+            let _ = agent.resume(pid);
+            return Err(confirmed
+                .err()
+                .unwrap_or_else(|| "the wallpaper agent did not stop".into()));
         }
-        agent.pause()?;
-        Ok(Paused { agent, held: true })
+        Ok(Paused {
+            agent,
+            held: Some(pid),
+        })
     }
 
     /// Resume, then let the service restart itself into the file we wrote.
@@ -1387,12 +1470,33 @@ impl<'a> Paused<'a> {
     fn release(mut self) -> Result<(), String> {
         // Nothing was ever paused, so nothing is owed and nothing needs
         // restarting: the next agent launchd starts reads the store fresh.
-        if !self.held {
+        let Some(pid) = self.held.take() else {
             return Ok(());
+        };
+        // The identity is re-asked before the CONT — but the CONT goes out
+        // either way, and first: an agent left frozen is a desktop that
+        // never repaints again, while a CONT to a pid that is not stopped
+        // does nothing at all.
+        let ours = self.agent.pid();
+        let resumed = self.agent.resume(pid);
+        if !matches!(&ours, Ok(Some(p)) if *p == pid) {
+            let why = ours
+                .err()
+                .unwrap_or_else(|| "the wallpaper agent restarted during the sync".into());
+            return Err(match resumed {
+                Ok(()) => why,
+                Err(e) => format!("{why}; and {e}"),
+            });
         }
-        self.held = false;
-        match (self.agent.resume(), self.agent.reload()) {
-            (Ok(()), reloaded) => reloaded,
+        // And re-asked again before the restart, because the resume above
+        // took time somebody else could have used.
+        let reloaded = match self.agent.pid() {
+            Ok(Some(p)) if p == pid => self.agent.reload(pid),
+            Ok(_) => Err("the wallpaper agent restarted during the sync".into()),
+            Err(e) => Err(e),
+        };
+        match (resumed, reloaded) {
+            (Ok(()), r) => r,
             (Err(e), Ok(())) => Err(e),
             (Err(e), Err(r)) => Err(format!("{e}; and {r}")),
         }
@@ -1404,8 +1508,8 @@ impl<'a> Paused<'a> {
 /// unwinding stack has nobody left to report to, so it just tries.
 impl Drop for Paused<'_> {
     fn drop(&mut self) {
-        if self.held {
-            let _ = self.agent.resume();
+        if let Some(pid) = self.held {
+            let _ = self.agent.resume(pid);
         }
     }
 }
@@ -1956,7 +2060,9 @@ mod tests {
     struct Fake {
         fails: Vec<&'static str>,
         pids: std::cell::RefCell<Vec<Option<i32>>>,
-        log: std::cell::RefCell<Vec<&'static str>>,
+        /// What the process table says after a STOP.
+        stops: bool,
+        log: std::cell::RefCell<Vec<(&'static str, i32)>>,
     }
 
     impl Fake {
@@ -1966,24 +2072,39 @@ mod tests {
             Fake {
                 fails: fails.to_vec(),
                 pids: std::cell::RefCell::new(pids.to_vec()),
+                stops: true,
                 log: std::cell::RefCell::new(Vec::new()),
             }
         }
-        fn did(&self, op: &'static str) -> Result<(), String> {
-            self.log.borrow_mut().push(op);
+        /// A STOP the kernel accepts and the process never obeys.
+        fn that_never_stops(mut self) -> Fake {
+            self.stops = false;
+            self
+        }
+        fn did(&self, op: &'static str, pid: i32) -> Result<(), String> {
+            self.log.borrow_mut().push((op, pid));
             match self.fails.contains(&op) {
                 true => Err(format!("cannot {op} the wallpaper agent: refused")),
                 false => Ok(()),
             }
         }
         fn ops(&self) -> Vec<&'static str> {
-            self.log.borrow().clone()
+            self.log.borrow().iter().map(|(op, _)| *op).collect()
+        }
+        /// Every pid this agent was ever asked to signal.
+        fn signalled(&self) -> Vec<i32> {
+            self.log
+                .borrow()
+                .iter()
+                .filter(|(op, _)| *op != "pid")
+                .map(|(_, p)| *p)
+                .collect()
         }
     }
 
     impl Agent for Fake {
         fn pid(&self) -> Result<Option<i32>, String> {
-            self.log.borrow_mut().push("pid");
+            self.log.borrow_mut().push(("pid", 0));
             if self.fails.contains(&"pid") {
                 return Err("cannot read the wallpaper agent: refused".into());
             }
@@ -1994,14 +2115,18 @@ mod tests {
                 _ => q.remove(0),
             })
         }
-        fn pause(&self) -> Result<(), String> {
-            self.did("pause")
+        fn pause(&self, pid: i32) -> Result<(), String> {
+            self.did("pause", pid)
         }
-        fn resume(&self) -> Result<(), String> {
-            self.did("resume")
+        fn resume(&self, pid: i32) -> Result<(), String> {
+            self.did("resume", pid)
         }
-        fn reload(&self) -> Result<(), String> {
-            self.did("restart")
+        fn reload(&self, pid: i32) -> Result<(), String> {
+            self.did("restart", pid)
+        }
+        fn stopped(&self, pid: i32) -> Result<bool, String> {
+            self.did("stopped", pid)?;
+            Ok(self.stops)
         }
     }
 
@@ -2037,11 +2162,18 @@ mod tests {
         let agent = Fake::new(&[Some(7)], &[]);
         let quiet = |_: &Path| Ok(false);
         sync_with(&agent, &quiet, &fd, &path, NEW_URI, floor(), "new.jpg").unwrap();
+        // launchd is asked who the agent IS before every signal, the STOP is
+        // verified against the process table, and the identity is re-checked
+        // before the rename, before the resume and before the restart.
         assert_eq!(
             agent.ops(),
-            ["pid", "pause", "pid", "resume", "restart"],
+            [
+                "pid", "pause", "stopped", "pid", "pid", "resume", "pid", "restart"
+            ],
             "the service was not coordinated in order"
         );
+        // And every one of those signals went to the pid launchd named.
+        assert!(agent.signalled().iter().all(|p| *p == 7));
         // The store really was rewritten, and it still parses.
         let after = std::fs::read(&path).unwrap();
         assert_ne!(after, before);
@@ -2135,7 +2267,10 @@ mod tests {
         let e = Paused::new(&agent, Some(7)).unwrap().release().unwrap_err();
         assert!(e.contains("cannot resume"), "{e}");
         assert!(e.contains("cannot restart"), "{e}");
-        assert_eq!(agent.ops(), ["pause", "resume", "restart"]);
+        assert_eq!(
+            agent.ops(),
+            ["pause", "stopped", "pid", "resume", "pid", "restart"]
+        );
 
         // One failing on its own still surfaces, from either side.
         let agent = Fake::new(&[Some(7)], &["restart"]);
@@ -2159,6 +2294,40 @@ mod tests {
         let agent = Fake::new(&[Some(7)], &["pause"]);
         assert!(Paused::new(&agent, Some(7)).is_err());
         assert_eq!(agent.ops(), ["pause"]);
+    }
+
+    /// A STOP the kernel accepted is not a process that stopped, and the
+    /// whole transaction rests on the store holding still. An agent that
+    /// never reaches the stopped state is resumed and refused — nothing is
+    /// written behind a process that is still running.
+    #[test]
+    fn a_stop_that_was_accepted_but_not_obeyed_is_refused() {
+        let agent = Fake::new(&[Some(7)], &[]).that_never_stops();
+        let Err(e) = Paused::new(&agent, Some(7)) else {
+            panic!("a process that never stopped must not yield a guard");
+        };
+        assert!(e.contains("did not stop"), "{e}");
+        assert_eq!(agent.ops(), ["pause", "stopped", "resume"]);
+
+        // An answer we could not READ is treated the same way: we stopped
+        // it, so it gets put back whatever went wrong.
+        let agent = Fake::new(&[Some(7)], &["stopped"]);
+        let Err(e) = Paused::new(&agent, Some(7)) else {
+            panic!("an unreadable process state must not yield a guard");
+        };
+        assert!(e.contains("cannot stopped"), "{e}");
+        assert_eq!(agent.ops(), ["pause", "stopped", "resume"]);
+
+        // And it costs the sync rather than the store.
+        let (dir, fd) = scratch_store("nostop");
+        let path = dir.join("Index.plist");
+        let before = std::fs::read(&path).unwrap();
+        let agent = Fake::new(&[Some(7)], &[]).that_never_stops();
+        let quiet = |_: &Path| Ok(false);
+        let e = sync_with(&agent, &quiet, &fd, &path, NEW_URI, floor(), "new.jpg").unwrap_err();
+        assert!(e.contains("did not stop"), "{e}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "it wrote anyway");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A teardown failure never replaces the reason we were tearing down,
