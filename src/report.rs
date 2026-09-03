@@ -276,16 +276,26 @@ pub(crate) fn human_bytes(path: &Path) -> String {
     }
 }
 
-pub(crate) fn added_date(path: &Path) -> String {
-    let out = Command::new("stat")
-        .args(["-f", "%SB", "-t", "%Y-%m-%d"])
+/// BSD `stat`, asked only where that is what `stat` means. Birth time is a
+/// BSD field, and GNU's `-f` selects the FILE SYSTEM rather than a format,
+/// so off macOS this spawn can only fail — and a listing was paying for it
+/// twice per file to learn nothing. None sends the caller to its stand-in.
+fn bsd_stat(args: &[&str], path: &Path) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    Command::new("stat")
+        .args(args)
         .arg(path)
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    if !out.is_empty() {
+        .filter(|s| !s.is_empty())
+}
+
+pub(crate) fn added_date(path: &Path) -> String {
+    if let Some(out) = bsd_stat(&["-f", "%SB", "-t", "%Y-%m-%d"], path) {
         return out;
     }
     // Non-macOS: no birth time — modification time is the honest stand-in.
@@ -312,21 +322,16 @@ pub(crate) fn added_date(path: &Path) -> String {
 }
 
 pub(crate) fn birth_key(path: &Path) -> i64 {
-    let out = Command::new("stat")
-        .args(["-f", "%B"])
-        .arg(path)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok());
-    out.unwrap_or_else(|| {
-        fs::metadata(path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    })
+    bsd_stat(&["-f", "%B"], path)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            fs::metadata(path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        })
 }
 
 pub(crate) fn swatch_cells(scheme: &[String]) -> (String, usize) {

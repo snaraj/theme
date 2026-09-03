@@ -27,6 +27,12 @@
 #
 # Run: THEME_BIN=target/release/theme tests/boundary.sh   (exits 0 on pass)
 set -u
+# The fixture builds the library, the cache and every planted directory
+# itself, and the custody audits it pins REFUSE a group-writable one — so
+# the world it builds must not depend on the caller's umask. macOS defaults
+# to 022 and always satisfied this by accident; Ubuntu defaults to 002 and
+# turned every custody positive into a refusal. Stated, not inherited.
+umask 022
 root="$(cd "$(dirname "$0")/.." && pwd)"
 THEME="${THEME_BIN:-$root/target/release/theme}"
 [ -x "$THEME" ] || { echo "FAIL  no binary at $THEME (cargo build --release first)"; exit 1; }
@@ -76,7 +82,14 @@ if [ "$child_env" = "||" ]; then
     pass "no ambient credential reaches an unpinned child (outer token was ${#outer_token} bytes)"
 else fail "an ambient credential reached an unpinned child: $child_env"; fi
 
-fixture=$(mktemp -d -t theme-boundary) || exit 1
+# Spelled-out template, and NOT under TMPDIR: `mktemp -t` means opposite
+# things to BSD and GNU (the GNU form also demands the Xs), and on Linux
+# TMPDIR is the world-writable /tmp — a chain the saver's ancestor audit
+# refuses outright, which is why the unit tests' scratch already lives here
+# (src/save_tests.rs). target/ sits on a user-owned chain wherever the repo
+# is sanely checked out.
+mkdir -p "$root/target/test-tmp" || exit 1
+fixture=$(mktemp -d "$root/target/test-tmp/theme-boundary.XXXXXX") || exit 1
 trap 'rm -rf "$fixture"' EXIT
 lib="$fixture/library"
 out="$fixture/outside"
@@ -107,6 +120,13 @@ run() { THEME_WALLPAPER_DIR="$1" THEME_NO_APPLY=1 THEME_CACHE_DIR="$fixture/cach
     TMPDIR="$fixture/tmpdir" "$THEME" "${@:2}"; }
 run_nokitty() { THEME_WALLPAPER_DIR="$1" THEME_NO_APPLY=1 THEME_CACHE_DIR="$fixture/cache" \
     TMPDIR="$fixture/tmpdir" KITTY_WINDOW_ID='' "$THEME" "${@:2}"; }
+
+# theme writes and reads a wallpaper's provenance through the macOS `xattr`
+# tool; Linux ships no counterpart, so a planted theme.* attribute is
+# invisible there and the sections that assert on one have nothing to drive.
+# What those cases pin — the display sanitizing and the parsed-host label —
+# is platform-independent code, exercised on the platform that can carry it.
+xattr_meta() { [ "$(uname -s)" = Darwin ]; }
 
 # --- positive destructive ops must MUTATE, not merely exit 0 ---------------
 check  "in-library rm succeeds"                0 run "$lib" rm in-lib.jpg
@@ -209,6 +229,7 @@ exists "first-dir dupname intact"               yes "$lib/dupname.png"
 exists "second-dir dupname intact"              yes "$lib2/dupname.png"
 
 # --- long values WRAP with a hanging indent — never merging with a label ----
+if xattr_meta; then
 png1x1 "$lib/long-src.png" 0 0 0
 xattr -w theme.source "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bb.invalid/x" "$lib/long-src.png" 2>/dev/null
 pv_out=$(COLUMNS=60 run_nokitty "$lib" preview long-src 2>/dev/null)
@@ -234,6 +255,7 @@ pv_out=$(COLUMNS=80 run_nokitty "$lib" preview ctrl-src 2>/dev/null)
 if printf '%s' "$pv_out" | grep -q 'SOURCE       badlineirl'; then
     pass "control bytes in the source xattr are stripped"
 else fail "control bytes reached the preview table"; fi
+fi
 
 # --- OWNER: only populated fields render; hostile metadata xattrs are inert -
 png1x1 "$lib/bare-meta.png" 5 5 5
@@ -246,6 +268,7 @@ if printf '%s' "$pv_out" | grep -q '^  TITLE        bare-meta' \
    && printf '%s' "$pv_out" | grep -q '^  LOCATION'; then
     pass "a bare file still renders its filesystem facts"
 else fail "preview lost a filesystem fact on a bare file"; fi
+if xattr_meta; then
 xattr -w theme.artist "$(printf 'Ev\033]52;c;steal\ail Artist')" "$lib/bare-meta.png" 2>/dev/null
 pv_out=$(COLUMNS=80 run_nokitty "$lib" preview bare-meta 2>/dev/null)
 if printf '%s' "$pv_out" | grep -qF "$(printf '\033]')"; then
@@ -254,6 +277,7 @@ else pass "hostile metadata cannot emit terminal protocol"; fi
 if printf '%s' "$pv_out" | grep -q '^  ARTIST       Ev]52;c;stealil Artist$'; then
     pass "the sanitized artist value still renders"
 else fail "the artist metadata line was lost or mangled"; fi
+fi
 rm -f "$lib/bare-meta.png"
 rm -f "$lib/long-src.png" "$lib/ctrl-src.png" "$lib/dupname.png" "$lib2/dupname.png"
 
@@ -760,6 +784,7 @@ srccase() { # $1 description, $2 basename, $3 theme.source value, $4 expected la
     got=$(COLUMNS=120 run_nokitty "$lib" preview "$2" 2>/dev/null | sed -n 's/^ *SOURCE  *//p')
     if [ "$got" = "$4" ]; then pass "$1"; else fail "$1 (got '$got', wanted '$4')"; fi
 }
+if xattr_meta; then
 srccase "the genuine host still labels unsplash"  srchost-good \
     "https://unsplash.com/photos/abc" unsplash
 srccase "a subdomain of it still labels unsplash" srchost-sub \
@@ -770,6 +795,7 @@ srccase "a SUFFIX-extended host is not unsplash"  srchost-suffix \
     "https://unsplash.com.evil.invalid/x" unsplash.com.evil.invalid
 srccase "userinfo cannot fake the host"           srchost-userinfo \
     "https://unsplash.com@evil.invalid/x" evil.invalid
+fi
 
 # --- NO command emits terminal control protocol, whatever disk or API says -
 sweeplib="$fixture/sweep"; sweepcache="$fixture/sweepcache"
@@ -1587,6 +1613,10 @@ for tool in id getfacl ls; do
     printf '#!/bin/sh\n: >"%s/audit-stub-ran-%s"\nexit 0\n' "$fixture" "$tool" >"$auditbin/$tool"
     chmod +x "$auditbin/$tool"
 done
+# The FIFO section above leaves a regular file behind ONLY if the heal it
+# pins actually happened; a stale FIFO here would block this write forever
+# and hang CI instead of failing it, so the entry goes before it is written.
+rm -f "$notecache/update-check"
 printf 'v9.9.9' >"$notecache/update-check"
 note_run PATH="$auditbin:$failbin:$sweepbin:$PATH"
 if grep -qF 'update to the latest theme version: v9.9.9' "$note_out" \

@@ -33,6 +33,10 @@ mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 
 - Intel Mac: `theme-x86_64-apple-darwin.tar.gz` · ARM Linux:
   `theme-aarch64-unknown-linux-gnu.tar.gz`
+- The Linux binary is built against glibc and was verified on 2026-09-03,
+  x86_64 and arm64, on Ubuntu 24.04, Fedora 44 and Arch; it needs glibc 2.39
+  or newer, so distributions below that line (Ubuntu 22.04, Debian 12) and
+  musl systems such as Alpine build from source instead.
 - `~/.local/bin` must be on your `PATH`.
 - Or build from source: `cargo build --release`.
 

@@ -21,6 +21,11 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # The acceptance fixture had never run anywhere but the author's Mac,
+      # so nothing pinned the tool END TO END on the platform most of its
+      # users are on. It needs both binaries — the update sections drive the
+      # debug build's THEME_CURL seam — and costs this job seconds.
+      - run: cargo build --release --locked && cargo build --locked && THEME_BIN=target/release/theme tests/boundary.sh
   test-macos:
     runs-on: macos-latest
     timeout-minutes: 20 # a hung test must cost minutes of feedback, not 6h
