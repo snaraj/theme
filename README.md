@@ -49,6 +49,11 @@ theme list | search <terms> | preview [-w] <name> | status | update | version | 
 without recoloring the terminal) are accepted anywhere; `--mkdir <folder>`
 files a `get` download under a library subfolder of your own.
 
+macOS 14 and later keep a wallpaper per Mission Control Space, and the system
+tools change only the Space you are looking at. `theme` applies the image to
+every Space on every display and seeds the all-Spaces fallback, so Spaces you
+create later inherit it too. Your screensaver choices are left alone.
+
 ## Terminals
 
 - **kitty** — recolored live over its remote-control socket; future windows

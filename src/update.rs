@@ -383,7 +383,7 @@ fn check_dir(cfg: &Config) -> Option<rustix::fd::OwnedFd> {
 /// Root-down openat walk of an absolute, canonical path: every component
 /// opens O_NOFOLLOW|O_DIRECTORY relative to the previous fd, so a symlink
 /// racing in anywhere along the chain refuses instead of being followed.
-fn open_chain_nofollow(path: &Path) -> Option<rustix::fd::OwnedFd> {
+pub(crate) fn open_chain_nofollow(path: &Path) -> Option<rustix::fd::OwnedFd> {
     use std::path::Component;
     let mut comps = path.components();
     if comps.next() != Some(Component::RootDir) {
@@ -408,7 +408,7 @@ fn open_chain_nofollow(path: &Path) -> Option<rustix::fd::OwnedFd> {
 /// The fd-level custody predicate, pure over the stat so the foreign-owner
 /// arm is testable without root — the same trick own_socket's test uses
 /// for its unforgeable-uid branch.
-fn fd_custody_ok(st: &rustix::fs::Stat, my_uid: u32) -> bool {
+pub(crate) fn fd_custody_ok(st: &rustix::fs::Stat, my_uid: u32) -> bool {
     rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory
         && st.st_uid == my_uid
         && st.st_mode & 0o022 == 0

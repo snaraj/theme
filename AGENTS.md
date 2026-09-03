@@ -70,6 +70,7 @@ money, never trade away security.
 - The `pigment` crate emits strings and files only — it never touches a
   terminal, socket, or the desktop. Only the CLI applies state, and only
   through the documented paths (kitty socket `set-colors`, wallpaper tool,
+  the macOS per-Space wallpaper store (plutil-converted, descriptor-bound),
   OSC writes to the caller's own tty).
 - No credentials in the repo, in test fixtures, or on command lines
   (stdin-config pattern for anything secret).

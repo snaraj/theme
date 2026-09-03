@@ -51,11 +51,16 @@ pub fn set_desktop(cfg: &Config, img: &Path) {
         return;
     }
     if have("wallpaper") {
+        // The helper reaches only the ACTIVE Space of each screen, so note
+        // when it started: spaces::sync_all_spaces tells the record it wrote
+        // from an older one by that instant.
+        #[cfg(target_os = "macos")]
+        let started = std::time::SystemTime::now();
         // fill = cover the screen and crop the overflow — never letterbox.
         let filled = Command::new("wallpaper")
             .args(["set"])
             .arg(img)
-            .args(["--scale", "fill"])
+            .args(["--scale", "fill", "--screen", "all"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -63,12 +68,20 @@ pub fn set_desktop(cfg: &Config, img: &Path) {
             let plain = Command::new("wallpaper")
                 .arg("set")
                 .arg(img)
+                .args(["--screen", "all"])
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !plain {
                 die(&format!("wallpaper set failed for {}", img.display()));
             }
+        }
+        // Never fatal: the active desktop DID change and the palette must
+        // still apply, so a store we could not carry the record into is a
+        // note, not an exit.
+        #[cfg(target_os = "macos")]
+        if let Err(e) = crate::spaces::sync_all_spaces(img, started) {
+            note(&format!("could not sync the other Spaces: {e}"));
         }
     } else if std::env::var("XDG_CURRENT_DESKTOP")
         .map(|v| !v.is_empty())

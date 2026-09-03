@@ -22,6 +22,9 @@ mod report;
 mod save;
 mod scratch;
 mod search;
+/// The per-Space wallpaper store is macOS-only machinery.
+#[cfg(target_os = "macos")]
+mod spaces;
 mod ui;
 mod unsplash;
 mod update;
