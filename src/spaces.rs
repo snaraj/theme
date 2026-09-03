@@ -2558,6 +2558,121 @@ mod tests {
         }
     }
 
+    /// EVERY choice, not just the first. A helper stating several of them
+    /// is checked to the end, because [`choose`] pairs to the end: a
+    /// second choice missing a field would splice that field's old value
+    /// into the second slot of the picture exactly as the first would.
+    ///
+    /// Driven off [`SCHEMA`] so a field added to it is covered here without
+    /// anyone remembering to come back.
+    #[test]
+    fn a_later_helper_choice_is_checked_as_closely_as_the_first() {
+        // A record of two choices: the helper's, mutated in the SECOND, and
+        // the destination's, so the pair-by-index count matches and only
+        // the helper check can refuse.
+        let twice = |conf: &str, when: &str, mutate: &dyn Fn(&mut Plist)| {
+            let mut t = image(conf, when);
+            let Some(Plist::Array(cs)) = t.get_mut("Content").unwrap().get_mut("Choices") else {
+                unreachable!("the fixture is not the real Content shape")
+            };
+            cs.push(cs[0].clone());
+            mutate(&mut cs[1]);
+            t
+        };
+        let store = || {
+            d(vec![(
+                "SystemDefault",
+                d(vec![(
+                    "Desktop",
+                    twice(OLD_B64, "2026-09-01T12:30:10Z", &|_| {}),
+                )]),
+            )])
+        };
+        let helper = |mutate: &dyn Fn(&mut Plist)| twice(NEW_B64, "2026-09-03T06:44:55Z", mutate);
+        for (key, kind, _) in SCHEMA {
+            let cases = [
+                (
+                    format!("Choices[1] has no {key}"),
+                    helper(&|c| c.remove(key)),
+                ),
+                (
+                    format!("Choices[1]/{key} is not {kind}"),
+                    // Neither data, nor an array, nor a string: wrong for
+                    // every field the schema has or may grow.
+                    helper(&|c| c.set(key, Plist::Bool(true))),
+                ),
+            ];
+            for (why, template) in cases {
+                let mut tree = store();
+                let before = tree.clone();
+                let e = rewrite(&mut tree, &template).unwrap_err();
+                assert!(e.contains(&why), "{e} should have said {why}");
+                assert!(e.contains("helper"), "{e} should have said whose it is");
+                assert_eq!(tree, before, "a refusal changed the store");
+            }
+        }
+        // And the same helper with BOTH choices whole is accepted, so the
+        // refusals above are the second choice and nothing else.
+        let mut tree = store();
+        assert!(rewrite(&mut tree, &helper(&|_| {})).is_ok());
+    }
+
+    /// The helper is checked BEFORE the walk, not inside it. A store with
+    /// no destination record anywhere still gets one — the all-Spaces slot
+    /// is seeded from the helper's record whole — so a check that only ran
+    /// where a Desktop already existed would let an incomplete record be
+    /// planted in the one place every future Space inherits from.
+    #[test]
+    fn a_store_with_nothing_to_overwrite_still_refuses_a_broken_helper() {
+        // Idle records only: no Desktop anywhere, and no all-Spaces slot.
+        let bare = || {
+            d(vec![(
+                "Spaces",
+                Plist::Dict(vec![(
+                    uuid(1),
+                    d(vec![(
+                        "Default",
+                        d(vec![("Idle", idle()), ("Type", s("idle"))]),
+                    )]),
+                )]),
+            )])
+        };
+        assert!(
+            desktops(&bare()).is_empty(),
+            "the fixture has a destination after all"
+        );
+
+        let mut broken = image(NEW_B64, "2026-09-03T06:44:55Z");
+        let Some(Plist::Array(cs)) = broken.get_mut("Content").unwrap().get_mut("Choices") else {
+            unreachable!("the fixture is not the real Content shape")
+        };
+        cs[0].remove("Provider");
+
+        let mut tree = bare();
+        let before = tree.clone();
+        let e = rewrite(&mut tree, &broken).unwrap_err();
+        assert!(
+            e.contains("helper's Content/Choices[0] has no Provider"),
+            "{e}"
+        );
+        assert_eq!(tree, before, "a refusal changed the store");
+        assert!(
+            tree.get("AllSpacesAndDisplays").is_none(),
+            "an incomplete record was seeded where every Space inherits it"
+        );
+
+        // The control: the same store takes a WHOLE helper record, which is
+        // what makes the refusal above the helper's fault and not the
+        // store's.
+        let whole = image(NEW_B64, "2026-09-03T06:44:55Z");
+        let mut tree = bare();
+        assert_eq!(rewrite(&mut tree, &whole), Ok(1));
+        assert_eq!(
+            tree.get("AllSpacesAndDisplays").unwrap().get("Desktop"),
+            Some(&whole)
+        );
+    }
+
     /// The reviewer's fixture, end to end: a record whose `Files` name our
     /// image while its `Configuration` chooses another, with the whole
     /// store on disk. It is not a record of our image, the sync refuses
