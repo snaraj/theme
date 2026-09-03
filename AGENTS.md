@@ -33,7 +33,9 @@ money, never trade away security.
 
 ## Review
 
-- The receipt is a **normal issue comment**, never a `gh pr review` object.
+- The receipt is a **normal issue comment on the PR's own conversation**
+  (GitHub's `issues/<pr>/comments`; not the tracking issue), never a
+  `gh pr review` object.
   First line: `VERDICT: APPROVE head=<sha>` or
   `VERDICT: REQUEST-CHANGES head=<sha>`. The reviewer removes
   `requires-review` whichever way the verdict went.
