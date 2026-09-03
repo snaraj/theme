@@ -23,6 +23,7 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process};
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ use std::time::{Duration, SystemTime};
 const STORE: &str = "Library/Application Support/com.apple.wallpaper/Store/Index.plist";
 const PLUTIL: &str = "/usr/bin/plutil";
 const PGREP: &str = "/usr/bin/pgrep";
+const LS: &str = "/bin/ls";
 /// The store is a handful of kilobytes; four megabytes is a ceiling no
 /// legitimate one approaches, and the XML expansion gets its own.
 const MAX_STORE: u64 = 4 * 1024 * 1024;
@@ -48,13 +50,17 @@ const MAX_DEPTH: usize = 64;
 /// bytes, so both sit orders of magnitude above anything legitimate.
 const MAX_OBJECTS: usize = 4096;
 const MAX_ITEMS: usize = 1024;
-/// Total objects one blob may cost to decode. Depth and object count bound
-/// the SHAPE but not the WORK: references may be shared, so a blob whose
-/// every level points at the same few objects re-walks them once per path —
-/// exponential while still shallow, small and cycle-free. A legitimate plist
-/// visits each object about once, so sixteen visits apiece is generous cover
-/// for shared keys and values and still turns that blob into a refusal.
+/// Objects one SYNC may spend decoding, across every blob it looks at and
+/// every retry it makes. Depth and object count bound a blob's SHAPE but not
+/// the WORK it asks for: references may be shared, so a blob whose every
+/// level points at the same few objects re-walks them once per path —
+/// exponential while still shallow, small and cycle-free — and a store full
+/// of such blobs multiplies that again. A legitimate plist visits each
+/// object about once, so sixteen visits apiece is generous cover for shared
+/// keys and values; each blob is additionally held to that much of its OWN
+/// object count, so one blob cannot spend the whole sync's allowance.
 const MAX_EVALS: usize = MAX_OBJECTS * 16;
+const EVALS_PER_OBJECT: usize = 16;
 
 /// Copy the record the helper just wrote into every other slot of the store.
 /// `helper_started` is the instant BEFORE the helper ran: it is what
@@ -72,6 +78,11 @@ pub fn sync_all_spaces(img: &Path, helper_started: SystemTime) -> Result<(), Str
         Err(e) => return Err(format!("cannot look at the store: {e}")),
     }
     let dirfd = store_dir(path.parent().ok_or("the store has no folder")?)?;
+    // Asked once, before the agent is ever paused: a store this tool could
+    // not replace faithfully costs nothing to decline.
+    if let Some(why) = uncopyable(0, has_acl(&path)?) {
+        return Err(why.into());
+    }
 
     let img = std::fs::canonicalize(img).map_err(|e| format!("cannot resolve the image: {e}"))?;
     let uri = file_uri(&img);
@@ -86,20 +97,82 @@ pub fn sync_all_spaces(img: &Path, helper_started: SystemTime) -> Result<(), Str
     // at all, so it is paused only now — and the store is read AGAIN behind
     // the pause, because whatever the agent wrote between the two reads is a
     // store we never inspected.
-    let paused = Paused::new(agent_pids()?)?;
-    let (bytes, now, src) = read_store(&dirfd)?;
-    if !same_file(&now, &was) {
-        let _ = paused.release();
-        return Err("the store changed while pausing the agent".into());
-    }
-    // Transactional in memory: the rewrite is a local tree, so a refusal
-    // anywhere in it means nothing was ever handed to the writer.
-    let mut tree = parse_store(&bytes)?;
-    rewrite(&mut tree, &template)?;
-    let out = plutil("binary1", write_xml(&tree).as_bytes())?;
+    let paused = Paused::new(&Launchd, agent_pids()?)?;
+    // Everything from here to the rename is one fallible block, so there is
+    // exactly ONE exit — through `finish`, which always releases the guard
+    // and never lets a teardown failure hide what really went wrong.
+    let primary = (|| -> Result<(), String> {
+        let (bytes, now, src) = read_store(&dirfd)?;
+        if !same_file(&now, &was) {
+            return Err("the store changed while pausing the agent".into());
+        }
+        // Transactional in memory: the rewrite is a local tree, so a refusal
+        // anywhere in it means nothing was ever handed to the writer.
+        let mut tree = parse_store(&bytes)?;
+        rewrite(&mut tree, &template)?;
+        let out = plutil("binary1", write_xml(&tree).as_bytes())?;
+        replace_store(&dirfd, &src, &now, &out)
+    })();
+    finish(paused, primary)
+}
 
-    replace_store(&dirfd, &src, &now, &out)?;
-    paused.release()
+/// Release the guard and report BOTH halves. A teardown failure may never
+/// replace the reason we were tearing down, and may never be swallowed
+/// either: a store written behind an agent that would not resume is still a
+/// desktop that does not repaint.
+fn finish(paused: Paused, primary: Result<(), String>) -> Result<(), String> {
+    match (primary, paused.release()) {
+        (Ok(()), cleanup) => cleanup,
+        (Err(e), Ok(())) => Err(e),
+        (Err(e), Err(c)) => Err(format!(
+            "{e}; and the wallpaper agent could not be resumed: {c}"
+        )),
+    }
+}
+
+/// Metadata a replacement could not carry, or nothing. BSD flags need
+/// chflags and an ACL needs acl(3): neither has a safe binding here, and
+/// this crate denies unsafe code. Losing either silently would be the real
+/// failure, so the store is refused instead — the honest alternative to
+/// unsafe FFI. A stock store carries neither. Pure over its inputs so both
+/// arms are testable without root, the way `fd_custody_ok` is.
+fn uncopyable(flags: u32, acl: bool) -> Option<&'static str> {
+    match (flags != 0, acl) {
+        (true, _) => Some("the store carries BSD flags this tool does not copy"),
+        (_, true) => Some("the store carries an ACL this tool does not copy"),
+        _ => None,
+    }
+}
+
+/// Is an ACL attached? macOS gives up this answer grudgingly: the
+/// `com.apple.system.Security` pseudo-attribute is EPERM to read whether or
+/// not an ACL exists (measured both ways, so it can distinguish nothing),
+/// `flistxattr` never lists it, and acl(3) needs unsafe FFI. What is left
+/// is Apple's own interrogator, reached exactly as the library audit
+/// reaches it — absolute path, root-owned binary, empty environment — which
+/// prints one numbered ACE line per entry. The PATH here is advisory only:
+/// it decides whether to proceed, never where to write, and the replacement
+/// stays bound to the descriptor the store was read through.
+fn has_acl(path: &Path) -> Result<bool, String> {
+    if !trusted_system_binary(LS) {
+        return Err("no trusted /bin/ls to check the store for an ACL".into());
+    }
+    let out = trusted_spawn(Path::new(LS))
+        .arg("-lde")
+        .arg(path)
+        .output()
+        .map_err(|e| format!("cannot check the store for an ACL: {e}"))?;
+    if !out.status.success() {
+        return Err("cannot check the store for an ACL: ls -lde failed".into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).lines().any(ace_line))
+}
+
+/// `N: <who> allow|deny <perms>` — the shape `ls -lde` gives each entry,
+/// and the one thing that separates an ACL'd file from a plain one.
+fn ace_line(l: &str) -> bool {
+    matches!(l.trim_start().split_once(':'),
+        Some((n, _)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The same file, by identity AND content age: nothing about the store may
@@ -144,17 +217,21 @@ fn load(
     cutoff: i64,
     name: &str,
 ) -> Result<(rustix::fs::Stat, Plist), String> {
+    // ONE allowance for the whole sync — every attempt, every record, every
+    // blob draws on it, so twenty-one retries over a hostile store cannot
+    // multiply the bound by twenty-one.
+    let budget = Cell::new(MAX_EVALS);
     for attempt in 0..=TRIES {
         let (bytes, st, _) = read_store(dirfd)?;
         let tree = parse_store(&bytes)?;
-        if let Some(t) = template(&tree, uri, Some(cutoff)) {
+        if let Some(t) = template(&tree, uri, Some(cutoff), &budget) {
             return Ok((st, t));
         }
         if attempt == TRIES {
             // Only the DATE is ever relaxed: an older record of this image
             // may carry a run-behind fill mode, but it is still this image.
             // Fail closed rather than copy somebody else's wallpaper.
-            let t = template(&tree, uri, None).ok_or_else(|| {
+            let t = template(&tree, uri, None, &budget).ok_or_else(|| {
                 format!("the wallpaper helper did not record {name} in the store")
             })?;
             return Ok((st, t));
@@ -183,6 +260,12 @@ fn read_store(dirfd: &OwnedFd) -> Result<(Vec<u8>, rustix::fs::Stat, OwnedFd), S
         || st.st_size as u64 > MAX_STORE
     {
         return Err("the store is not a plain unshared file you alone own".into());
+    }
+    // Judged HERE, before the agent is ever paused, so a store we cannot
+    // faithfully replace costs nothing to refuse. (The ACL half of the
+    // question needs a path and is asked once, in `sync_all_spaces`.)
+    if let Some(why) = uncopyable(st.st_flags, false) {
+        return Err(why.into());
     }
     let mut bytes = Vec::new();
     let mut f = std::fs::File::from(fd);
@@ -600,7 +683,7 @@ fn be(b: &[u8]) -> Option<usize> {
 /// exactly — null, uid, fill, which XML plists have no syntax for — refuse
 /// rather than decode into a lie. A refusal is never a match, which is the
 /// direction that fails closed.
-fn bplist(blob: &[u8]) -> Option<Plist> {
+fn bplist<'a>(blob: &'a [u8], budget: &'a Cell<usize>) -> Option<Plist> {
     if !blob.starts_with(b"bplist00") || blob.len() < 40 {
         return None;
     }
@@ -629,7 +712,8 @@ fn bplist(blob: &[u8]) -> Option<Plist> {
         b: blob,
         offsets,
         ref_size,
-        budget: Cell::new(MAX_EVALS),
+        mine: Cell::new(count.checked_mul(EVALS_PER_OBJECT)?),
+        shared: budget,
     }
     .object(top, 0)
 }
@@ -638,8 +722,11 @@ struct Bin<'a> {
     b: &'a [u8],
     offsets: Vec<usize>,
     ref_size: usize,
-    /// What is left of [`MAX_EVALS`], spent across the whole decode.
-    budget: Cell<usize>,
+    /// This blob's own allowance, its object count times
+    /// [`EVALS_PER_OBJECT`] — so one blob cannot spend the sync's.
+    mine: Cell<usize>,
+    /// What is left of [`MAX_EVALS`] for the whole sync.
+    shared: &'a Cell<usize>,
 }
 
 impl Bin<'_> {
@@ -649,7 +736,10 @@ impl Bin<'_> {
         }
         // One budget for the entire decode, not per branch: that is what
         // makes a fan-out blob cost arithmetic rather than exponential work.
-        self.budget.set(self.budget.get().checked_sub(1)?);
+        // And one for the whole sync above it, so a STORE full of such blobs
+        // cannot multiply the bound by its slot count.
+        self.mine.set(self.mine.get().checked_sub(1)?);
+        self.shared.set(self.shared.get().checked_sub(1)?);
         let at = *self.offsets.get(idx)?;
         let marker = *self.b.get(at)?;
         let low = (marker & 0x0F) as usize;
@@ -832,7 +922,12 @@ fn desktops<'a>(v: &'a Plist, out: &mut Vec<&'a Plist>) {
 /// to contain. A record can mention a path in a field that does not choose
 /// it, so anything short of parsing attributes the wrong wallpaper. Older
 /// builds put the path in `Files` as plain text instead, already exact.
-fn names(rec: &Plist, uri: &str) -> bool {
+fn names<'a>(
+    rec: &'a Plist,
+    uri: &str,
+    memo: &mut HashMap<&'a str, bool>,
+    budget: &Cell<usize>,
+) -> bool {
     let choice = match rec.get("Content").and_then(|c| c.get("Choices")) {
         Some(Plist::Array(a)) => match a.first() {
             Some(c) => c,
@@ -840,27 +935,57 @@ fn names(rec: &Plist, uri: &str) -> bool {
         },
         _ => return false,
     };
-    if let Some(Plist::Data(b64)) = choice.get("Configuration")
-        && let Some(bytes) = b64_decode(b64)
-        && let Some(conf) = bplist(&bytes)
-        && matches!(conf.get("type"), Some(Plist::String(t)) if t == "imageFile")
-        && matches!(conf.get("url").and_then(|u| u.get("relative")),
-                    Some(Plist::String(r)) if r == uri)
-    {
-        return true;
+    // Slots repeat the same blob across every Space and display, so one scan
+    // parses each distinct Configuration once however many carry it.
+    if let Some(Plist::Data(b64)) = choice.get("Configuration") {
+        let hit = match memo.get(b64.as_str()) {
+            Some(&known) => known,
+            None => {
+                let hit = chooses(b64, uri, budget);
+                memo.insert(b64.as_str(), hit);
+                hit
+            }
+        };
+        if hit {
+            return true;
+        }
     }
     matches!(choice.get("Files"), Some(Plist::Array(fs))
         if fs.iter().any(|f| matches!(f.get("relative"), Some(Plist::String(r)) if r == uri)))
 }
 
+/// Does this Configuration blob CHOOSE `uri`? A blob that does not contain
+/// the bytes anywhere cannot name them, and that test costs a scan rather
+/// than a parse — so it stands in front of the decode as a gate. The decode
+/// is still what decides.
+fn chooses(b64: &str, uri: &str, budget: &Cell<usize>) -> bool {
+    let Some(bytes) = b64_decode(b64) else {
+        return false;
+    };
+    if !bytes.windows(uri.len()).any(|w| w == uri.as_bytes()) {
+        return false;
+    }
+    let Some(conf) = bplist(&bytes, budget) else {
+        return false;
+    };
+    matches!(conf.get("type"), Some(Plist::String(t)) if t == "imageFile")
+        && matches!(conf.get("url").and_then(|u| u.get("relative")),
+                    Some(Plist::String(r)) if r == uri)
+}
+
 /// The freshest record of this image, or nothing. `after` is the helper's
 /// start: with it, only a record the helper itself could have written
 /// qualifies; without it, any record OF THE IMAGE will do — never another.
-fn template(tree: &Plist, uri: &str, after: Option<i64>) -> Option<Plist> {
+///
+/// The filters run cheapest-first, and that ordering is load-bearing: the
+/// date is a field already in hand, attribution is a parse of somebody
+/// else's bytes. A store whose records are all stale must cost no decodes
+/// at all.
+fn template(tree: &Plist, uri: &str, after: Option<i64>, budget: &Cell<usize>) -> Option<Plist> {
     let mut all = Vec::new();
     desktops(tree, &mut all);
+    let mut memo = HashMap::new();
     all.into_iter()
-        .filter(|r| names(r, uri))
         .filter_map(|r| {
             let set = match r.get("LastSet") {
                 Some(Plist::Date(d)) => date_secs(d),
@@ -872,6 +997,7 @@ fn template(tree: &Plist, uri: &str, after: Option<i64>) -> Option<Plist> {
                 (None, t) => Some((t.unwrap_or(i64::MIN), r)),
             }
         })
+        .filter(|(_, r)| names(r, uri, &mut memo, budget))
         .max_by_key(|(t, _)| *t)
         .map(|(_, r)| r.clone())
 }
@@ -1008,16 +1134,23 @@ fn replace_store(
     let (tmp, fd) = made.ok_or("the store folder is full of stale theme temporaries")?;
     let name = tmp.as_str();
     let done = (move || -> Result<(), String> {
-        // umask filters open(2)'s mode but never fchmod(2), so the exact
-        // permission bits are set through the descriptor afterwards.
-        rustix::fs::fchmod(&fd, Mode::from_raw_mode(was.st_mode & 0o7777))
-            .map_err(|e| format!("cannot set the store's mode: {e}"))?;
-        // The group travels with the file; the owner stays us. A refusal is
-        // only tolerable when the group is already right.
+        // Group FIRST: a chown may clear setuid/setgid bits, so the mode has
+        // to be the LAST of the two if it is to stick. The owner stays us;
+        // a refusal is only tolerable when the group is already right.
         if let Err(e) = rustix::fs::fchown(&fd, None, Some(rustix::fs::Gid::from_raw(was.st_gid)))
             && !(e == Errno::PERM && rustix::fs::fstat(&fd).map(|s| s.st_gid) == Ok(was.st_gid))
         {
             return Err(format!("cannot set the store's group: {e}"));
+        }
+        // umask filters open(2)'s mode but never fchmod(2), so the exact
+        // permission bits are set through the descriptor.
+        rustix::fs::fchmod(&fd, Mode::from_raw_mode(was.st_mode & 0o7777))
+            .map_err(|e| format!("cannot set the store's mode: {e}"))?;
+        // Neither call is taken on trust: the replacement must ALREADY be
+        // the file it is about to become before the rename makes it so.
+        let got = rustix::fs::fstat(&fd).map_err(|e| format!("cannot re-check the temp: {e}"))?;
+        if (got.st_mode & 0o7777, got.st_gid) != (was.st_mode & 0o7777, was.st_gid) {
+            return Err("the replacement did not take the store's mode and group".into());
         }
         copy_xattrs(src, &fd)?;
         let mut f = std::fs::File::from(fd);
@@ -1100,29 +1233,56 @@ fn agent_pids() -> Result<Vec<Pid>, String> {
         .collect()
 }
 
+/// Everything the guard does to the world outside this process, behind one
+/// seam — so every failure path below is exercised by tests that need no
+/// victim process and send no real signal.
+trait Agent {
+    fn signal(&self, pid: Pid, sig: Signal) -> Result<(), Errno>;
+    fn running(&self) -> Result<Vec<Pid>, String>;
+    /// Signal 0: asks whether a pid is still there without touching it.
+    fn alive(&self, pid: Pid) -> bool;
+}
+
+struct Launchd;
+
+impl Agent for Launchd {
+    fn signal(&self, pid: Pid, sig: Signal) -> Result<(), Errno> {
+        kill_process(pid, sig)
+    }
+    fn running(&self) -> Result<Vec<Pid>, String> {
+        agent_pids()
+    }
+    fn alive(&self, pid: Pid) -> bool {
+        rustix::process::test_kill_process(pid).is_ok()
+    }
+}
+
 /// SIGSTOP across the write so the agent cannot rewrite the store mid
 /// transaction — and a guard rather than a pair of calls, because every
 /// early exit owes it a SIGCONT.
-struct Paused(Vec<Pid>);
+struct Paused<'a> {
+    held: Vec<Pid>,
+    agent: &'a dyn Agent,
+}
 
-impl Paused {
+impl<'a> Paused<'a> {
     /// Only pids that ACTUALLY stopped are held: one that vanished (ESRCH)
     /// was never ours to resume, and any other refusal means we cannot hold
     /// the store still at all — so the ones already stopped are resumed and
     /// nothing is written.
-    fn new(pids: Vec<Pid>) -> Result<Paused, String> {
+    fn new(agent: &'a dyn Agent, pids: Vec<Pid>) -> Result<Paused<'a>, String> {
         let mut held = Vec::new();
         for p in pids {
-            match kill_process(p, Signal::STOP) {
+            match agent.signal(p, Signal::STOP) {
                 Ok(()) => held.push(p),
                 Err(Errno::SRCH) => {}
                 Err(e) => {
-                    drop(Paused(held));
+                    drop(Paused { held, agent });
                     return Err(format!("cannot pause the wallpaper agent: {e}"));
                 }
             }
         }
-        Ok(Paused(held))
+        Ok(Paused { held, agent })
     }
 
     /// Resume, then ask the agent to reload. Both are checked against a
@@ -1133,18 +1293,18 @@ impl Paused {
     /// excuse and is skipped instead. A pid that would not resume stays in
     /// the guard, so Drop tries once more.
     fn release(mut self) -> Result<(), String> {
-        let fresh = agent_pids();
-        let held = std::mem::take(&mut self.0);
+        let fresh = self.agent.running();
+        let held = std::mem::take(&mut self.held);
         let mut stuck = Vec::new();
         {
             let known = fresh.as_ref().ok();
             let mine = |p: &Pid| known.is_none_or(|l| l.contains(p));
             for p in held.iter().copied().filter(mine) {
-                if let Err(e) = kill_process(p, Signal::CONT)
+                if let Err(e) = self.agent.signal(p, Signal::CONT)
                     && e != Errno::SRCH
                 {
                     stuck.push(format!("{} ({e})", p.as_raw_nonzero()));
-                    self.0.push(p);
+                    self.held.push(p);
                 }
             }
         }
@@ -1156,15 +1316,17 @@ impl Paused {
         }
         let live = fresh?;
         let still: Vec<Pid> = held.into_iter().filter(|p| live.contains(p)).collect();
-        reload_agent(&still);
-        Ok(())
+        reload_agent(self.agent, &still)
     }
 }
 
-impl Drop for Paused {
+/// Best effort, for a PANIC only: every ordinary exit after the pause goes
+/// through [`finish`], which releases explicitly and reports what failed.
+/// An unwinding stack has nobody left to report to, so it just tries.
+impl Drop for Paused<'_> {
     fn drop(&mut self) {
-        for p in &self.0 {
-            let _ = kill_process(*p, Signal::CONT);
+        for p in &self.held {
+            let _ = self.agent.signal(*p, Signal::CONT);
         }
     }
 }
@@ -1172,10 +1334,35 @@ impl Drop for Paused {
 /// Nothing documents a hot reload of the store, and every recipe that works
 /// restarts the agent instead: launchd brings it straight back (keepalive 0,
 /// on demand) and it reads what we just wrote. ESRCH is not a failure — the
-/// agent may already be gone.
-fn reload_agent(pids: &[Pid]) {
+/// agent may already be gone — but any other refusal is, and so is an agent
+/// that is STILL there a second later: the file we wrote would go unread, or
+/// be overwritten from the memory of the process that never reloaded it.
+fn reload_agent(agent: &dyn Agent, pids: &[Pid]) -> Result<(), String> {
     for p in pids {
-        let _ = kill_process(*p, Signal::TERM);
+        if let Err(e) = agent.signal(*p, Signal::TERM)
+            && e != Errno::SRCH
+        {
+            return Err(format!(
+                "cannot restart the wallpaper agent (pid {}): {e}",
+                p.as_raw_nonzero()
+            ));
+        }
+    }
+    // Signal 0 rather than pgrep: launchd relaunches the agent on demand, so
+    // by the time we look a NEW pid may already answer to the name. Only the
+    // pids we actually signalled are watched out.
+    for _ in 0..20 {
+        if !pids.iter().any(|p| agent.alive(*p)) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    match pids.iter().find(|p| agent.alive(**p)) {
+        Some(p) => Err(format!(
+            "the wallpaper agent did not exit after SIGTERM (pid {})",
+            p.as_raw_nonzero()
+        )),
+        None => Ok(()),
     }
 }
 
@@ -1291,6 +1478,11 @@ mod tests {
         "LAAAAAAAAAEBAAAAAAAAAAcAAAAAAAAAAAAAAAAAAABX",
     );
     const AERIALS: &str = "com.apple.wallpaper.choice.aerials";
+
+    /// A sync's worth of decoding allowance, for a test that only needs one.
+    fn budget() -> Cell<usize> {
+        Cell::new(MAX_EVALS)
+    }
 
     fn d(items: Vec<(&str, Plist)>) -> Plist {
         Plist::Dict(items.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
@@ -1472,7 +1664,7 @@ mod tests {
             // A newer record of a DIFFERENT image must never win.
             ("D", slot(image(OLD_B64, "2026-09-03T06:44:59Z"))),
         ]);
-        let won = template(&tree, NEW_URI, Some(floor)).unwrap();
+        let won = template(&tree, NEW_URI, Some(floor), &budget()).unwrap();
         assert_eq!(
             won.get("LastSet"),
             Some(&Plist::Date("2026-09-03T06:44:55Z".into()))
@@ -1480,17 +1672,17 @@ mod tests {
 
         // The Files shape on its own still qualifies.
         let only_files = slot(by_files("2026-09-03T06:44:52Z"));
-        assert!(template(&only_files, NEW_URI, Some(floor)).is_some());
+        assert!(template(&only_files, NEW_URI, Some(floor), &budget()).is_some());
 
         // Another image never qualifies, whatever its date.
         let other = slot(image(OLD_B64, "2026-09-03T06:44:59Z"));
-        assert!(template(&other, NEW_URI, Some(floor)).is_none());
+        assert!(template(&other, NEW_URI, Some(floor), &budget()).is_none());
 
         // A record older than the helper's run is skipped — until the
         // patience runs out and the date stops being a requirement.
         let stale = slot(image(NEW_B64, "2026-09-01T00:00:00Z"));
-        assert!(template(&stale, NEW_URI, Some(floor)).is_none());
-        assert!(template(&stale, NEW_URI, None).is_some());
+        assert!(template(&stale, NEW_URI, Some(floor), &budget()).is_none());
+        assert!(template(&stale, NEW_URI, None, &budget()).is_some());
     }
 
     /// Fail closed: only the DATE is ever relaxed. A record the helper
@@ -1505,11 +1697,11 @@ mod tests {
             ("Stale", slot(image(NEW_B64, stale))),
             ("Fresh", slot(image(OLD_B64, fresh))),
         ]);
-        assert!(template(&tree, NEW_URI, Some(floor)).is_none());
-        let ours = template(&tree, NEW_URI, None);
+        assert!(template(&tree, NEW_URI, Some(floor), &budget()).is_none());
+        let ours = template(&tree, NEW_URI, None, &budget());
         assert_eq!(ours, Some(image(NEW_B64, stale)));
         let none = d(vec![("Fresh", slot(image(OLD_B64, fresh)))]);
-        assert!(template(&none, NEW_URI, None).is_none());
+        assert!(template(&none, NEW_URI, None, &budget()).is_none());
     }
 
     /// Attribution reads the Configuration's FIELDS. Mentioning our URI
@@ -1517,14 +1709,16 @@ mod tests {
     /// in the right field as the wrong kind of object.
     #[test]
     fn only_the_chosen_url_attributes_a_record() {
-        let slot = |b64: &str| rec(IMAGE, b64, Plist::Array(vec![]), "2026-09-03T06:44:55Z");
-        assert!(names(&slot(NEW_B64), NEW_URI));
-        assert!(!names(&slot(OLD_B64), NEW_URI));
+        assert!(chooses(NEW_B64, NEW_URI, &budget()));
+        assert!(!chooses(OLD_B64, NEW_URI, &budget()));
         // A valid plist naming a different file, with our URI sitting in an
         // unrelated field.
-        assert!(!names(&slot(DECOY_B64), NEW_URI));
+        assert!(!chooses(DECOY_B64, NEW_URI, &budget()));
         // url.relative holding the URI's BYTES rather than the string.
-        assert!(!names(&slot(INDATA_B64), NEW_URI));
+        assert!(!chooses(INDATA_B64, NEW_URI, &budget()));
+        // And through the record, memo and all.
+        let slot = rec(IMAGE, NEW_B64, Plist::Array(vec![]), "2026-09-03T06:44:55Z");
+        assert!(names(&slot, NEW_URI, &mut HashMap::new(), &budget()));
         // The decoy really does contain our URI — the old substring test
         // would have taken it.
         assert!(
@@ -1540,7 +1734,7 @@ mod tests {
     #[test]
     fn hostile_bplists_refuse_without_panicking() {
         let good = b64_decode(NEW_B64).unwrap();
-        assert!(bplist(&good).is_some());
+        assert!(bplist(&good, &budget()).is_some());
         let patch = |at: usize, with: &[u8]| {
             let mut b = good.clone();
             b[at..at + with.len()].copy_from_slice(with);
@@ -1576,7 +1770,11 @@ mod tests {
             .concat(),
         ];
         for bad in cases {
-            assert!(bplist(&bad).is_none(), "accepted {} bytes", bad.len());
+            assert!(
+                bplist(&bad, &budget()).is_none(),
+                "accepted {} bytes",
+                bad.len()
+            );
         }
     }
 
@@ -1602,7 +1800,10 @@ mod tests {
     /// string at the bottom. Built by hand because the shape that costs
     /// exponential work — small, shallow, cycle-free, and all fan-out — is
     /// not one plutil would ever write.
-    fn fanout(levels: usize, fan: usize) -> Vec<u8> {
+    /// `bottom` is the string the deepest level holds — a caller varies it
+    /// to make blobs identical in cost but distinct in text, or to put the
+    /// URI's bytes inside one so the substring gate lets it reach a decode.
+    fn fanout(levels: usize, fan: usize, bottom: &str) -> Vec<u8> {
         let mut b: Vec<u8> = b"bplist00".to_vec();
         let mut offsets = Vec::new();
         for i in 0..levels {
@@ -1614,7 +1815,12 @@ mod tests {
             b.extend(std::iter::repeat_n(i as u8 + 1, fan));
         }
         offsets.push(b.len());
-        b.extend_from_slice(&[0x51, b'x']);
+        let s = bottom.as_bytes();
+        match s.len() {
+            0..15 => b.push(0x50 | s.len() as u8),
+            _ => b.extend_from_slice(&[0x5F, 0x10, s.len() as u8]),
+        }
+        b.extend_from_slice(s);
         let table = b.len();
         for o in &offsets {
             b.extend_from_slice(&(*o as u16).to_be_bytes());
@@ -1634,14 +1840,220 @@ mod tests {
     fn a_fan_out_blob_exhausts_the_budget_instead_of_the_machine() {
         // The builder really does emit decodable blobs, fan-out and all —
         // so the refusal below is the budget, not a malformed fixture.
-        let small = bplist(&fanout(3, 4)).unwrap();
-        assert!(matches!(&small, Plist::Array(a) if a.len() == 4));
-        assert!(bplist(&fanout(6, 32)).is_none());
-        let chain = bplist(&fanout(6, 1)).unwrap();
+        let small = bplist(&fanout(2, 3, "x"), &budget()).unwrap();
+        assert!(matches!(&small, Plist::Array(a) if a.len() == 3));
+        assert!(bplist(&fanout(6, 32, "x"), &budget()).is_none());
+        let chain = bplist(&fanout(6, 1, "x"), &budget()).unwrap();
         assert_eq!(
             chain,
             (0..6).fold(Plist::String("x".into()), |v, _| Plist::Array(vec![v]))
         );
+        // Its OWN allowance stops it long before the sync's: seven objects
+        // buy 112 evaluations, so one blob cannot spend the store's.
+        let shared = budget();
+        assert!(bplist(&fanout(6, 32, "x"), &shared).is_none());
+        assert!(MAX_EVALS - shared.get() <= 7 * EVALS_PER_OBJECT);
+    }
+
+    /// A store can multiply a bounded blob by its slot count, so the whole
+    /// scan is bounded too — and the cheap filters must run first, or a
+    /// store of stale records would pay for a parse it never needed.
+    #[test]
+    fn a_store_full_of_hostile_records_is_bounded_and_decodes_nothing_stale() {
+        // Each slot carries a DISTINCT fan-out blob, so the memo cannot mask
+        // the bound; 512 of them, far past any real store. Each holds the
+        // URI's bytes at the bottom, so the substring gate lets every one
+        // through to a decode that then has to be stopped.
+        let hostile = |i: usize| b64_encode(&fanout(6, 32, &format!("{NEW_URI}{i}")));
+        let store = |when: &str, blob: &dyn Fn(usize) -> String| {
+            Plist::Dict(
+                (0..512)
+                    .map(|i| {
+                        let r = rec(IMAGE, &blob(i), Plist::Array(vec![]), when);
+                        (format!("S{i}"), d(vec![("Desktop", r)]))
+                    })
+                    .collect(),
+            )
+        };
+        let floor = date_secs("2026-09-03T06:44:45Z").unwrap();
+
+        let fresh = store("2026-09-03T06:44:55Z", &hostile);
+        let spent = budget();
+        let started = std::time::Instant::now();
+        assert!(template(&fresh, NEW_URI, Some(floor), &spent).is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the scan was not bounded: {:?}",
+            started.elapsed()
+        );
+        assert!(spent.get() < MAX_EVALS, "nothing was decoded at all");
+
+        // The same store, stale. The date filter comes first, so the
+        // allowance is untouched: not one blob was parsed.
+        let stale = store("2026-09-01T00:00:00Z", &hostile);
+        let untouched = budget();
+        assert!(template(&stale, NEW_URI, Some(floor), &untouched).is_none());
+        assert_eq!(untouched.get(), MAX_EVALS, "a stale record was decoded");
+
+        // And identical blobs are parsed once however many slots carry them.
+        let same = store("2026-09-03T06:44:55Z", &|_| {
+            b64_encode(&fanout(6, 32, NEW_URI))
+        });
+        let memoized = budget();
+        assert!(template(&same, NEW_URI, Some(floor), &memoized).is_none());
+        assert!(
+            MAX_EVALS - memoized.get() < (MAX_EVALS - spent.get()) / 100,
+            "the memo did not collapse identical blobs"
+        );
+    }
+
+    /// A signal sender and pid lister that touches no real process, so
+    /// every teardown failure gets a test instead of a victim.
+    struct Fake {
+        fails: Option<(i32, Signal)>,
+        live: Vec<Pid>,
+        log: std::cell::RefCell<Vec<(i32, i32)>>,
+    }
+
+    impl Fake {
+        fn new(live: &[i32], fails: Option<(i32, Signal)>) -> Fake {
+            Fake {
+                fails,
+                live: live.iter().map(|p| pid(*p)).collect(),
+                log: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+        fn sent(&self) -> Vec<(i32, i32)> {
+            self.log.borrow().clone()
+        }
+    }
+
+    impl Agent for Fake {
+        fn signal(&self, p: Pid, sig: Signal) -> Result<(), Errno> {
+            let raw = p.as_raw_nonzero().get();
+            self.log.borrow_mut().push((raw, sig.as_raw()));
+            match self.fails {
+                Some((f, s)) if f == raw && s == sig => Err(Errno::PERM),
+                _ => Ok(()),
+            }
+        }
+        fn running(&self) -> Result<Vec<Pid>, String> {
+            Ok(self.live.clone())
+        }
+        /// Nothing outlives a TERM here, so the restart wait never sleeps.
+        fn alive(&self, _p: Pid) -> bool {
+            false
+        }
+    }
+
+    fn pid(n: i32) -> Pid {
+        Pid::from_raw(n).unwrap()
+    }
+
+    fn sig(s: Signal) -> i32 {
+        s.as_raw()
+    }
+
+    /// Every teardown failure is explicit and reaches the caller: a pause
+    /// that only half succeeded resumes what it stopped, a resume that fails
+    /// names the pid and keeps it for Drop, and a restart that fails is not
+    /// passed off as a clean release.
+    #[test]
+    fn a_failed_pause_resume_or_restart_is_reported() {
+        // STOP refused on the second pid: the first is resumed and nothing
+        // is held, so no write ever begins.
+        let f = Fake::new(&[1, 2], Some((2, Signal::STOP)));
+        let Err(e) = Paused::new(&f, vec![pid(1), pid(2)]) else {
+            panic!("a refused STOP must not yield a guard");
+        };
+        assert!(e.contains("cannot pause"), "{e}");
+        assert_eq!(
+            f.sent(),
+            [
+                (1, sig(Signal::STOP)),
+                (2, sig(Signal::STOP)),
+                (1, sig(Signal::CONT))
+            ]
+        );
+
+        // CONT refused: release names the pid, and the pid stays in the
+        // guard so Drop tries once more.
+        let f = Fake::new(&[1], Some((1, Signal::CONT)));
+        let e = Paused::new(&f, vec![pid(1)])
+            .unwrap()
+            .release()
+            .unwrap_err();
+        assert!(e.contains("still paused (pid 1"), "{e}");
+        assert_eq!(
+            f.sent()
+                .iter()
+                .filter(|(_, s)| *s == sig(Signal::CONT))
+                .count(),
+            2
+        );
+
+        // TERM refused: the restart failure surfaces.
+        let f = Fake::new(&[1], Some((1, Signal::TERM)));
+        let e = Paused::new(&f, vec![pid(1)])
+            .unwrap()
+            .release()
+            .unwrap_err();
+        assert!(e.contains("cannot restart"), "{e}");
+
+        // And a clean run stops, resumes and restarts, in that order.
+        let f = Fake::new(&[1], None);
+        Paused::new(&f, vec![pid(1)]).unwrap().release().unwrap();
+        assert_eq!(
+            f.sent(),
+            [
+                (1, sig(Signal::STOP)),
+                (1, sig(Signal::CONT)),
+                (1, sig(Signal::TERM))
+            ]
+        );
+    }
+
+    /// A teardown failure never replaces the reason we were tearing down,
+    /// and a clean run never swallows one.
+    #[test]
+    fn finish_reports_both_halves() {
+        let f = Fake::new(&[1], Some((1, Signal::CONT)));
+        let g = Paused::new(&f, vec![pid(1)]).unwrap();
+        let both = finish(g, Err("the write failed".into())).unwrap_err();
+        assert!(
+            both.starts_with("the write failed; and the wallpaper agent could not be resumed: "),
+            "{both}"
+        );
+
+        let f = Fake::new(&[1], Some((1, Signal::CONT)));
+        let g = Paused::new(&f, vec![pid(1)]).unwrap();
+        assert!(finish(g, Ok(())).unwrap_err().contains("still paused"));
+
+        let f = Fake::new(&[1], None);
+        let g = Paused::new(&f, vec![pid(1)]).unwrap();
+        assert!(finish(g, Ok(())).is_ok());
+    }
+
+    /// Metadata this tool cannot carry is refused, never lost quietly.
+    #[test]
+    fn uncopyable_metadata_is_refused() {
+        assert_eq!(uncopyable(0, false), None);
+        assert!(uncopyable(0, true).unwrap().contains("ACL"));
+        // UF_IMMUTABLE, and any other flag.
+        assert!(uncopyable(0x2, false).unwrap().contains("BSD flags"));
+        assert!(uncopyable(0x40000, false).is_some());
+        // Flags are named first when a store carries both.
+        assert!(uncopyable(0x2, true).unwrap().contains("BSD flags"));
+
+        // The ACE lines `ls -lde` prints, and the header line it prints
+        // first — which carries a ':' of its own in the timestamp.
+        assert!(ace_line(" 0: group:everyone deny delete"));
+        assert!(ace_line("12: user:samuel allow read"));
+        assert!(!ace_line(
+            "-rw-r--r--@ 1 samuel  staff  6595 Sep  3 01:47 Index.plist"
+        ));
+        assert!(!ace_line(""));
+        assert!(!ace_line("no colon here"));
     }
 
     /// A store with no all-Spaces slot gets one, and it must say what it is:
