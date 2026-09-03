@@ -21,7 +21,6 @@
 use crate::save::{trusted_spawn, trusted_system_binary};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
-use rustix::process::{Pid, Signal, kill_process};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -32,8 +31,13 @@ use std::time::{Duration, SystemTime};
 
 const STORE: &str = "Library/Application Support/com.apple.wallpaper/Store/Index.plist";
 const PLUTIL: &str = "/usr/bin/plutil";
-const PGREP: &str = "/usr/bin/pgrep";
+const LAUNCHCTL: &str = "/bin/launchctl";
 const LS: &str = "/bin/ls";
+/// The agent is a launchd SERVICE — `gui/<uid>/com.apple.wallpaper.agent`,
+/// a LaunchAgent running WallpaperAgent.app. Coordinating with the service
+/// rather than with a pid is what makes the handshake atomic: launchd
+/// relaunches it on demand, so a pid is only ever a snapshot.
+const SERVICE: &str = "com.apple.wallpaper.agent";
 /// The store is a handful of kilobytes; four megabytes is a ceiling no
 /// legitimate one approaches, and the XML expansion gets its own.
 const MAX_STORE: u64 = 4 * 1024 * 1024;
@@ -78,11 +82,6 @@ pub fn sync_all_spaces(img: &Path, helper_started: SystemTime) -> Result<(), Str
         Err(e) => return Err(format!("cannot look at the store: {e}")),
     }
     let dirfd = store_dir(path.parent().ok_or("the store has no folder")?)?;
-    // Asked once, before the agent is ever paused: a store this tool could
-    // not replace faithfully costs nothing to decline.
-    if let Some(why) = uncopyable(0, has_acl(&path)?) {
-        return Err(why.into());
-    }
 
     let img = std::fs::canonicalize(img).map_err(|e| format!("cannot resolve the image: {e}"))?;
     let uri = file_uri(&img);
@@ -91,29 +90,90 @@ pub fn sync_all_spaces(img: &Path, helper_started: SystemTime) -> Result<(), Str
         .map(|d| d.as_secs() as i64 - 2)
         .unwrap_or(i64::MIN);
     let name = img.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let (was, template) = load(&dirfd, &uri, cutoff, name)?;
+    sync_with(&Launchd, &has_acl, &dirfd, &path, &uri, cutoff, name)
+}
 
+/// The transaction proper, over its two seams — the agent and the ACL probe
+/// — so the whole sequence has tests that neither reach launchd nor go near
+/// a real store.
+fn sync_with(
+    agent: &dyn Agent,
+    probe: &dyn Fn(&Path) -> Result<bool, String>,
+    dirfd: &OwnedFd,
+    path: &Path,
+    uri: &str,
+    cutoff: i64,
+    name: &str,
+) -> Result<(), String> {
+    // Which INSTANCE of the service we are transacting with, before anything
+    // else happens. If a different one is running by the time we come to
+    // rename, the agent died and relaunched mid-flight — and a fresh agent
+    // holds the old store in memory, so our write would be overwritten.
+    let first = agent.pid()?;
     // The agent has to be RUNNING for the helper's record to reach the store
-    // at all, so it is paused only now — and the store is read AGAIN behind
-    // the pause, because whatever the agent wrote between the two reads is a
-    // store we never inspected.
-    let paused = Paused::new(&Launchd, agent_pids()?)?;
+    // at all, so it is paused only after that record is found.
+    let (was, template) = load(dirfd, uri, cutoff, name)?;
+    let paused = Paused::new(agent)?;
     // Everything from here to the rename is one fallible block, so there is
     // exactly ONE exit — through `finish`, which always releases the guard
     // and never lets a teardown failure hide what really went wrong.
     let primary = (|| -> Result<(), String> {
-        let (bytes, now, src) = read_store(&dirfd)?;
+        // Read AGAIN behind the pause: whatever the agent wrote between the
+        // two reads is a store we never inspected.
+        let (bytes, now, src) = read_store(dirfd)?;
         if !same_file(&now, &was) {
             return Err("the store changed while pausing the agent".into());
         }
+        copyable(path, &src, probe, &now)?;
         // Transactional in memory: the rewrite is a local tree, so a refusal
         // anywhere in it means nothing was ever handed to the writer.
         let mut tree = parse_store(&bytes)?;
         rewrite(&mut tree, &template)?;
         let out = plutil("binary1", write_xml(&tree).as_bytes())?;
-        replace_store(&dirfd, &src, &now, &out)
+        // Re-asked with the rename one statement away, because everything
+        // above took time somebody else could have used.
+        let before_rename = || {
+            if agent.pid()? != first {
+                return Err("the wallpaper agent restarted during the sync".into());
+            }
+            copyable(path, &src, probe, &now)
+        };
+        replace_store(dirfd, &src, &now, &out, &before_rename)
     })();
     finish(paused, primary)
+}
+
+/// May this store still be replaced faithfully? The ACL probe takes a PATH,
+/// so its answer is only worth having while that path still names the file
+/// the descriptor holds — otherwise it describes some other file entirely.
+/// The metadata the replacement copies is re-checked in the same breath.
+fn copyable(
+    path: &Path,
+    fd: &OwnedFd,
+    probe: &dyn Fn(&Path) -> Result<bool, String>,
+    was: &rustix::fs::Stat,
+) -> Result<(), String> {
+    let acl = probe(path)?;
+    let named = rustix::fs::stat(path).map_err(|e| format!("cannot re-check the store: {e}"))?;
+    let held = rustix::fs::fstat(fd).map_err(|e| format!("cannot re-check the store: {e}"))?;
+    if !same_object(&named, &held) {
+        return Err("the store moved while it was being checked".into());
+    }
+    if (held.st_mode & 0o7777, held.st_gid, held.st_flags)
+        != (was.st_mode & 0o7777, was.st_gid, was.st_flags)
+    {
+        return Err("the store's mode, group or flags changed during the sync".into());
+    }
+    match uncopyable(held.st_flags, acl) {
+        Some(why) => Err(why.into()),
+        None => Ok(()),
+    }
+}
+
+/// One file by identity alone — what makes a path's answer belong to a
+/// descriptor.
+fn same_object(a: &rustix::fs::Stat, b: &rustix::fs::Stat) -> bool {
+    (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
 }
 
 /// Release the guard and report BOTH halves. A teardown failure may never
@@ -1113,6 +1173,7 @@ fn replace_store(
     src: &OwnedFd,
     was: &rustix::fs::Stat,
     bytes: &[u8],
+    before_rename: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
     let mut made = None;
     for seq in 0..8u32 {
@@ -1162,6 +1223,8 @@ fn replace_store(
         if !same_file(&now, was) {
             return Err("the store changed underneath the sync".into());
         }
+        // The caller's last word, with the rename one statement away.
+        before_rename()?;
         rustix::fs::renameat(dirfd, name, dirfd, "Index.plist")
             .map_err(|e| format!("cannot replace the store: {e}"))
     })();
@@ -1199,173 +1262,139 @@ fn copy_xattrs(from: &OwnedFd, to: &OwnedFd) -> Result<(), String> {
     Ok(())
 }
 
-/// The user's own WallpaperAgent, by exact process name and our uid only —
-/// no other process ever receives a signal from here. Anything short of a
-/// clean answer is an error: a missing or untrusted pgrep, a spawn that
-/// failed, an exit code that means neither "found" nor "no match", a line
-/// that is not a pid. An agent whose state we do not know is one we must
-/// not write behind.
-fn agent_pids() -> Result<Vec<Pid>, String> {
-    if !trusted_system_binary(PGREP) {
-        return Err("no trusted /usr/bin/pgrep".into());
-    }
-    let uid = rustix::process::getuid().as_raw().to_string();
-    let out = trusted_spawn(Path::new(PGREP))
-        .args(["-x", "-u", &uid, "WallpaperAgent"])
-        .output()
-        .map_err(|e| format!("cannot run pgrep: {e}"))?;
-    match out.status.code() {
-        Some(0) => {}
-        // pgrep's documented "nothing matched" — a real answer, not a fault.
-        Some(1) => return Ok(Vec::new()),
-        other => return Err(format!("pgrep answered {other:?}")),
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(|l| {
-            l.parse()
-                .ok()
-                .and_then(Pid::from_raw)
-                .ok_or_else(|| format!("pgrep printed {l:?}, which is not a pid"))
-        })
-        .collect()
-}
-
-/// Everything the guard does to the world outside this process, behind one
-/// seam — so every failure path below is exercised by tests that need no
-/// victim process and send no real signal.
+/// The wallpaper agent as launchd sees it: a SERVICE with four operations.
+/// Behind one seam, so every failure path below has a test that runs no
+/// launchctl and disturbs nothing.
 trait Agent {
-    fn signal(&self, pid: Pid, sig: Signal) -> Result<(), Errno>;
-    fn running(&self) -> Result<Vec<Pid>, String>;
-    /// Signal 0: asks whether a pid is still there without touching it.
-    fn alive(&self, pid: Pid) -> bool;
+    /// The service's pid, or None when launchd is not running it. Only ever
+    /// a snapshot — it tells "the same instance throughout" from "it
+    /// restarted underneath us", and is never a thing we signal.
+    fn pid(&self) -> Result<Option<i32>, String>;
+    fn pause(&self) -> Result<(), String>;
+    fn resume(&self) -> Result<(), String>;
+    /// Kill and relaunch: the service's OWN restart, which is what makes it
+    /// read the store we just wrote instead of rewriting it from memory.
+    fn reload(&self) -> Result<(), String>;
 }
 
 struct Launchd;
 
-impl Agent for Launchd {
-    fn signal(&self, pid: Pid, sig: Signal) -> Result<(), Errno> {
-        kill_process(pid, sig)
+impl Launchd {
+    fn target() -> String {
+        format!("gui/{}/{SERVICE}", rustix::process::getuid().as_raw())
     }
-    fn running(&self) -> Result<Vec<Pid>, String> {
-        agent_pids()
+
+    /// One launchctl run: absolute path, root-owned binary, empty
+    /// environment — the boundary every trusted child here starts from.
+    fn run(args: &[&str]) -> Result<std::process::Output, String> {
+        if !trusted_system_binary(LAUNCHCTL) {
+            return Err("no trusted /bin/launchctl".into());
+        }
+        trusted_spawn(Path::new(LAUNCHCTL))
+            .args(args)
+            .output()
+            .map_err(|e| format!("cannot run launchctl: {e}"))
     }
-    fn alive(&self, pid: Pid) -> bool {
-        rustix::process::test_kill_process(pid).is_ok()
+
+    /// A run whose only interesting answer is whether it worked.
+    fn ok(args: &[&str], what: &str) -> Result<(), String> {
+        let out = Launchd::run(args)?;
+        match out.status.success() {
+            true => Ok(()),
+            false => Err(format!(
+                "cannot {what} the wallpaper agent: {}",
+                first_line(&out.stderr)
+            )),
+        }
     }
 }
 
-/// SIGSTOP across the write so the agent cannot rewrite the store mid
-/// transaction — and a guard rather than a pair of calls, because every
-/// early exit owes it a SIGCONT.
+impl Agent for Launchd {
+    fn pid(&self) -> Result<Option<i32>, String> {
+        let out = Launchd::run(&["print", &Launchd::target()])?;
+        // 113 is launchctl's "could not find service in domain": a Mac with
+        // no wallpaper agent has nothing to coordinate with, which is an
+        // answer rather than a fault. Every other refusal is a fault.
+        if out.status.code() == Some(113) {
+            return Ok(None);
+        }
+        if !out.status.success() {
+            return Err(format!(
+                "cannot read the wallpaper agent: {}",
+                first_line(&out.stderr)
+            ));
+        }
+        // `pid = N` on its own line while the service runs, and no such line
+        // at all once its state is `not running`.
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("pid = "))
+            .and_then(|n| n.trim().parse().ok()))
+    }
+
+    fn pause(&self) -> Result<(), String> {
+        Launchd::ok(&["kill", "SIGSTOP", &Launchd::target()], "pause")
+    }
+
+    fn resume(&self) -> Result<(), String> {
+        Launchd::ok(&["kill", "SIGCONT", &Launchd::target()], "resume")
+    }
+
+    fn reload(&self) -> Result<(), String> {
+        Launchd::ok(&["kickstart", "-k", &Launchd::target()], "restart")
+    }
+}
+
+/// The first line a child gave as its reason, for a message that has to
+/// carry it.
+fn first_line(err: &[u8]) -> String {
+    String::from_utf8_lossy(err)
+        .lines()
+        .next()
+        .unwrap_or("no reason given")
+        .trim()
+        .to_string()
+}
+
+/// SIGSTOP across the write, so the agent cannot rewrite the store mid
+/// transaction. One service and one stop, so a failed pause has nothing to
+/// roll back — and a guard, because the resume is owed on every path.
 struct Paused<'a> {
-    held: Vec<Pid>,
     agent: &'a dyn Agent,
+    /// Cleared the moment `release` takes responsibility for reporting, so
+    /// Drop is left holding only the panic.
+    held: bool,
 }
 
 impl<'a> Paused<'a> {
-    /// Only pids that ACTUALLY stopped are held: one that vanished (ESRCH)
-    /// was never ours to resume, and any other refusal means we cannot hold
-    /// the store still at all — so the ones already stopped are resumed and
-    /// nothing is written.
-    fn new(agent: &'a dyn Agent, pids: Vec<Pid>) -> Result<Paused<'a>, String> {
-        let mut held = Vec::new();
-        for p in pids {
-            match agent.signal(p, Signal::STOP) {
-                Ok(()) => held.push(p),
-                Err(Errno::SRCH) => {}
-                Err(e) => {
-                    drop(Paused { held, agent });
-                    return Err(format!("cannot pause the wallpaper agent: {e}"));
-                }
-            }
-        }
-        Ok(Paused { held, agent })
+    fn new(agent: &'a dyn Agent) -> Result<Paused<'a>, String> {
+        agent.pause()?;
+        Ok(Paused { agent, held: true })
     }
 
-    /// Resume, then ask the agent to reload. Both are checked against a
-    /// FRESH pgrep, so a pid the kernel reused since the pause is never
-    /// signalled — but if that check itself fails, CONT still goes out: an
-    /// agent left stopped is a desktop that never repaints again, while a
-    /// CONT to something that is not stopped does nothing. TERM has no such
-    /// excuse and is skipped instead. A pid that would not resume stays in
-    /// the guard, so Drop tries once more.
+    /// Resume, then let the service restart itself into the file we wrote.
+    /// BOTH are attempted whatever the first one does — a resume that failed
+    /// must not cost the restart, and neither error may hide the other.
     fn release(mut self) -> Result<(), String> {
-        let fresh = self.agent.running();
-        let held = std::mem::take(&mut self.held);
-        let mut stuck = Vec::new();
-        {
-            let known = fresh.as_ref().ok();
-            let mine = |p: &Pid| known.is_none_or(|l| l.contains(p));
-            for p in held.iter().copied().filter(mine) {
-                if let Err(e) = self.agent.signal(p, Signal::CONT)
-                    && e != Errno::SRCH
-                {
-                    stuck.push(format!("{} ({e})", p.as_raw_nonzero()));
-                    self.held.push(p);
-                }
-            }
+        self.held = false;
+        match (self.agent.resume(), self.agent.reload()) {
+            (Ok(()), reloaded) => reloaded,
+            (Err(e), Ok(())) => Err(e),
+            (Err(e), Err(r)) => Err(format!("{e}; and {r}")),
         }
-        if !stuck.is_empty() {
-            return Err(format!(
-                "the wallpaper agent is still paused (pid {})",
-                stuck.join(", ")
-            ));
-        }
-        let live = fresh?;
-        let still: Vec<Pid> = held.into_iter().filter(|p| live.contains(p)).collect();
-        reload_agent(self.agent, &still)
     }
 }
 
-/// Best effort, for a PANIC only: every ordinary exit after the pause goes
-/// through [`finish`], which releases explicitly and reports what failed.
-/// An unwinding stack has nobody left to report to, so it just tries.
+/// Best effort, for a PANIC only: every ordinary exit goes through
+/// [`finish`], which releases explicitly and reports what failed. An
+/// unwinding stack has nobody left to report to, so it just tries.
 impl Drop for Paused<'_> {
     fn drop(&mut self) {
-        for p in &self.held {
-            let _ = self.agent.signal(*p, Signal::CONT);
+        if self.held {
+            let _ = self.agent.resume();
         }
     }
 }
-
-/// Nothing documents a hot reload of the store, and every recipe that works
-/// restarts the agent instead: launchd brings it straight back (keepalive 0,
-/// on demand) and it reads what we just wrote. ESRCH is not a failure — the
-/// agent may already be gone — but any other refusal is, and so is an agent
-/// that is STILL there a second later: the file we wrote would go unread, or
-/// be overwritten from the memory of the process that never reloaded it.
-fn reload_agent(agent: &dyn Agent, pids: &[Pid]) -> Result<(), String> {
-    for p in pids {
-        if let Err(e) = agent.signal(*p, Signal::TERM)
-            && e != Errno::SRCH
-        {
-            return Err(format!(
-                "cannot restart the wallpaper agent (pid {}): {e}",
-                p.as_raw_nonzero()
-            ));
-        }
-    }
-    // Signal 0 rather than pgrep: launchd relaunches the agent on demand, so
-    // by the time we look a NEW pid may already answer to the name. Only the
-    // pids we actually signalled are watched out.
-    for _ in 0..20 {
-        if !pids.iter().any(|p| agent.alive(*p)) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    match pids.iter().find(|p| agent.alive(**p)) {
-        Some(p) => Err(format!(
-            "the wallpaper agent did not exit after SIGTERM (pid {})",
-            p.as_raw_nonzero()
-        )),
-        None => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1907,131 +1936,215 @@ mod tests {
         );
     }
 
-    /// A signal sender and pid lister that touches no real process, so
-    /// every teardown failure gets a test instead of a victim.
+    /// A launchd that runs nothing: it logs the operations asked of it and
+    /// fails whichever SET of them a test names, so two failing at once is
+    /// as easy to stage as one.
     struct Fake {
-        fails: Option<(i32, Signal)>,
-        live: Vec<Pid>,
-        log: std::cell::RefCell<Vec<(i32, i32)>>,
+        fails: Vec<&'static str>,
+        pids: std::cell::RefCell<Vec<Option<i32>>>,
+        log: std::cell::RefCell<Vec<&'static str>>,
     }
 
     impl Fake {
-        fn new(live: &[i32], fails: Option<(i32, Signal)>) -> Fake {
+        /// `pids` is answered in order, the last value repeating — so a test
+        /// stages "the same instance throughout" or "it restarted".
+        fn new(pids: &[Option<i32>], fails: &[&'static str]) -> Fake {
             Fake {
-                fails,
-                live: live.iter().map(|p| pid(*p)).collect(),
+                fails: fails.to_vec(),
+                pids: std::cell::RefCell::new(pids.to_vec()),
                 log: std::cell::RefCell::new(Vec::new()),
             }
         }
-        fn sent(&self) -> Vec<(i32, i32)> {
+        fn did(&self, op: &'static str) -> Result<(), String> {
+            self.log.borrow_mut().push(op);
+            match self.fails.contains(&op) {
+                true => Err(format!("cannot {op} the wallpaper agent: refused")),
+                false => Ok(()),
+            }
+        }
+        fn ops(&self) -> Vec<&'static str> {
             self.log.borrow().clone()
         }
     }
 
     impl Agent for Fake {
-        fn signal(&self, p: Pid, sig: Signal) -> Result<(), Errno> {
-            let raw = p.as_raw_nonzero().get();
-            self.log.borrow_mut().push((raw, sig.as_raw()));
-            match self.fails {
-                Some((f, s)) if f == raw && s == sig => Err(Errno::PERM),
-                _ => Ok(()),
+        fn pid(&self) -> Result<Option<i32>, String> {
+            self.log.borrow_mut().push("pid");
+            if self.fails.contains(&"pid") {
+                return Err("cannot read the wallpaper agent: refused".into());
             }
+            let mut q = self.pids.borrow_mut();
+            Ok(match q.len() {
+                0 => None,
+                1 => q[0],
+                _ => q.remove(0),
+            })
         }
-        fn running(&self) -> Result<Vec<Pid>, String> {
-            Ok(self.live.clone())
+        fn pause(&self) -> Result<(), String> {
+            self.did("pause")
         }
-        /// Nothing outlives a TERM here, so the restart wait never sleeps.
-        fn alive(&self, _p: Pid) -> bool {
-            false
+        fn resume(&self) -> Result<(), String> {
+            self.did("resume")
+        }
+        fn reload(&self) -> Result<(), String> {
+            self.did("restart")
         }
     }
 
-    fn pid(n: i32) -> Pid {
-        Pid::from_raw(n).unwrap()
+    /// A store on disk, in a directory of our own, holding one Desktop
+    /// record that names NEW_URI. Never the live store.
+    fn scratch_store(tag: &str) -> (std::path::PathBuf, rustix::fd::OwnedFd) {
+        let dir = std::env::temp_dir().join(format!("theme-spaces-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tree = d(vec![(
+            "SystemDefault",
+            d(vec![("Desktop", image(NEW_B64, "2026-09-03T06:44:55Z"))]),
+        )]);
+        let bytes = plutil("binary1", write_xml(&tree).as_bytes()).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        std::fs::write(dir.join("Index.plist"), &bytes).unwrap();
+        let fd = crate::update::open_chain_nofollow(&dir).unwrap();
+        (dir, fd)
     }
 
-    fn sig(s: Signal) -> i32 {
-        s.as_raw()
+    fn floor() -> i64 {
+        date_secs("2026-09-03T06:44:45Z").unwrap()
     }
 
-    /// Every teardown failure is explicit and reaches the caller: a pause
-    /// that only half succeeded resumes what it stopped, a resume that fails
-    /// names the pid and keeps it for Drop, and a restart that fails is not
-    /// passed off as a clean release.
+    /// The whole transaction, against a store of our own and a launchd that
+    /// does nothing: it pauses, writes, and resumes and restarts the service
+    /// — in that order.
     #[test]
-    fn a_failed_pause_resume_or_restart_is_reported() {
-        // STOP refused on the second pid: the first is resumed and nothing
-        // is held, so no write ever begins.
-        let f = Fake::new(&[1, 2], Some((2, Signal::STOP)));
-        let Err(e) = Paused::new(&f, vec![pid(1), pid(2)]) else {
-            panic!("a refused STOP must not yield a guard");
+    fn a_clean_sync_pauses_writes_then_resumes_and_restarts() {
+        let (dir, fd) = scratch_store("clean");
+        let path = dir.join("Index.plist");
+        let before = std::fs::read(&path).unwrap();
+        let agent = Fake::new(&[Some(7)], &[]);
+        let quiet = |_: &Path| Ok(false);
+        sync_with(&agent, &quiet, &fd, &path, NEW_URI, floor(), "new.jpg").unwrap();
+        assert_eq!(
+            agent.ops(),
+            ["pid", "pause", "pid", "resume", "restart"],
+            "the service was not coordinated in order"
+        );
+        // The store really was rewritten, and it still parses.
+        let after = std::fs::read(&path).unwrap();
+        assert_ne!(after, before);
+        assert!(parse_store(&after).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A service that restarted mid-flight holds the OLD store in memory, so
+    /// the rename must not happen — and the guard is still released.
+    #[test]
+    fn a_restarted_agent_abandons_the_transaction() {
+        let (dir, fd) = scratch_store("raced");
+        let path = dir.join("Index.plist");
+        let before = std::fs::read(&path).unwrap();
+        // Same instance while we set up, a different one at the rename.
+        let agent = Fake::new(&[Some(7), Some(9)], &[]);
+        let quiet = |_: &Path| Ok(false);
+        let e = sync_with(&agent, &quiet, &fd, &path, NEW_URI, floor(), "new.jpg").unwrap_err();
+        assert!(e.contains("restarted during the sync"), "{e}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "it renamed anyway");
+        assert!(
+            agent.ops().contains(&"resume"),
+            "the guard was not released"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ACL probe is asked again with the rename one statement away, so a
+    /// store that grows an ACL mid-sync is still refused.
+    #[test]
+    fn the_pre_rename_check_refuses_an_acl_that_appeared() {
+        let (dir, fd) = scratch_store("acl");
+        let path = dir.join("Index.plist");
+        let before = std::fs::read(&path).unwrap();
+        let asked = Cell::new(0);
+        let flips = |_: &Path| {
+            asked.set(asked.get() + 1);
+            Ok(asked.get() > 1)
         };
-        assert!(e.contains("cannot pause"), "{e}");
-        assert_eq!(
-            f.sent(),
-            [
-                (1, sig(Signal::STOP)),
-                (2, sig(Signal::STOP)),
-                (1, sig(Signal::CONT))
-            ]
-        );
+        let agent = Fake::new(&[Some(7)], &[]);
+        let e = sync_with(&agent, &flips, &fd, &path, NEW_URI, floor(), "new.jpg").unwrap_err();
+        assert!(e.contains("ACL"), "{e}");
+        assert_eq!(asked.get(), 2, "the probe did not run twice");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "it renamed anyway");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        // CONT refused: release names the pid, and the pid stays in the
-        // guard so Drop tries once more.
-        let f = Fake::new(&[1], Some((1, Signal::CONT)));
-        let e = Paused::new(&f, vec![pid(1)])
-            .unwrap()
-            .release()
-            .unwrap_err();
-        assert!(e.contains("still paused (pid 1"), "{e}");
-        assert_eq!(
-            f.sent()
-                .iter()
-                .filter(|(_, s)| *s == sig(Signal::CONT))
-                .count(),
-            2
-        );
-
-        // TERM refused: the restart failure surfaces.
-        let f = Fake::new(&[1], Some((1, Signal::TERM)));
-        let e = Paused::new(&f, vec![pid(1)])
-            .unwrap()
-            .release()
-            .unwrap_err();
+    /// Teardown attempts EVERY step and reports every failure: a resume that
+    /// fails must not cost the restart, and neither may hide the other.
+    #[test]
+    fn a_release_that_fails_twice_reports_both() {
+        let agent = Fake::new(&[Some(7)], &["resume", "restart"]);
+        let e = Paused::new(&agent).unwrap().release().unwrap_err();
+        assert!(e.contains("cannot resume"), "{e}");
         assert!(e.contains("cannot restart"), "{e}");
+        assert_eq!(agent.ops(), ["pause", "resume", "restart"]);
 
-        // And a clean run stops, resumes and restarts, in that order.
-        let f = Fake::new(&[1], None);
-        Paused::new(&f, vec![pid(1)]).unwrap().release().unwrap();
-        assert_eq!(
-            f.sent(),
-            [
-                (1, sig(Signal::STOP)),
-                (1, sig(Signal::CONT)),
-                (1, sig(Signal::TERM))
-            ]
+        // One failing on its own still surfaces, from either side.
+        let agent = Fake::new(&[Some(7)], &["restart"]);
+        assert!(
+            Paused::new(&agent)
+                .unwrap()
+                .release()
+                .unwrap_err()
+                .contains("cannot restart")
         );
+        let agent = Fake::new(&[Some(7)], &["resume"]);
+        assert!(
+            Paused::new(&agent)
+                .unwrap()
+                .release()
+                .unwrap_err()
+                .contains("cannot resume")
+        );
+
+        // A pause that fails yields no guard, so nothing is ever written.
+        let agent = Fake::new(&[Some(7)], &["pause"]);
+        assert!(Paused::new(&agent).is_err());
+        assert_eq!(agent.ops(), ["pause"]);
     }
 
     /// A teardown failure never replaces the reason we were tearing down,
     /// and a clean run never swallows one.
     #[test]
     fn finish_reports_both_halves() {
-        let f = Fake::new(&[1], Some((1, Signal::CONT)));
-        let g = Paused::new(&f, vec![pid(1)]).unwrap();
+        let agent = Fake::new(&[Some(7)], &["resume"]);
+        let g = Paused::new(&agent).unwrap();
         let both = finish(g, Err("the write failed".into())).unwrap_err();
         assert!(
             both.starts_with("the write failed; and the wallpaper agent could not be resumed: "),
             "{both}"
         );
 
-        let f = Fake::new(&[1], Some((1, Signal::CONT)));
-        let g = Paused::new(&f, vec![pid(1)]).unwrap();
-        assert!(finish(g, Ok(())).unwrap_err().contains("still paused"));
+        let agent = Fake::new(&[Some(7)], &["resume"]);
+        let g = Paused::new(&agent).unwrap();
+        assert!(finish(g, Ok(())).unwrap_err().contains("cannot resume"));
 
-        let f = Fake::new(&[1], None);
-        let g = Paused::new(&f, vec![pid(1)]).unwrap();
+        let agent = Fake::new(&[Some(7)], &[]);
+        let g = Paused::new(&agent).unwrap();
         assert!(finish(g, Ok(())).is_ok());
+    }
+
+    /// A path's answer belongs to a descriptor only while the two are the
+    /// same file.
+    #[test]
+    fn same_object_is_identity_not_spelling() {
+        let (dir, _fd) = scratch_store("ident");
+        let path = dir.join("Index.plist");
+        let twin = dir.join("Twin.plist");
+        std::fs::copy(&path, &twin).unwrap();
+        let a = rustix::fs::stat(&path).unwrap();
+        let b = rustix::fs::stat(&path).unwrap();
+        let other = rustix::fs::stat(&twin).unwrap();
+        assert!(same_object(&a, &b));
+        // Byte-identical content, same directory, different file.
+        assert!(!same_object(&a, &other));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Metadata this tool cannot carry is refused, never lost quietly.
