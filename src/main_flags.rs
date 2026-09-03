@@ -146,16 +146,25 @@ pub fn parse(argv: &[String]) -> Flags {
     if !matches!(f.rotate.as_str(), "" | "left" | "right") {
         die("--rotate takes left or right");
     }
-    if list_n_raw.is_empty() || !list_n_raw.bytes().all(|b| b.is_ascii_digit()) {
-        die("-n takes a row count (0 or --all = everything)");
-    }
-    f.list_n = list_n_raw.parse().unwrap_or(10);
+    f.list_n = row_count(&list_n_raw)
+        .unwrap_or_else(|| die("-n takes a row count (0 or --all = everything)"));
     if !f.extend.is_empty()
         && (f.extend.len() != 6 || !f.extend.bytes().all(|b| b.is_ascii_hexdigit()))
     {
         die("--extend takes a 6-digit hex color (default 000000)");
     }
     f
+}
+
+/// A row count, or nothing at all. Digits are not the same thing as a
+/// number: a value larger than this machine can count rows with is not a
+/// row count, and turning it into the default silently answered a question
+/// nobody asked — `-n <past usize>` printed ten rows and exited 0.
+fn row_count(raw: &str) -> Option<usize> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
 }
 
 impl Flags {
@@ -188,5 +197,36 @@ impl Flags {
 
     pub fn transforms_requested(&self) -> bool {
         !self.rotate.is_empty() || !self.extend.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::row_count;
+
+    /// Every value `-n` is documented to take, and every one it is not.
+    /// The overflow case is the one that used to pass: the bytes are all
+    /// digits, so the shape check said yes, and the number that did not fit
+    /// quietly became the default ten rows.
+    #[test]
+    fn a_row_count_is_a_number_this_machine_can_count_to() {
+        assert_eq!(row_count("10"), Some(10));
+        assert_eq!(row_count("0"), Some(0));
+        assert_eq!(row_count(&usize::MAX.to_string()), Some(usize::MAX));
+        for bad in [
+            "",
+            " ",
+            "-1",
+            "1.5",
+            "1e3",
+            "ten",
+            "10 ",
+            "0x10",
+            "184467440737095516160",
+            // usize::MAX + 1, exactly.
+            "18446744073709551616",
+        ] {
+            assert_eq!(row_count(bad), None, "{bad} was accepted");
+        }
     }
 }

@@ -144,6 +144,13 @@ check  "rm of an in-library symlink succeeds"  0 run "$lib" rm escape.jpg
 exists "symlink target beyond boundary intact" yes "$out/delete-victim.jpg"
 exists "outside rename-victim untouched"       yes "$out/rename-victim.jpg"
 
+# A row count past usize used to be all digits, so the shape check passed and
+# the number that did not fit became the default ten rows: exit 0, ten rows,
+# nobody told. It has to REFUSE.
+check  "-n takes the largest count there is"   0 run "$lib" list -n 18446744073709551615
+check  "-n refuses a count past usize"         1 run "$lib" list -n 18446744073709551616
+check  "-n refuses a wildly overflowing count" 1 run "$lib" list -n 184467440737095516160
+
 # --- truncated/stem resolution: exactly ONE candidate or refuse ------------
 printf 'x' >"$lib/same-title.jpg"
 printf 'x' >"$lib/same-title.png"
