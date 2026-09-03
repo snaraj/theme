@@ -1152,12 +1152,18 @@ fn desktops(tree: &Plist) -> Vec<&Plist> {
         .collect()
 }
 
-/// Does this record name our image? The `Configuration` blob is a nested
-/// binary plist, and the answer is read from its FIELDS — an `imageFile`
-/// choice whose `url.relative` IS our URI — never from the bytes it happens
-/// to contain. A record can mention a path in a field that does not choose
-/// it, so anything short of parsing attributes the wrong wallpaper. Older
-/// builds put the path in `Files` as plain text instead, already exact.
+/// Does this record name our image? ONLY the `Configuration` blob answers
+/// that. It is a nested binary plist, and the answer is read from its
+/// FIELDS — an `imageFile` choice whose `url.relative` IS our URI — never
+/// from the bytes it happens to contain, because a record can mention a
+/// path in a field that does not choose it.
+///
+/// `Files` used to answer too, for older builds that wrote the path there
+/// as plain text. It no longer does. A record that `Files` attributes and
+/// `Configuration` does not is a record whose blob we never read, and
+/// copying it would put a wallpaper we cannot describe into every Space —
+/// the live store has an empty `Files` on all 56 of its choices, so that
+/// fallback bought nothing and stood in front of the only real evidence.
 fn names<'a>(
     rec: &'a Plist,
     uri: &str,
@@ -1171,23 +1177,19 @@ fn names<'a>(
         },
         _ => return false,
     };
+    let Some(Plist::Data(b64)) = choice.get("Configuration") else {
+        return false;
+    };
     // Slots repeat the same blob across every Space and display, so one scan
     // parses each distinct Configuration once however many carry it.
-    if let Some(Plist::Data(b64)) = choice.get("Configuration") {
-        let hit = match memo.get(b64.as_str()) {
-            Some(&known) => known,
-            None => {
-                let hit = chooses(b64, uri, budget);
-                memo.insert(b64.as_str(), hit);
-                hit
-            }
-        };
-        if hit {
-            return true;
+    match memo.get(b64.as_str()) {
+        Some(&known) => known,
+        None => {
+            let hit = chooses(b64, uri, budget);
+            memo.insert(b64.as_str(), hit);
+            hit
         }
     }
-    matches!(choice.get("Files"), Some(Plist::Array(fs))
-        if fs.iter().any(|f| matches!(f.get("relative"), Some(Plist::String(r)) if r == uri)))
 }
 
 /// Does this Configuration blob CHOOSE `uri`? A blob that does not contain
@@ -1246,6 +1248,7 @@ fn check_shape(tree: &Plist, template: &Plist) -> Result<(), String> {
     if !matches!(tree, Plist::Dict(_)) {
         return Err("the store's root is not a dictionary".into());
     }
+    check_helper(template)?;
     for (path, node, slot) in documented(tree) {
         if !matches!(node, Plist::Dict(_)) {
             return Err(format!("the store's {path} is not a dictionary"));
@@ -1264,6 +1267,42 @@ fn check_shape(tree: &Plist, template: &Plist) -> Result<(), String> {
 /// record with no `Content` of its own is simply given the template's.
 fn choices(rec: &Plist) -> Option<&Plist> {
     rec.get("Content")?.get("Choices")
+}
+
+/// The helper's OWN record, checked before it is copied anywhere. Every
+/// choice it states must carry the complete wallpaper, each field of the
+/// kind it is supposed to be, because [`choose`] copies a field only when
+/// the helper states it: a record missing one would leave the
+/// destination's old value of that field standing beside the new ones —
+/// half of yesterday's wallpaper and half of today's, a record no version
+/// of macOS ever wrote and this tool could not explain afterwards.
+///
+/// Checked ONCE and up front rather than per slot, because a slot with no
+/// destination record of its own takes the helper's whole and would never
+/// reach the pairing check at all.
+fn check_helper(template: &Plist) -> Result<(), String> {
+    let Some(Plist::Array(choices)) = choices(template) else {
+        return Err("the helper's Content/Choices is not an array".into());
+    };
+    if choices.is_empty() {
+        return Err("the helper's Content/Choices is empty".into());
+    }
+    for (i, choice) in choices.iter().enumerate() {
+        let wrong = |key: &str, kind: &str, ok: fn(&Plist) -> bool| match choice.get(key) {
+            Some(v) if ok(v) => None,
+            Some(_) => Some(format!(
+                "the helper's Content/Choices[{i}]/{key} is not {kind}"
+            )),
+            None => Some(format!("the helper's Content/Choices[{i}] has no {key}")),
+        };
+        if let Some(why) = SCHEMA
+            .iter()
+            .find_map(|(key, kind, ok)| wrong(key, kind, *ok))
+        {
+            return Err(why);
+        }
+    }
+    Ok(())
 }
 
 /// [`choose`] pairs `Choices` by index, so the pairing is settled HERE,
@@ -1391,26 +1430,37 @@ fn merge(dest: &mut Plist, src: &Plist) {
 }
 
 /// The fields of a choice that ARE the wallpaper, and the only ones a
-/// wallpaper change is entitled to restate. Read off the live store,
-/// read-only: all 56 choices in it carry exactly
-/// `{Configuration, Files, Provider}` and nothing else, and the record the
-/// helper writes carries the same three. Whatever a choice grows beyond
-/// them belongs to whoever put it there.
-const CHOSEN: [&str; 3] = ["Configuration", "Files", "Provider"];
+/// wallpaper change is entitled to restate — with the kind each one has to
+/// be. Read off the live store, read-only: all 56 choices in it carry
+/// exactly `{Configuration, Files, Provider}` and nothing else, and the
+/// record the helper writes carries the same three. Whatever a choice
+/// grows beyond them belongs to whoever put it there.
+///
+/// ONE list, read by both [`check_helper`] and [`choose`], so the fields
+/// that are demanded of the helper and the fields that are copied from it
+/// can never be different fields.
+type Field = (&'static str, &'static str, fn(&Plist) -> bool);
+const SCHEMA: [Field; 3] = [
+    ("Configuration", "data", |v| matches!(v, Plist::Data(_))),
+    ("Files", "an array", |v| matches!(v, Plist::Array(_))),
+    ("Provider", "a string", |v| matches!(v, Plist::String(_))),
+];
 
-/// `Choices` pairs by INDEX and copies only [`CHOSEN`] into each pair, so
-/// every other key a destination choice carries survives byte-identical.
-/// The lengths were settled by [`check_choices`] before anything was
-/// written, so no pairing here can be partial. An array UNDER a chosen
-/// field — `Files` — is still replaced whole however its length differs:
-/// that list is the picture itself, not state around it.
+/// `Choices` pairs by INDEX and copies only [`SCHEMA`]'s fields into each
+/// pair, so every other key a destination choice carries survives
+/// byte-identical. Both the lengths and the helper's own fields were
+/// settled before anything was written — by [`check_choices`] and
+/// [`check_helper`] — so no pairing here can be partial and no field can
+/// be silently skipped. An array UNDER a chosen field — `Files` — is still
+/// replaced whole however its length differs: that list is the picture
+/// itself, not state around it.
 fn choose(dest: &mut Plist, src: &Plist) {
     let (Plist::Array(into), Plist::Array(from)) = (&mut *dest, src) else {
         *dest = src.clone();
         return;
     };
     for (choice, fresh) in into.iter_mut().zip(from) {
-        for key in CHOSEN {
+        for (key, _, _) in SCHEMA {
             if let Some(v) = fresh.get(key) {
                 choice.set(key, v.clone());
             }
@@ -1565,24 +1615,43 @@ fn own_lines(out: &str) -> impl Iterator<Item = &str> {
 /// it is not running and names no pid. Every other shape is output we do
 /// not understand, and calling THAT idle would write the store out from
 /// under a live agent. Fail closed instead.
+///
+/// The service states its condition ONCE. Reducing several `state` lines to
+/// "did any of them say idle" answered a question launchd was not asked:
+/// `running` followed by `not running` came back idle. So exactly one
+/// state line, exactly one pid line, and the two must agree.
 fn parse_pid(out: &str) -> Result<Option<i32>, String> {
-    let mut pids = own_lines(out).filter_map(|l| l.strip_prefix("pid = "));
-    let pid = pids.next();
-    if pids.next().is_some() {
-        return Err("the wallpaper agent's state names more than one pid".into());
-    }
-    let idle = own_lines(out).any(|l| l.trim_end() == "state = not running");
-    match (pid, idle) {
-        (None, true) => Ok(None),
-        (None, false) => Err("the wallpaper agent's state names no pid".into()),
-        (Some(_), true) => Err("the wallpaper agent is running and not running at once".into()),
-        (Some(p), false) => match p.trim_end().parse::<i32>() {
+    let state = only("state", out)?;
+    let pid = only("pid", out)?;
+    match (state, pid) {
+        (Some("running"), Some(p)) => match p.parse::<i32>() {
             Ok(n) if n > 0 => Ok(Some(n)),
-            _ => Err(format!(
-                "the wallpaper agent's pid is not a pid: {}",
-                p.trim_end()
-            )),
+            _ => Err(format!("the wallpaper agent's pid is not a pid: {p}")),
         },
+        (Some("not running"), None) => Ok(None),
+        (Some("running"), None) => Err("the wallpaper agent runs under no pid".into()),
+        (Some("not running"), Some(p)) => {
+            Err(format!("the wallpaper agent is not running, under pid {p}"))
+        }
+        // Every word launchd may emit that we have not modelled — `spawn
+        // scheduled`, `waiting for initialization`, whatever comes next —
+        // lands here, where not understanding it costs a refusal rather
+        // than an unpaused agent.
+        (Some(other), _) => Err(format!("the wallpaper agent's state is {other}")),
+        (None, _) => Err("the wallpaper agent states no state".into()),
+    }
+}
+
+/// The one value the service gives for `key`, or nothing at all. Two of
+/// them is not an answer, it is two answers, and choosing between them
+/// would be us deciding what launchd meant.
+fn only<'a>(key: &str, out: &'a str) -> Result<Option<&'a str>, String> {
+    let prefix = format!("{key} = ");
+    let mut found = own_lines(out).filter_map(|l| l.strip_prefix(&prefix));
+    let one = found.next().map(str::trim_end);
+    match found.next() {
+        Some(_) => Err(format!("the wallpaper agent states more than one {key}")),
+        None => Ok(one),
     }
 }
 
@@ -2140,18 +2209,20 @@ mod tests {
 
     #[test]
     fn the_template_is_the_newest_record_of_this_image() {
-        // Older builds record the path in Files as plain text instead of
-        // inside the Configuration blob; both shapes must count.
+        // A record whose FILES name our image but whose Configuration does
+        // not choose it. The blob is the only evidence of what a record
+        // actually chooses, so this is not a record of our image at all.
         let by_files = |when: &str| {
             let files = Plist::Array(vec![d(vec![("relative", s(NEW_URI))])]);
-            rec(IMAGE, "", files, when)
+            rec(IMAGE, OLD_B64, files, when)
         };
         let floor = date_secs("2026-09-03T06:44:45Z").unwrap();
         let tree = spaces_with(vec![
             image(NEW_B64, "2026-09-03T06:44:50Z"),
             image(NEW_B64, "2026-09-03T06:44:55Z"),
-            by_files("2026-09-03T06:44:52Z"),
-            // A newer record of a DIFFERENT image must never win.
+            // Newer than the winner, and named by Files alone: never chosen.
+            by_files("2026-09-03T06:44:57Z"),
+            // A newer record of a DIFFERENT image must never win either.
             image(OLD_B64, "2026-09-03T06:44:59Z"),
         ]);
         let won = template(&tree, NEW_URI, Some(floor), &budget()).unwrap();
@@ -2160,9 +2231,20 @@ mod tests {
             Some(&Plist::Date("2026-09-03T06:44:55Z".into()))
         );
 
-        // The Files shape on its own still qualifies.
+        // On its own, the Files shape is not a record of our image.
         let only_files = spaces_with(vec![by_files("2026-09-03T06:44:52Z")]);
-        assert!(template(&only_files, NEW_URI, Some(floor), &budget()).is_some());
+        assert!(template(&only_files, NEW_URI, Some(floor), &budget()).is_none());
+        // Nor is one with no Configuration at all — the shape the reviewer
+        // used to splice a fresh Files over a stale Configuration.
+        let headless = spaces_with(vec![{
+            let mut r = by_files("2026-09-03T06:44:52Z");
+            let Some(Plist::Array(cs)) = r.get_mut("Content").unwrap().get_mut("Choices") else {
+                unreachable!("the fixture is not the real Content shape")
+            };
+            cs[0].remove("Configuration");
+            r
+        }]);
+        assert!(template(&headless, NEW_URI, Some(floor), &budget()).is_none());
 
         // Another image never qualifies, whatever its date.
         let other = spaces_with(vec![image(OLD_B64, "2026-09-03T06:44:59Z")]);
@@ -2350,7 +2432,7 @@ mod tests {
         let Some(Plist::Array(want)) = fresh.get("Choices") else {
             unreachable!("the template has no choices")
         };
-        for key in CHOSEN {
+        for (key, _, _) in SCHEMA {
             assert_eq!(
                 after[0].get(key),
                 want[0].get(key),
@@ -2412,6 +2494,93 @@ mod tests {
             );
             assert_eq!(tree, before, "a refusal changed the tree");
         }
+    }
+
+    /// [`choose`] copies a field only when the helper states it, so a
+    /// helper choice missing one would leave the destination's old value of
+    /// it standing beside the new ones — yesterday's picture under today's
+    /// provider. Every field of every helper choice is therefore checked,
+    /// by name and by kind, before a single slot is touched.
+    #[test]
+    fn an_incomplete_helper_choice_is_refused_before_anything_is_written() {
+        // A fresh record with one field taken out or replaced by the wrong
+        // kind of thing — each in turn.
+        let broken = |mutate: &dyn Fn(&mut Plist)| {
+            let mut t = image(NEW_B64, "2026-09-03T06:44:55Z");
+            let Some(Plist::Array(cs)) = t.get_mut("Content").unwrap().get_mut("Choices") else {
+                unreachable!("the fixture is not the real Content shape")
+            };
+            mutate(&mut cs[0]);
+            t
+        };
+        let cases = [
+            (
+                "Choices[0] has no Configuration",
+                broken(&|c| c.remove("Configuration")),
+            ),
+            (
+                "Choices[0]/Configuration is not data",
+                broken(&|c| c.set("Configuration", s(NEW_B64))),
+            ),
+            ("Choices[0] has no Files", broken(&|c| c.remove("Files"))),
+            (
+                "Choices[0]/Files is not an array",
+                broken(&|c| c.set("Files", s("/one.jpg"))),
+            ),
+            (
+                "Choices[0] has no Provider",
+                broken(&|c| c.remove("Provider")),
+            ),
+            (
+                "Choices[0]/Provider is not a string",
+                broken(&|c| c.set("Provider", Plist::Array(vec![]))),
+            ),
+            ("Choices is empty", {
+                let mut t = image(NEW_B64, "2026-09-03T06:44:55Z");
+                t.get_mut("Content")
+                    .unwrap()
+                    .set("Choices", Plist::Array(vec![]));
+                t
+            }),
+            ("Choices is not an array", {
+                let mut t = image(NEW_B64, "2026-09-03T06:44:55Z");
+                t.get_mut("Content").unwrap().set("Choices", s("odd"));
+                t
+            }),
+        ];
+        for (why, template) in cases {
+            let mut tree = store_fixture();
+            let before = tree.clone();
+            let e = rewrite(&mut tree, &template).unwrap_err();
+            assert!(e.contains(why), "{e} should have said {why}");
+            assert!(e.contains("helper"), "{e} should have said whose it is");
+            assert_eq!(tree, before, "a refusal changed the store");
+        }
+    }
+
+    /// The reviewer's fixture, end to end: a record whose `Files` name our
+    /// image while its `Configuration` chooses another, with the whole
+    /// store on disk. It is not a record of our image, the sync refuses
+    /// before it writes, and the store is byte-identical afterwards.
+    #[test]
+    fn a_record_named_only_by_files_never_becomes_the_template() {
+        let files = Plist::Array(vec![d(vec![("relative", s(NEW_URI))])]);
+        let decoy = rec(IMAGE, OLD_B64, files, "2026-09-03T06:44:55Z");
+        let (dir, fd) = scratch_with(
+            "byfiles",
+            &d(vec![("SystemDefault", d(vec![("Desktop", decoy)]))]),
+        );
+        let path = dir.join("Index.plist");
+        let before = std::fs::read(&path).unwrap();
+        let agent = Fake::new(&[Some(7)], &[]);
+        let quiet = |_: &Path| Ok(false);
+        let e = sync_with(&agent, &quiet, &fd, &path, NEW_URI, floor(), "new.jpg").unwrap_err();
+        assert!(e.contains("did not record new.jpg"), "{e}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "it wrote anyway");
+        // And the agent was never touched: the record is looked for before
+        // anything is paused.
+        assert!(agent.ops().is_empty(), "{:?}", agent.ops());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `Files` lives UNDER a chosen field: it is the picture itself, so it
@@ -2753,14 +2922,21 @@ mod tests {
     /// A store on disk, in a directory of our own, holding one Desktop
     /// record that names NEW_URI. Never the live store.
     fn scratch_store(tag: &str) -> (std::path::PathBuf, rustix::fd::OwnedFd) {
+        scratch_with(
+            tag,
+            &d(vec![(
+                "SystemDefault",
+                d(vec![("Desktop", image(NEW_B64, "2026-09-03T06:44:55Z"))]),
+            )]),
+        )
+    }
+
+    /// The same, for a store of some other shape.
+    fn scratch_with(tag: &str, tree: &Plist) -> (std::path::PathBuf, rustix::fd::OwnedFd) {
         let dir = std::env::temp_dir().join(format!("theme-spaces-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let tree = d(vec![(
-            "SystemDefault",
-            d(vec![("Desktop", image(NEW_B64, "2026-09-03T06:44:55Z"))]),
-        )]);
-        let bytes = plutil("binary1", write_xml(&tree).as_bytes()).unwrap();
+        let bytes = plutil("binary1", write_xml(tree).as_bytes()).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
         std::fs::write(dir.join("Index.plist"), &bytes).unwrap();
         let fd = crate::update::open_chain_nofollow(&dir).unwrap();
@@ -2962,43 +3138,72 @@ mod tests {
 
     /// launchd's answer is read strictly, because `None` means "skip the
     /// pause": output we cannot account for must never be mistaken for an
-    /// agent that is not there.
+    /// agent that is not there. Exactly one state, exactly one pid, and the
+    /// two agreeing — anything else is two answers, or none.
     #[test]
-    fn only_a_stated_pid_or_a_stated_idleness_is_an_answer() {
+    fn only_one_state_agreeing_with_one_pid_is_an_answer() {
         assert_eq!(parse_pid(RUNNING), Ok(Some(71056)));
         assert_eq!(parse_pid(NOT_RUNNING), Ok(None));
         let refused = [
-            // Neither a pid nor a not-running state: an answer we cannot read.
-            ("names no pid", "gui/501/x = {\n\tstate = waiting\n}\n"),
-            ("names no pid", ""),
+            // The reviewer's fixture: two contradictory states and no pid.
+            // Reducing the states to "did any say idle" answered `None`,
+            // which skips the pause while an agent may be running.
+            (
+                "more than one state",
+                "gui/501/x = {\n\tstate = running\n\tstate = not running\n}\n",
+            ),
+            // Two of the same state is still two answers.
+            (
+                "more than one state",
+                "gui/501/x = {\n\tstate = running\n\tstate = running\n\tpid = 71056\n}\n",
+            ),
+            // A word launchd may emit that we have not modelled.
+            (
+                "state is spawn scheduled",
+                "gui/501/x = {\n\tstate = spawn scheduled\n}\n",
+            ),
+            ("state is waiting", "gui/501/x = {\n\tstate = waiting\n}\n"),
+            // Running under no pid, and not running under one.
+            ("runs under no pid", "gui/501/x = {\n\tstate = running\n}\n"),
+            (
+                "not running, under pid 71056",
+                "gui/501/x = {\n\tstate = not running\n\tpid = 71056\n}\n",
+            ),
+            // No state at all, whether or not a pid is offered.
+            ("states no state", ""),
+            ("states no state", "gui/501/x = {\n\tpid = 71056\n}\n"),
             // Two pids: which one would we stop?
             (
                 "more than one pid",
-                "gui/501/x = {\n\tpid = 71056\n\tpid = 71057\n}\n",
+                "gui/501/x = {\n\tstate = running\n\tpid = 71056\n\tpid = 71057\n}\n",
             ),
             // A pid that is not a number, is zero or negative, or is past
             // what a pid can be.
-            ("is not a pid: nine", "gui/501/x = {\n\tpid = nine\n}\n"),
-            ("is not a pid: 0", "gui/501/x = {\n\tpid = 0\n}\n"),
-            ("is not a pid: -1", "gui/501/x = {\n\tpid = -1\n}\n"),
+            (
+                "is not a pid: nine",
+                "gui/501/x = {\n\tstate = running\n\tpid = nine\n}\n",
+            ),
+            (
+                "is not a pid: 0",
+                "gui/501/x = {\n\tstate = running\n\tpid = 0\n}\n",
+            ),
+            (
+                "is not a pid: -1",
+                "gui/501/x = {\n\tstate = running\n\tpid = -1\n}\n",
+            ),
             (
                 "is not a pid: 2147483648",
-                "gui/501/x = {\n\tpid = 2147483648\n}\n",
-            ),
-            // Running and not running at once.
-            (
-                "running and not running",
-                "gui/501/x = {\n\tstate = not running\n\tpid = 71056\n}\n",
+                "gui/501/x = {\n\tstate = running\n\tpid = 2147483648\n}\n",
             ),
         ];
         for (why, out) in refused {
             let e = parse_pid(out).unwrap_err();
             assert!(e.contains(why), "{e} should have said {why}");
         }
-        // A pid nested inside somebody else's dictionary is not the
-        // service's pid, and reading it as one would signal a stranger.
+        // A pid or a state nested inside somebody else's dictionary is not
+        // the service's, and reading one as such would signal a stranger.
         assert!(
-            parse_pid("gui/501/x = {\n\tstate = waiting\n\tsub = {\n\t\tpid = 71056\n\t}\n}\n")
+            parse_pid("gui/501/x = {\n\tstate = running\n\tsub = {\n\t\tpid = 71056\n\t}\n}\n")
                 .is_err()
         );
     }
