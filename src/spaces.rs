@@ -113,7 +113,7 @@ fn sync_with(
     // The agent has to be RUNNING for the helper's record to reach the store
     // at all, so it is paused only after that record is found.
     let (was, template) = load(dirfd, uri, cutoff, name)?;
-    let paused = Paused::new(agent)?;
+    let paused = Paused::new(agent, first)?;
     // Everything from here to the rename is one fallible block, so there is
     // exactly ONE exit — through `finish`, which always releases the guard
     // and never lets a teardown failure hide what really went wrong.
@@ -1367,7 +1367,16 @@ struct Paused<'a> {
 }
 
 impl<'a> Paused<'a> {
-    fn new(agent: &'a dyn Agent) -> Result<Paused<'a>, String> {
+    /// `running` is the service's pid as it stood a moment ago. None means
+    /// launchd is not running the agent — it starts on demand and keeps no
+    /// process alive between times — so there is nothing that could rewrite
+    /// the store underneath us and nothing to restart into what we write.
+    /// Pausing it would only fail, and failing there would cost a sync that
+    /// had nothing to coordinate in the first place.
+    fn new(agent: &'a dyn Agent, running: Option<i32>) -> Result<Paused<'a>, String> {
+        if running.is_none() {
+            return Ok(Paused { agent, held: false });
+        }
         agent.pause()?;
         Ok(Paused { agent, held: true })
     }
@@ -1376,6 +1385,11 @@ impl<'a> Paused<'a> {
     /// BOTH are attempted whatever the first one does — a resume that failed
     /// must not cost the restart, and neither error may hide the other.
     fn release(mut self) -> Result<(), String> {
+        // Nothing was ever paused, so nothing is owed and nothing needs
+        // restarting: the next agent launchd starts reads the store fresh.
+        if !self.held {
+            return Ok(());
+        }
         self.held = false;
         match (self.agent.resume(), self.agent.reload()) {
             (Ok(()), reloaded) => reloaded,
@@ -2035,6 +2049,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// launchd starts the agent on demand and keeps nothing alive between
+    /// times, so a store synced while it is idle has nobody to coordinate
+    /// with: the pause, the resume and the restart are all skipped, and the
+    /// write still lands. Pausing a service that is not running would only
+    /// fail, and that failure would have cost the whole sync.
+    #[test]
+    fn an_idle_agent_is_coordinated_with_by_leaving_it_alone() {
+        let (dir, fd) = scratch_store("idle");
+        let path = dir.join("Index.plist");
+        let before = std::fs::read(&path).unwrap();
+        // A launchd that refuses every operation on an idle service, which
+        // is what the real one does: `kill SIGSTOP` on a service with no
+        // process fails. The sync must succeed anyway, by not asking.
+        let agent = Fake::new(&[None], &["pause", "resume", "restart"]);
+        let quiet = |_: &Path| Ok(false);
+        sync_with(&agent, &quiet, &fd, &path, NEW_URI, floor(), "new.jpg").unwrap();
+        assert_eq!(agent.ops(), ["pid", "pid"], "an idle service was disturbed");
+        let after = std::fs::read(&path).unwrap();
+        assert_ne!(after, before, "the store was not written");
+        assert!(parse_store(&after).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And an agent that appears while we work is the same race as one that
+    /// restarted: it read the old store on the way up.
+    #[test]
+    fn an_agent_that_appears_mid_sync_abandons_the_transaction() {
+        let (dir, fd) = scratch_store("appeared");
+        let path = dir.join("Index.plist");
+        let before = std::fs::read(&path).unwrap();
+        let agent = Fake::new(&[None, Some(7)], &[]);
+        let quiet = |_: &Path| Ok(false);
+        let e = sync_with(&agent, &quiet, &fd, &path, NEW_URI, floor(), "new.jpg").unwrap_err();
+        assert!(e.contains("restarted during the sync"), "{e}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "it renamed anyway");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A service that restarted mid-flight holds the OLD store in memory, so
     /// the rename must not happen — and the guard is still released.
     #[test]
@@ -2080,7 +2132,7 @@ mod tests {
     #[test]
     fn a_release_that_fails_twice_reports_both() {
         let agent = Fake::new(&[Some(7)], &["resume", "restart"]);
-        let e = Paused::new(&agent).unwrap().release().unwrap_err();
+        let e = Paused::new(&agent, Some(7)).unwrap().release().unwrap_err();
         assert!(e.contains("cannot resume"), "{e}");
         assert!(e.contains("cannot restart"), "{e}");
         assert_eq!(agent.ops(), ["pause", "resume", "restart"]);
@@ -2088,7 +2140,7 @@ mod tests {
         // One failing on its own still surfaces, from either side.
         let agent = Fake::new(&[Some(7)], &["restart"]);
         assert!(
-            Paused::new(&agent)
+            Paused::new(&agent, Some(7))
                 .unwrap()
                 .release()
                 .unwrap_err()
@@ -2096,7 +2148,7 @@ mod tests {
         );
         let agent = Fake::new(&[Some(7)], &["resume"]);
         assert!(
-            Paused::new(&agent)
+            Paused::new(&agent, Some(7))
                 .unwrap()
                 .release()
                 .unwrap_err()
@@ -2105,7 +2157,7 @@ mod tests {
 
         // A pause that fails yields no guard, so nothing is ever written.
         let agent = Fake::new(&[Some(7)], &["pause"]);
-        assert!(Paused::new(&agent).is_err());
+        assert!(Paused::new(&agent, Some(7)).is_err());
         assert_eq!(agent.ops(), ["pause"]);
     }
 
@@ -2114,7 +2166,7 @@ mod tests {
     #[test]
     fn finish_reports_both_halves() {
         let agent = Fake::new(&[Some(7)], &["resume"]);
-        let g = Paused::new(&agent).unwrap();
+        let g = Paused::new(&agent, Some(7)).unwrap();
         let both = finish(g, Err("the write failed".into())).unwrap_err();
         assert!(
             both.starts_with("the write failed; and the wallpaper agent could not be resumed: "),
@@ -2122,11 +2174,11 @@ mod tests {
         );
 
         let agent = Fake::new(&[Some(7)], &["resume"]);
-        let g = Paused::new(&agent).unwrap();
+        let g = Paused::new(&agent, Some(7)).unwrap();
         assert!(finish(g, Ok(())).unwrap_err().contains("cannot resume"));
 
         let agent = Fake::new(&[Some(7)], &[]);
-        let g = Paused::new(&agent).unwrap();
+        let g = Paused::new(&agent, Some(7)).unwrap();
         assert!(finish(g, Ok(())).is_ok());
     }
 
