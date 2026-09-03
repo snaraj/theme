@@ -113,18 +113,16 @@ fn load(
         let (bytes, st) = read_store(dirfd)?;
         let xml = plutil("xml1", &bytes)?;
         let tree = parse_xml(std::str::from_utf8(&xml).map_err(|_| "plutil emitted no text")?)?;
-        if let Some(t) = template(&tree, Some(uri), Some(cutoff)) {
+        if let Some(t) = template(&tree, uri, Some(cutoff)) {
             return Ok((tree, st, t));
         }
         if attempt == TRIES {
-            // Last resort: a record written in the last second by whatever
-            // spelling — the helper wrote one and nothing else on this machine
-            // did — and only then an older record of the image we asked for.
-            let t = template(&tree, None, Some(cutoff))
-                .or_else(|| template(&tree, Some(uri), None))
-                .ok_or_else(|| {
-                    format!("the wallpaper helper did not record {name} in the store")
-                })?;
+            // Only the DATE is ever relaxed: an older record of this image
+            // may carry a run-behind fill mode, but it is still this image.
+            // Fail closed rather than copy somebody else's wallpaper.
+            let t = template(&tree, uri, None).ok_or_else(|| {
+                format!("the wallpaper helper did not record {name} in the store")
+            })?;
             return Ok((tree, st, t));
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -563,12 +561,14 @@ fn date_secs(s: &str) -> Option<i64> {
 
 // -------------------------------------------------------------- the rewrite
 
-/// Every dict value filed under a key named `Desktop`, anywhere.
+/// Every value filed under a key named `Desktop`, anywhere — whatever its
+/// type, so [`check_shape`] can refuse the ones we do not understand rather
+/// than this walk hiding them.
 fn desktops<'a>(v: &'a Plist, out: &mut Vec<&'a Plist>) {
     match v {
         Plist::Dict(e) => {
             for (k, val) in e {
-                if k == "Desktop" && matches!(val, Plist::Dict(_)) {
+                if k == "Desktop" {
                     out.push(val);
                 }
                 desktops(val, out);
@@ -580,8 +580,10 @@ fn desktops<'a>(v: &'a Plist, out: &mut Vec<&'a Plist>) {
 }
 
 /// Does this record name our image? The helper writes the path inside the
-/// nested binary plist under `Configuration`; older builds put it in `Files`
-/// as plain text instead, so either shape counts.
+/// nested binary plist under `Configuration`, so the URI must sit there as a
+/// WHOLE string object — a bare substring would read a record naming
+/// `…/new.jpg2` as one naming `…/new.jpg`. Older builds put the path in
+/// `Files` as plain text instead, which is exact already.
 fn names(rec: &Plist, uri: &str) -> bool {
     let choice = match rec.get("Content").and_then(|c| c.get("Choices")) {
         Some(Plist::Array(a)) => match a.first() {
@@ -592,7 +594,7 @@ fn names(rec: &Plist, uri: &str) -> bool {
     };
     if let Some(Plist::Data(b64)) = choice.get("Configuration")
         && let Some(bytes) = b64_decode(b64)
-        && bytes.windows(uri.len()).any(|w| w == uri.as_bytes())
+        && framed_string(&bytes, uri.as_bytes())
     {
         return true;
     }
@@ -600,14 +602,38 @@ fn names(rec: &Plist, uri: &str) -> bool {
         if fs.iter().any(|f| matches!(f.get("relative"), Some(Plist::String(r)) if r == uri)))
 }
 
-/// The freshest matching record, or nothing. `uri` narrows to one image
-/// (None takes any); `after` is the helper's start, so only a record the
-/// helper itself could have written qualifies (None takes any date).
-fn template(tree: &Plist, uri: Option<&str>, after: Option<i64>) -> Option<Plist> {
+/// Does `blob` hold `want` as a COMPLETE binary-plist ASCII string object?
+/// The length sits in the marker just before the bytes — `0x50|n` while it
+/// fits, else its own integer — so a declared length equal to ours is what
+/// proves the object ends where we do. (Percent-encoding leaves the URI
+/// pure ASCII, so the UTF-16 markers cannot arise.)
+fn framed_string(blob: &[u8], want: &[u8]) -> bool {
+    let n = want.len();
+    if n == 0 || blob.len() < n {
+        return false;
+    }
+    let marker: Vec<u8> = match n {
+        1..=14 => vec![0x50 | n as u8],
+        15..=255 => vec![0x5F, 0x10, n as u8],
+        _ if n <= u16::MAX as usize => {
+            let [hi, lo] = (n as u16).to_be_bytes();
+            vec![0x5F, 0x11, hi, lo]
+        }
+        _ => return false,
+    };
+    blob.windows(n)
+        .enumerate()
+        .any(|(at, w)| w == want && blob[..at].ends_with(&marker))
+}
+
+/// The freshest record of this image, or nothing. `after` is the helper's
+/// start: with it, only a record the helper itself could have written
+/// qualifies; without it, any record OF THE IMAGE will do — never another.
+fn template(tree: &Plist, uri: &str, after: Option<i64>) -> Option<Plist> {
     let mut all = Vec::new();
     desktops(tree, &mut all);
     all.into_iter()
-        .filter(|r| uri.is_none_or(|u| names(r, u)))
+        .filter(|r| names(r, uri))
         .filter_map(|r| {
             let set = match r.get("LastSet") {
                 Some(Plist::Date(d)) => date_secs(d),
@@ -623,9 +649,29 @@ fn template(tree: &Plist, uri: Option<&str>, after: Option<i64>) -> Option<Plist
         .map(|(_, r)| r.clone())
 }
 
+/// Refuse before anything is written: every shape the rewrite goes on to
+/// assume is checked here, so a store we do not recognise is one we leave
+/// alone rather than half-convert.
+fn check_shape(tree: &Plist) -> Result<(), String> {
+    if !matches!(tree, Plist::Dict(_)) {
+        return Err("the store's root is not a dictionary".into());
+    }
+    let odd = |v: &Plist| !matches!(v, Plist::Dict(_));
+    if tree.get("AllSpacesAndDisplays").is_some_and(odd) {
+        return Err("the store's all-Spaces slot is not a dictionary".into());
+    }
+    let mut slots = Vec::new();
+    desktops(tree, &mut slots);
+    if slots.into_iter().any(odd) {
+        return Err("the store has a wallpaper slot that is not a dictionary".into());
+    }
+    Ok(())
+}
+
 /// Give every slot the template, and leave everything else exactly as it
 /// was. Returns how many Desktop records were written.
 fn rewrite(tree: &mut Plist, template: &Plist) -> Result<usize, String> {
+    check_shape(tree)?;
     let mut n = 0;
     walk(tree, template, &mut n);
     // The slot System Settings' "Show on all Spaces" writes, and the one a
@@ -675,8 +721,15 @@ fn walk(v: &mut Plist, template: &Plist, n: &mut usize) {
                 v.set("Type", Plist::String("individual".into()));
                 v.set("Desktop", template.clone());
             }
-            if v.get("Desktop").is_some() {
-                v.set("Desktop", template.clone());
+            // OVERLAY, not replace: a slot may carry keys this tool has never
+            // heard of, and losing them is a change nobody asked for.
+            if let Some(mut dest) = v.get("Desktop").cloned() {
+                if let Plist::Dict(fields) = template {
+                    for (k, val) in fields {
+                        dest.set(k, val.clone());
+                    }
+                }
+                v.set("Desktop", dest);
                 *n += 1;
             }
         }
@@ -888,8 +941,10 @@ mod tests {
 "#;
 
     const NEW_URI: &str = "file:///Users/example/wallpapers/new.jpg";
-    const NEW_B64: &str = "ZmlsZTovLy9Vc2Vycy9leGFtcGxlL3dhbGxwYXBlcnMvbmV3LmpwZw==";
-    const OLD_B64: &str = "ZmlsZTovLy9Vc2Vycy9leGFtcGxlL3dhbGxwYXBlcnMvb2xkLmpwZw==";
+    /// `bplist00` + the `0x5F 0x10 0x28` string marker + the URI — the
+    /// framing the live store really uses, which `names` now demands.
+    const NEW_B64: &str = "YnBsaXN0MDBfEChmaWxlOi8vL1VzZXJzL2V4YW1wbGUvd2FsbHBhcGVycy9uZXcuanBn";
+    const OLD_B64: &str = "YnBsaXN0MDBfEChmaWxlOi8vL1VzZXJzL2V4YW1wbGUvd2FsbHBhcGVycy9vbGQuanBn";
     const AERIALS: &str = "com.apple.wallpaper.choice.aerials";
 
     fn d(items: Vec<(&str, Plist)>) -> Plist {
@@ -1072,7 +1127,7 @@ mod tests {
             // A newer record of a DIFFERENT image must never win.
             ("D", slot(image(OLD_B64, "2026-09-03T06:44:59Z"))),
         ]);
-        let won = template(&tree, Some(NEW_URI), Some(floor)).unwrap();
+        let won = template(&tree, NEW_URI, Some(floor)).unwrap();
         assert_eq!(
             won.get("LastSet"),
             Some(&Plist::Date("2026-09-03T06:44:55Z".into()))
@@ -1080,24 +1135,24 @@ mod tests {
 
         // The Files shape on its own still qualifies.
         let only_files = slot(by_files("2026-09-03T06:44:52Z"));
-        assert!(template(&only_files, Some(NEW_URI), Some(floor)).is_some());
+        assert!(template(&only_files, NEW_URI, Some(floor)).is_some());
 
         // Another image never qualifies, whatever its date.
         let other = slot(image(OLD_B64, "2026-09-03T06:44:59Z"));
-        assert!(template(&other, Some(NEW_URI), Some(floor)).is_none());
+        assert!(template(&other, NEW_URI, Some(floor)).is_none());
 
         // A record older than the helper's run is skipped — until the
         // patience runs out and the date stops being a requirement.
         let stale = slot(image(NEW_B64, "2026-09-01T00:00:00Z"));
-        assert!(template(&stale, Some(NEW_URI), Some(floor)).is_none());
-        assert!(template(&stale, Some(NEW_URI), None).is_some());
+        assert!(template(&stale, NEW_URI, Some(floor)).is_none());
+        assert!(template(&stale, NEW_URI, None).is_some());
     }
 
-    /// The last-resort arm: a record the helper plainly just wrote, whose
-    /// URI we spell differently, is still the record we came for — and only
-    /// there does a fresh record of another image beat a stale one of ours.
+    /// Fail closed: only the DATE is ever relaxed. A record the helper
+    /// plainly just wrote still loses if it names another image — copying
+    /// somebody else's wallpaper across every Space is worse than refusing.
     #[test]
-    fn a_fresh_record_of_any_image_is_the_last_resort() {
+    fn a_foreign_record_is_never_the_template() {
         let (stale, fresh) = ("2026-09-01T00:00:00Z", "2026-09-03T06:44:55Z");
         let slot = |v: Plist| d(vec![("Desktop", v)]);
         let floor = date_secs("2026-09-03T06:44:45Z").unwrap();
@@ -1105,11 +1160,69 @@ mod tests {
             ("Stale", slot(image(NEW_B64, stale))),
             ("Fresh", slot(image(OLD_B64, fresh))),
         ]);
-        assert!(template(&tree, Some(NEW_URI), Some(floor)).is_none());
-        let any = template(&tree, None, Some(floor));
-        assert_eq!(any, Some(image(OLD_B64, fresh)));
-        let ours = template(&tree, Some(NEW_URI), None);
+        assert!(template(&tree, NEW_URI, Some(floor)).is_none());
+        let ours = template(&tree, NEW_URI, None);
         assert_eq!(ours, Some(image(NEW_B64, stale)));
+        let none = d(vec![("Fresh", slot(image(OLD_B64, fresh)))]);
+        assert!(template(&none, NEW_URI, None).is_none());
+    }
+
+    /// The URI must sit in the blob as a WHOLE bplist string object. The
+    /// length prefix is what proves it: a record naming a longer path that
+    /// merely starts with ours is a different wallpaper.
+    #[test]
+    fn only_a_framed_string_object_attributes_a_record() {
+        let uri = NEW_URI.as_bytes();
+        let n = uri.len() as u8;
+        let blob = |m: &[u8], tail: &[u8]| [b"bplist00".as_slice(), m, uri, tail].concat();
+        assert!(framed_string(&blob(&[0x5F, 0x10, n], b""), uri));
+        // One byte longer: the same prefix, a different file.
+        assert!(!framed_string(&blob(&[0x5F, 0x10, n + 1], b"2"), uri));
+        // Unframed, and framed with the wrong length marker.
+        assert!(!framed_string(uri, uri));
+        assert!(!framed_string(&blob(&[0x5F, 0x11, 0, n], b""), uri));
+        // A short name carries its length in the marker itself.
+        let short = b"file:///a.jpg";
+        assert!(framed_string(&[&[0x5D][..], short].concat(), short));
+        assert!(!framed_string(short, short));
+    }
+
+    /// A slot may carry fields this tool has never heard of — a future
+    /// macOS key, a per-display tweak. The template overlays its own keys
+    /// and leaves the rest standing.
+    #[test]
+    fn a_destination_record_keeps_the_keys_the_template_lacks() {
+        let mut template = image(NEW_B64, "2026-09-03T06:44:55Z");
+        template.remove("LastUse");
+        let mut dest = image(OLD_B64, "2026-09-01T12:30:10Z");
+        dest.set("Extra", s("mine"));
+        let mut tree = d(vec![("SystemDefault", d(vec![("Desktop", dest.clone())]))]);
+        rewrite(&mut tree, &template).unwrap();
+        let got = tree.get("SystemDefault").unwrap().get("Desktop").unwrap();
+        assert_eq!(got.get("Extra"), Some(&s("mine")));
+        assert_eq!(got.get("LastUse"), dest.get("LastUse"));
+        assert_eq!(got.get("Content"), template.get("Content"));
+        assert_eq!(got.get("LastSet"), template.get("LastSet"));
+    }
+
+    /// A shape we do not recognise is refused whole — never half-converted.
+    #[test]
+    fn an_unrecognised_shape_is_refused_before_anything_is_written() {
+        let template = image(NEW_B64, "2026-09-03T06:44:55Z");
+        let slot = d(vec![("Desktop", template.clone())]);
+        let cases = [
+            // A root that is not a dictionary, nested Desktop and all.
+            Plist::Array(vec![slot.clone()]),
+            // An all-Spaces slot that is not a dictionary.
+            d(vec![("AllSpacesAndDisplays", s("odd")), ("A", slot)]),
+            // A Desktop that is not a record.
+            d(vec![("SystemDefault", d(vec![("Desktop", s("odd"))]))]),
+        ];
+        for mut case in cases {
+            let before = case.clone();
+            assert!(rewrite(&mut case, &template).is_err());
+            assert_eq!(case, before, "a refusal changed the tree");
+        }
     }
 
     #[test]
@@ -1123,7 +1236,8 @@ mod tests {
             "file:///Users/example/a%20b.jpg"
         );
         // Byte-faithful. Foundation spells non-ASCII decomposed, so a
-        // composed name on disk relies on load()'s timestamp fallback.
+        // composed name matches no record and the sync fails closed: the
+        // active Space is set, the others are not, and the exit says so.
         assert_eq!(
             file_uri(Path::new("/Users/example/café.jpg")),
             "file:///Users/example/caf%C3%A9.jpg"
@@ -1138,7 +1252,7 @@ mod tests {
 
     #[test]
     fn base64_decodes_wrapped_text_and_refuses_junk() {
-        assert_eq!(b64_decode(NEW_B64).unwrap(), NEW_URI.as_bytes());
+        assert!(b64_decode(NEW_B64).unwrap().ends_with(NEW_URI.as_bytes()));
         assert_eq!(b64_decode("aGVs\n\t bG8=").unwrap(), b"hello");
         assert_eq!(b64_decode("").unwrap(), b"");
         for bad in ["a", "!!!!", "aGVsbG8=x", "====", "aG=l", "aGVsbG8-"] {
