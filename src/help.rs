@@ -63,6 +63,10 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
                 "one wallpaper up close: picture, colorscheme, title, location",
             ),
             (
+                "search",
+                "fuzzy search across titles, folders, artists, places, colors, sizes, dates",
+            ),
+            (
                 "rename",
                 "rename a saved wallpaper, keeping the naming format",
             ),
@@ -401,6 +405,23 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
     theme preview
     theme preview neon-pink-and-purple-light-particles
     theme preview -w trees-on-forest…
+"
+        ),
+        "search" => print!(
+            "theme search <term…> [-n <count> | --all]
+
+  Rank the wallpapers in {wdir} by how well they answer your terms
+  and show what matched. Every fact a file has is searched — title,
+  folder, format, size, shape (landscape/portrait/4k), bytes, date
+  added, source, artist, published, camera, place, license, palette
+  colors (red, blue, dark…) — exactly, at a word start, anywhere
+  inside, or as scattered letters. EVERY term must land somewhere,
+  so terms narrow; a #rrggbb term matches a palette that close.
+  Newest 10 by default; -n <count> or --all widens it.
+
+  Examples:
+    theme search neon blue
+    theme search unsplash portrait 2026-08
 "
         ),
         "status" => print!(

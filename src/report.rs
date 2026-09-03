@@ -40,14 +40,7 @@ fn have(cmd: &str) -> bool {
 /// Unknown is an honest "-", never a guess; the label is decided by the
 /// PARSED hostname, never a substring.
 pub fn wall_source(path: &Path) -> String {
-    let xattr = Command::new("xattr")
-        .args(["-p", "theme.source"])
-        .arg(path)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let xattr = xattr_value(path, "theme.source");
     let src = if xattr.is_empty() {
         Command::new("mdls")
             .args(["-raw", "-name", "kMDItemWhereFroms"])
@@ -81,20 +74,25 @@ pub fn wall_source(path: &Path) -> String {
     s.split(['/', ':']).next().unwrap_or("").to_string()
 }
 
-/// One `theme.*` metadata xattr, read back defensively: it holds UNTRUSTED
-/// bytes (an API record persisted at download time), so control bytes are
-/// stripped and the length capped again on the way out — the write-side gate
-/// in `record_meta` is not trusted to have run.
-fn wall_meta(path: &Path, key: &str) -> String {
-    let raw = Command::new("xattr")
-        .args(["-p", key])
-        .arg(path)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    display_text(&raw).chars().take(512).collect()
+/// One extended attribute, read IN-PROCESS — no `xattr` subprocess, because
+/// `search` asks five of these per file across a whole library. The bytes are
+/// UNTRUSTED, so the display copy is sanitized HERE, where they enter, and
+/// bounded by the buffer they land in. Every failure is the same empty answer
+/// the callers render as unknown: no attribute, no xattr support on this
+/// filesystem, or a value past the buffer (ERANGE).
+fn xattr_value(path: &Path, key: &str) -> String {
+    let mut buf = [0u8; 512];
+    let Ok(n) = rustix::fs::getxattr(path, key, &mut buf) else {
+        return String::new();
+    };
+    display_text(String::from_utf8_lossy(&buf[..n.min(buf.len())]).trim())
+}
+
+/// One `theme.*` metadata xattr (an API record persisted at download time),
+/// capped for display a second time so the bound survives a wider read buffer
+/// — the write-side gate in `record_meta` is not trusted to have run.
+pub(crate) fn wall_meta(path: &Path, key: &str) -> String {
+    xattr_value(path, key).chars().take(512).collect()
 }
 
 /// The first 8 palette colors a wallpaper derives, from the pigment scheme
@@ -269,7 +267,7 @@ fn strip_choreography(s: &str) -> String {
     out
 }
 
-fn human_bytes(path: &Path) -> String {
+pub(crate) fn human_bytes(path: &Path) -> String {
     let b = fs::metadata(path).map(|m| m.len()).unwrap_or(0) as f64;
     if b >= 1_048_576.0 {
         format!("{:.1}M", b / 1_048_576.0)
@@ -278,7 +276,7 @@ fn human_bytes(path: &Path) -> String {
     }
 }
 
-fn added_date(path: &Path) -> String {
+pub(crate) fn added_date(path: &Path) -> String {
     let out = Command::new("stat")
         .args(["-f", "%SB", "-t", "%Y-%m-%d"])
         .arg(path)
@@ -313,7 +311,7 @@ fn added_date(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn birth_key(path: &Path) -> i64 {
+pub(crate) fn birth_key(path: &Path) -> i64 {
     let out = Command::new("stat")
         .args(["-f", "%B"])
         .arg(path)
@@ -331,7 +329,7 @@ fn birth_key(path: &Path) -> i64 {
     })
 }
 
-fn swatch_cells(scheme: &[String]) -> (String, usize) {
+pub(crate) fn swatch_cells(scheme: &[String]) -> (String, usize) {
     // 8 swatches of 2 cells + a trailing space = exactly 24 visible columns.
     let mut out = String::new();
     let mut n = 0;

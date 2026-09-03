@@ -483,6 +483,44 @@ if printf '%s' "$corrupt_out" | grep -q '48;2;' || [ -s "$fixture/corrupt.err" ]
     fail "a corrupt cache entry produced a swatch or an error"
 else pass "corrupt cache entry degrades to a dash, silently"; fi
 
+# --- `search` answers from FACTS, and from the same cache ------------------
+# The corrupt entries above are still in place, so the first case proves the
+# colors come from a derived scheme and are never invented; the live runs
+# after it re-derive. Solid-color PNGs make every answer here exact.
+run_scheme_search() { COLUMNS=200 THEME_WALLPAPER_DIR="$schemelib" THEME_CACHE_DIR="$schemecache" \
+    KITTY_WINDOW_ID='' TMPDIR="$fixture/tmpdir" "$THEME" search "$@"; }
+if THEME_NO_APPLY=1 run_scheme_search green --all 2>/dev/null | grep -q 'no wallpaper matches'; then
+    pass "a color word finds nothing while no scheme is derived"
+else fail "search invented a color word from an underived scheme"; fi
+srch=$(run_scheme_search red-one --all 2>/dev/null)
+if printf '%s' "$srch" | grep -q '^  red-one .*title: red-one' &&
+    printf '%s' "$srch" | grep -q '^  1 of 3 wallpapers match$'; then
+    pass "a title substring finds exactly its wallpaper"
+else fail "the title search missed or over-matched"; fi
+if run_scheme_search red-one png --all 2>/dev/null | grep -q 'title: red-one, format: png'; then
+    pass "two terms AND together, each naming the fact it landed on"
+else fail "two terms did not AND together"; fi
+if run_scheme_search red-one qqqq --all 2>/dev/null |
+    grep -q 'no wallpaper matches "red-one qqqq"'; then
+    pass "one unanswerable term eliminates every wallpaper"
+else fail "an unanswerable term did not eliminate"; fi
+check  "a search with no hits is not an error"  0 run_scheme_search red-one qqqq --all
+if run_scheme_search green --all 2>/dev/null | grep -q '^  red-one .*colors: .*green'; then
+    pass "a color word matches the backfilled scheme that holds it"
+else fail "the backfilled green accent was not searchable"; fi
+# c81e1e IS red-one.png's own color; its derived red accent sits 43 away.
+if run_scheme_search c81e1e --all 2>/dev/null | grep -q '^  red-one .*colors: #c81e1e'; then
+    pass "a hex term matches a scheme color by distance"
+else fail "a hex term did not match a near scheme color"; fi
+if run_scheme_search 808080 --all 2>/dev/null | grep -q 'no wallpaper matches'; then
+    pass "a hex term far from every scheme color matches nothing"
+else fail "the hex distance gate let a far color through"; fi
+capped=$(run_scheme_search png -n 2 2>/dev/null)
+if printf '%s' "$capped" | grep -q '^  2 of 3 matches shown — more:' &&
+    ! printf '%s' "$capped" | grep -q 'wallpapers match'; then
+    pass "a capped table counts the rows shown, not the matches found"
+else fail "the capped footer claimed the whole match count"; fi
+
 # --- the DEFAULT listing is bounded: newest 10, honestly labelled -----------
 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do printf 'x' >"$lib/bulk-$i.jpg"; done
 if run_nokitty "$lib" list 2>/dev/null | grep -q 'newest 10 of [0-9]* — more:'; then
@@ -768,6 +806,7 @@ sweep help
 sweep status
 sweep list
 sweep list -v
+sweep search sweep-safe
 sweep preview sweep-safe
 sweep preview sizeinject
 sweep set sweep-safe
@@ -782,7 +821,8 @@ else pass "no command emits a filename's OSC sequence"; fi
 sweep_missing=""
 for marker in 'would set the desktop wallpaper to' 'would derive a palette from' \
     'now: ' 'current theme:' 'palette image:' 'COLORSCHEME' 'sizeinject' \
-    'successfully deleted' 'successfully renamed' 'unknown command'; do
+    'successfully deleted' 'successfully renamed' 'unknown command' \
+    'wallpapers match'; do
     grep -qF -- "$marker" "$sweep_all" || sweep_missing="$sweep_missing [$marker]"
 done
 if [ -z "$sweep_missing" ]; then
@@ -1620,7 +1660,7 @@ else:
 starters = ('Apply Commands:', 'Library Commands:', 'Info Commands:', 'Usage:',
             'Global Flags', 'Use "', 'current theme:', 'mode:', 'color scheme:',
             'palette source:', 'palette image:', 'wallpaper dir:', 'variables:',
-            'update to the latest', 'to update run:', 'wallpapers')
+            'update to the latest', 'to update run:', 'wallpapers', 'search:')
 for l in lines:
     if l and not l.startswith(' ') and not l.startswith(starters):
         sys.exit('column-0 line outside the known starters: %r' % l)
@@ -1662,6 +1702,10 @@ narrow_run 40 status
 if [ "$narrow_rc" = 0 ] && why=$(narrowck 40 0 0); then
     pass "a 40-column status wraps every value with a hanging indent"
 else fail "40-column status broke (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
+narrow_run 40 search narrow-check
+if [ "$narrow_rc" = 0 ] && why=$(narrowck 40 0 0); then
+    pass "a 40-column search stacks its three columns, none at column 0"
+else fail "40-column search broke (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
 
 # --- the REAL terminal width, from the tty itself (issue #21) ---------------
 # v0.2.1 read only COLUMNS, which zsh does not export — every real terminal

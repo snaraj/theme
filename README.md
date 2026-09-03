@@ -42,7 +42,7 @@ mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 
 ```
 theme random | set <name|link> | unsplash [query|page-url] | get <link>
-theme list | preview [-w] <name> | status | update | version | rename | rm
+theme list | search <terms> | preview [-w] <name> | status | update | version | rename | rm
 ```
 
 `--rotate left|right`, `--extend[=hex]`, and `--desktop-only` (wallpaper

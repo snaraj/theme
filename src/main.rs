@@ -21,6 +21,7 @@ mod net;
 mod report;
 mod save;
 mod scratch;
+mod search;
 mod ui;
 mod unsplash;
 mod update;
@@ -146,6 +147,16 @@ fn main() {
         }
         "url" => die("theme url was folded into theme set — run: theme set <link>"),
         "list" | "ls" => report::cmd_list(&cfg, flags.verbose, flags.list_n),
+        "search" => {
+            // Same kubectl-style root as unsplash: bare `theme search` is the
+            // command's help, not a whole-library dump.
+            if args.len() < 2 {
+                let code = help::usage_cmd(&cfg, "search");
+                scratch::cleanup();
+                std::process::exit(code);
+            }
+            search::cmd_search(&cfg, &args[1..], flags.list_n);
+        }
         "preview" => {
             let positional = args.get(1).map(String::as_str);
             let by_flag = if flags.wallpaper.is_empty() {
