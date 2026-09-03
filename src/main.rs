@@ -151,13 +151,7 @@ fn main() {
             }
             commands::cmd_rm(&cfg, &args[1..]);
         }
-        "version" | "--version" | "-V" => {
-            // Compile-time version — no runtime lookups.
-            println!(
-                "version: v{}\ngithub: https://github.com/snaraj/theme\nmaintainer: Samuel Naranjo",
-                env!("CARGO_PKG_VERSION")
-            );
-        }
+        "version" | "--version" | "-V" => update::cmd_version(&cfg),
         "help" | "-h" | "--help" => help::usage(&cfg),
         other => die(&format!(
             "unknown command '{other}' — run 'theme help' for the list"

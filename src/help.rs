@@ -77,7 +77,10 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
                 "update",
                 "replace this binary with the latest release (verified)",
             ),
-            ("version, -V", "version, repository, and maintainer"),
+            (
+                "version, -V",
+                "version, repository, maintainer — and whether a newer release exists",
+            ),
             ("help", "this text (per-command: theme <command> --help)"),
         ],
     ),
@@ -450,13 +453,25 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
   versions may be unsupported or break (a downgrade says so before it
   proceeds), through the same verified pipeline.
 
-  The bare `theme` screen notes when a newer release exists (checked
-  at most once a day, silently); THEME_NO_UPDATE_CHECK=1 disables the
-  check. `theme update` itself always runs when you ask.
+  `theme version` (and the bare screen) says when a newer release
+  exists; `theme update` itself always runs when you ask.
 
   Examples:
     theme update
     theme update --version v0.1.0
+"
+        ),
+        "version" | "--version" | "-V" => print!(
+            "theme version        (aliases: theme --version, theme -V)
+
+  Print this build's version, the repository and the maintainer — and
+  whether it is the latest release. That answer comes from the same
+  check the bare screen uses: one bounded (2s) lookup a day at most,
+  cached; THEME_NO_UPDATE_CHECK=1 disables it. When the latest cannot
+  be reached the three plain lines print alone, never a guess.
+
+  Example:
+    theme version
 "
         ),
         "help" | "" => usage(cfg),

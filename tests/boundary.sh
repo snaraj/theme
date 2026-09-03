@@ -1355,6 +1355,86 @@ if [ "$note_rc" = 0 ] && grep -qF "$expect1" "$note_out"; then
     pass "a fresh cache renders without any transport"
 else fail "the fresh-cache render needed a transport: $(tail -3 "$note_out")"; fi
 
+# --- version answers "am I current?" (issue #25) ---------------------------
+# The footer's cache, custody and transport, asked as a QUESTION — so the
+# answer may never outrun the evidence. Its own cache dir and attempt log
+# leave the footer's accounting above exactly as pinned.
+vercache="$fixture/vercache"
+verbin="$fixture/verbin"
+verfaillog="$fixture/verfail.log"
+mkdir -p "$vercache" "$verbin"
+: >"$verfaillog"
+cat >"$verbin/curl" <<EOS
+#!/bin/sh
+printf 'x\n' >>"$verfaillog"
+exit 6
+EOS
+chmod +x "$verbin/curl"
+ver_out="$updd/ver.out"
+ver_run() { # $1 the verb (version|--version|-V); env-pair overrides follow.
+    local verb="$1"
+    shift
+    env THEME_NO_UPDATE_CHECK= \
+        THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$vercache" \
+        THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" KITTY_WINDOW_ID='' \
+        THEME_CURL="$verbin/curl" \
+        PATH="$verbin:$sweepbin:$PATH" "$@" "$THEME_DBG" "$verb" >"$ver_out" 2>&1
+    ver_rc=$?
+}
+verline() { sed -n "$1p" "$ver_out"; }
+vercount() { wc -l <"$ver_out" | tr -d ' '; }
+verfails() { wc -l <"$verfaillog" | tr -d ' '; }
+plain2="github: https://github.com/snaraj/theme"
+plain3="maintainer: Samuel Naranjo"
+three_plain() { # today's three lines, and nothing else
+    [ "$(verline 1)" = "version: v$cur_ver" ] && [ "$(verline 2)" = "$plain2" ] \
+        && [ "$(verline 3)" = "$plain3" ] && [ "$(vercount)" = 3 ]
+}
+
+printf 'v9.9.9' >"$vercache/update-check"
+ver_run version
+if [ "$(verline 1)" = "update to the latest version by running 'theme update'" ] \
+   && [ "$(verline 2)" = "current version: v$cur_ver" ] \
+   && [ "$(verline 3)" = "latest version: v9.9.9" ] \
+   && [ "$(verline 4)" = "$plain2" ] && [ "$(verline 5)" = "$plain3" ] \
+   && [ "$(vercount)" = 5 ] && [ "$(verfails)" = 0 ]; then
+    pass "a newer cached release makes version the five-line update answer"
+else fail "version's update shape drifted (attempts $(verfails)): $(cat "$ver_out")"; fi
+ver_canon=$(cat "$ver_out")
+ver_run --version
+ver_alias=$(cat "$ver_out")
+ver_run -V
+if [ "$ver_alias" = "$ver_canon" ] && [ "$(cat "$ver_out")" = "$ver_canon" ]; then
+    pass "--version and -V stay byte-identical aliases of version"
+else fail "an alias diverged from version: $(cat "$ver_out")"; fi
+printf 'v%s' "$cur_ver" >"$vercache/update-check"
+ver_run version
+if [ "$(verline 1)" = "you're currently on the latest version." ] \
+   && [ "$(verline 2)" = "version: v$cur_ver" ] && [ "$(verline 3)" = "$plain2" ] \
+   && [ "$(verline 4)" = "$plain3" ] && [ "$(vercount)" = 4 ]; then
+    pass "an up-to-date cache says so above the three lines"
+else fail "the up-to-date answer drifted: $(cat "$ver_out")"; fi
+printf 'v0.0.0' >"$vercache/update-check"
+ver_run version
+if three_plain; then pass "a build newer than the latest claims nothing extra"
+else fail "a dev build made a claim: $(cat "$ver_out")"; fi
+printf 'v9.9.9\033]52;c;steal\007' >"$vercache/update-check"
+ver_run version
+if three_plain && ! grep -qF "$(printf '\033]')" "$ver_out"; then
+    pass "a hostile cache reaches neither the answer nor the terminal"
+else fail "hostile cache content reached version: $(cat "$ver_out")"; fi
+rm -f "$vercache/update-check"
+ver_run version
+if [ "$ver_rc" = 0 ] && three_plain && ! grep -qiE 'error|curl' "$ver_out" \
+   && [ "$(verfails)" = 1 ] && [ -e "$vercache/update-check" ]; then
+    pass "an unknown latest prints three lines and stamps its one attempt"
+else fail "the offline answer misbehaved (rc=$ver_rc, attempts $(verfails)): $(cat "$ver_out")"; fi
+rm -f "$vercache/update-check"
+ver_run version THEME_NO_UPDATE_CHECK=1
+if three_plain && [ "$(verfails)" = 1 ]; then
+    pass "the kill-switch leaves version at three lines and spawns nothing"
+else fail "THEME_NO_UPDATE_CHECK did not disable version's check: $(cat "$ver_out")"; fi
+
 # --- the cache stamp is fail-closed (Codex round 4) ------------------------
 # An attacker-writable cache dir with a planted symlink: the old stamp
 # followed it and truncated the victim on a bare help. Now custody refuses
