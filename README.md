@@ -33,12 +33,29 @@ mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 
 - Intel Mac: `theme-x86_64-apple-darwin.tar.gz` · ARM Linux:
   `theme-aarch64-unknown-linux-gnu.tar.gz`
-- The Linux binary is built against glibc and was verified on 2026-09-03,
-  x86_64 and arm64, on Ubuntu 24.04, Fedora 44 and Arch; it needs glibc 2.39
-  or newer, so distributions below that line (Ubuntu 22.04, Debian 12) and
-  musl systems such as Alpine build from source instead.
 - `~/.local/bin` must be on your `PATH`.
 - Or build from source: `cargo build --release`.
+
+### Compatibility
+
+| Platform | glibc | Prebuilt binary | From source |
+| --- | --- | --- | --- |
+| macOS (Apple Silicon, Intel) | — | yes | yes |
+| Ubuntu 24.04 | 2.39 | yes | yes |
+| Fedora 44 | 2.43 | yes | yes |
+| Arch | 2.44 | yes | yes |
+| Debian 12 | 2.36 | no | yes |
+| Ubuntu 22.04 | 2.35 | no | yes |
+| Alpine 3 (musl) | — | no | yes |
+
+The prebuilt Linux binaries inherit the glibc floor of the runner that
+builds them — 2.39 today — so a distribution below that line builds from
+source, as musl systems do. Every Linux row was checked on 2026-09-03 in a
+container on x86_64 and arm64 (Arch on x86_64, the only architecture it
+publishes an image for): the release tarball for the prebuilt column, a
+source build and the whole `tests/boundary.sh` fixture for the other.
+`tests/linux-matrix.sh` re-runs the prebuilt half against the current
+release.
 
 ## Use
 
