@@ -38,9 +38,15 @@ const MAX_XML: u64 = 32 * 1024 * 1024;
 /// The helper's own write may still be in flight when we look: the agent
 /// persists it asynchronously. Twenty 50 ms looks is a second of patience.
 const TRIES: u32 = 20;
-/// Deepest nesting the parser will follow. The real store is eight levels;
-/// the cap is what keeps a malformed file from recursing off the stack.
+/// Deepest nesting either reader will follow. The real store is eight levels
+/// and a Configuration blob three; the cap is what keeps a malformed file —
+/// or a reference cycle, which only a binary plist can express — from
+/// recursing off the stack.
 const MAX_DEPTH: usize = 64;
+/// Ceilings for the nested binary plists: those blobs are a few hundred
+/// bytes, so both sit orders of magnitude above anything legitimate.
+const MAX_OBJECTS: usize = 4096;
+const MAX_ITEMS: usize = 1024;
 
 /// Copy the record the helper just wrote into every other slot of the store.
 /// `helper_started` is the instant BEFORE the helper ran: it is what
@@ -66,18 +72,39 @@ pub fn sync_all_spaces(img: &Path, helper_started: SystemTime) -> Result<(), Str
         .map(|d| d.as_secs() as i64 - 2)
         .unwrap_or(i64::MIN);
     let name = img.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let (tree, was, template) = load(&dirfd, &uri, cutoff, name)?;
+    let (was, template) = load(&dirfd, &uri, cutoff, name)?;
 
-    // Transactional in memory: the rewrite works on a clone, so a refusal
-    // anywhere in it leaves the tree we read intact and nothing is written.
-    let mut next = tree.clone();
-    rewrite(&mut next, &template)?;
-    let bytes = plutil("binary1", write_xml(&next).as_bytes())?;
+    // The agent has to be RUNNING for the helper's record to reach the store
+    // at all, so it is paused only now — and the store is read AGAIN behind
+    // the pause, because whatever the agent wrote between the two reads is a
+    // store we never inspected.
+    let paused = Paused::new(agent_pids()?)?;
+    let (bytes, now, src) = read_store(&dirfd)?;
+    if !same_file(&now, &was) {
+        let _ = paused.release();
+        return Err("the store changed while pausing the agent".into());
+    }
+    // Transactional in memory: the rewrite is a local tree, so a refusal
+    // anywhere in it means nothing was ever handed to the writer.
+    let mut tree = parse_store(&bytes)?;
+    rewrite(&mut tree, &template)?;
+    let out = plutil("binary1", write_xml(&tree).as_bytes())?;
 
-    let paused = Paused::new(agent_pids());
-    replace_store(&dirfd, &was, &bytes)?;
-    paused.release();
-    Ok(())
+    replace_store(&dirfd, &src, &now, &out)?;
+    paused.release()
+}
+
+/// The same file, by identity AND content age: nothing about the store may
+/// have moved between the read we based a rewrite on and the write.
+fn same_file(a: &rustix::fs::Stat, b: &rustix::fs::Stat) -> bool {
+    (a.st_dev, a.st_ino, a.st_size, a.st_mtime, a.st_mtime_nsec)
+        == (b.st_dev, b.st_ino, b.st_size, b.st_mtime, b.st_mtime_nsec)
+}
+
+/// The store's bytes as a tree: Apple's converter, then our own parser.
+fn parse_store(bytes: &[u8]) -> Result<Plist, String> {
+    let xml = plutil("xml1", bytes)?;
+    parse_xml(std::str::from_utf8(&xml).map_err(|_| "plutil emitted no text")?)
 }
 
 /// The store's folder, held open by descriptor. Same custody machinery the
@@ -108,13 +135,12 @@ fn load(
     uri: &str,
     cutoff: i64,
     name: &str,
-) -> Result<(Plist, rustix::fs::Stat, Plist), String> {
+) -> Result<(rustix::fs::Stat, Plist), String> {
     for attempt in 0..=TRIES {
-        let (bytes, st) = read_store(dirfd)?;
-        let xml = plutil("xml1", &bytes)?;
-        let tree = parse_xml(std::str::from_utf8(&xml).map_err(|_| "plutil emitted no text")?)?;
+        let (bytes, st, _) = read_store(dirfd)?;
+        let tree = parse_store(&bytes)?;
         if let Some(t) = template(&tree, uri, Some(cutoff)) {
-            return Ok((tree, st, t));
+            return Ok((st, t));
         }
         if attempt == TRIES {
             // Only the DATE is ever relaxed: an older record of this image
@@ -123,15 +149,17 @@ fn load(
             let t = template(&tree, uri, None).ok_or_else(|| {
                 format!("the wallpaper helper did not record {name} in the store")
             })?;
-            return Ok((tree, st, t));
+            return Ok((st, t));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     Err("the store could not be read".into())
 }
 
-/// The store's bytes and the identity the rename will be checked against.
-fn read_store(dirfd: &OwnedFd) -> Result<(Vec<u8>, rustix::fs::Stat), String> {
+/// The store's bytes, the identity the rename will be checked against, and
+/// the descriptor itself — the replacement copies its metadata from that fd,
+/// not from a second lookup of the name.
+fn read_store(dirfd: &OwnedFd) -> Result<(Vec<u8>, rustix::fs::Stat, OwnedFd), String> {
     let fd = rustix::fs::openat(
         dirfd,
         "Index.plist",
@@ -149,11 +177,12 @@ fn read_store(dirfd: &OwnedFd) -> Result<(Vec<u8>, rustix::fs::Stat), String> {
         return Err("the store is not a plain unshared file you alone own".into());
     }
     let mut bytes = Vec::new();
-    std::fs::File::from(fd)
+    let mut f = std::fs::File::from(fd);
+    (&mut f)
         .take(MAX_STORE)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("cannot read the store: {e}"))?;
-    Ok((bytes, st))
+    Ok((bytes, st, OwnedFd::from(f)))
 }
 
 /// Apple's own converter, both directions. Reached by absolute path and
@@ -523,6 +552,210 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// base64 for the reader below: a `<data>` object decoded out of a nested
+/// plist is held the way the XML tree holds every other one.
+fn b64_encode(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            match i > c.len() {
+                true => out.push('='),
+                false => out.push(A[(n >> (18 - 6 * i)) as usize & 63] as char),
+            }
+        }
+    }
+    out
+}
+
+/// Big-endian integer of up to eight bytes, or nothing.
+fn be(b: &[u8]) -> Option<usize> {
+    if b.len() > 8 {
+        return None;
+    }
+    b.iter()
+        .try_fold(0usize, |v, &x| v.checked_mul(256)?.checked_add(x as usize))
+}
+
+/// A bounded reader for the `bplist00` blobs NESTED inside the store. The
+/// Configuration of a wallpaper choice is one, and reading its fields is the
+/// only honest way to know a record chooses our image rather than merely
+/// mentioning it.
+///
+/// Bounded everywhere, because this is somebody else's file: the trailer,
+/// every table offset and every object reference are range-checked against
+/// the blob, the graph is followed only to [`MAX_DEPTH`] so a cycle
+/// terminates, and container counts are capped. Types this tree cannot hold
+/// exactly — null, uid, fill, which XML plists have no syntax for — refuse
+/// rather than decode into a lie. A refusal is never a match, which is the
+/// direction that fails closed.
+fn bplist(blob: &[u8]) -> Option<Plist> {
+    if !blob.starts_with(b"bplist00") || blob.len() < 40 {
+        return None;
+    }
+    let trailer = &blob[blob.len() - 32..];
+    let (off_size, ref_size) = (trailer[6] as usize, trailer[7] as usize);
+    let (count, top, table) = (
+        be(&trailer[8..16])?,
+        be(&trailer[16..24])?,
+        be(&trailer[24..32])?,
+    );
+    if !(1..=8).contains(&off_size) || !(1..=8).contains(&ref_size) {
+        return None;
+    }
+    if count > MAX_OBJECTS || top >= count || table < 8 {
+        return None;
+    }
+    let end = table.checked_add(count.checked_mul(off_size)?)?;
+    if end > blob.len() - 32 {
+        return None;
+    }
+    let offsets: Option<Vec<usize>> = (0..count)
+        .map(|i| be(&blob[table + i * off_size..table + (i + 1) * off_size]))
+        .collect();
+    let offsets = offsets?;
+    Bin {
+        b: blob,
+        offsets,
+        ref_size,
+    }
+    .object(top, 0)
+}
+
+struct Bin<'a> {
+    b: &'a [u8],
+    offsets: Vec<usize>,
+    ref_size: usize,
+}
+
+impl Bin<'_> {
+    fn object(&self, idx: usize, depth: usize) -> Option<Plist> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        let at = *self.offsets.get(idx)?;
+        let marker = *self.b.get(at)?;
+        let low = (marker & 0x0F) as usize;
+        match marker >> 4 {
+            // Singletons: only the two booleans have a home in this tree.
+            0x0 => match marker {
+                0x08 => Some(Plist::Bool(false)),
+                0x09 => Some(Plist::Bool(true)),
+                _ => None,
+            },
+            // Widths are 2^nnnn; the eight-byte form is the signed one.
+            0x1 => {
+                let n = 1usize << low.min(4);
+                let v = be(self.b.get(at + 1..at + 1 + n)?)?;
+                Some(Plist::Integer(if n == 8 {
+                    (v as i64).to_string()
+                } else {
+                    v.to_string()
+                }))
+            }
+            0x2 => match self.b.get(at + 1..at + 1 + (1usize << low.min(4)))? {
+                b if b.len() == 4 => Some(Plist::Real(
+                    f32::from_be_bytes(b.try_into().ok()?).to_string(),
+                )),
+                b if b.len() == 8 => Some(Plist::Real(
+                    f64::from_be_bytes(b.try_into().ok()?).to_string(),
+                )),
+                _ => None,
+            },
+            // Seconds since 2001-01-01, spelled the way the XML tree spells
+            // every other date.
+            0x3 if marker == 0x33 => {
+                let secs = f64::from_be_bytes(self.b.get(at + 1..at + 9)?.try_into().ok()?);
+                iso_date(secs as i64 + 978_307_200)
+            }
+            0x4 => {
+                let (n, body) = self.count(at, low)?;
+                Some(Plist::Data(b64_encode(self.b.get(body..body + n)?)))
+            }
+            0x5 => {
+                let (n, body) = self.count(at, low)?;
+                let raw = self.b.get(body..body + n)?;
+                raw.is_ascii()
+                    .then(|| String::from_utf8(raw.to_vec()).ok())?
+                    .map(Plist::String)
+            }
+            0x6 => {
+                let (n, body) = self.count(at, low)?;
+                let raw = self.b.get(body..body + n.checked_mul(2)?)?;
+                let units: Vec<u16> = raw
+                    .chunks(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect();
+                String::from_utf16(&units).ok().map(Plist::String)
+            }
+            // Arrays and sets alike are ordered lists to this tree.
+            0xA | 0xC => {
+                let (n, body) = self.count(at, low)?;
+                let refs = self.b.get(body..body + n.checked_mul(self.ref_size)?)?;
+                refs.chunks(self.ref_size)
+                    .map(|r| self.object(be(r)?, depth + 1))
+                    .collect::<Option<Vec<_>>>()
+                    .map(Plist::Array)
+            }
+            0xD => {
+                let (n, body) = self.count(at, low)?;
+                let width = n.checked_mul(self.ref_size)?;
+                let keys = self.b.get(body..body + width)?;
+                let vals = self.b.get(body + width..body + width.checked_mul(2)?)?;
+                let mut out = Vec::new();
+                for (k, v) in keys.chunks(self.ref_size).zip(vals.chunks(self.ref_size)) {
+                    match self.object(be(k)?, depth + 1)? {
+                        Plist::String(name) => out.push((name, self.object(be(v)?, depth + 1)?)),
+                        _ => return None,
+                    }
+                }
+                Some(Plist::Dict(out))
+            }
+            _ => None,
+        }
+    }
+
+    /// A sized object's element count and where its body starts: `nnnn`, or
+    /// a spelled-out integer object when `nnnn` is 0xF.
+    fn count(&self, at: usize, low: usize) -> Option<(usize, usize)> {
+        let (n, body) = if low != 0x0F {
+            (low, at + 1)
+        } else {
+            let m = *self.b.get(at + 1)?;
+            if m >> 4 != 0x1 {
+                return None;
+            }
+            let w = 1usize << (m & 0x0F).min(4);
+            (be(self.b.get(at + 2..at + 2 + w)?)?, at + 2 + w)
+        };
+        (n <= MAX_ITEMS).then_some((n, body))
+    }
+}
+
+/// UNIX seconds as `YYYY-MM-DDTHH:MM:SSZ` — the inverse of [`date_secs`],
+/// so a date read out of a nested plist reads like every other one here.
+fn iso_date(t: i64) -> Option<Plist> {
+    let (days, rest) = (t.div_euclid(86_400), t.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    Some(Plist::Date(format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )))
+}
+
 /// `YYYY-MM-DDTHH:MM:SSZ` to UNIX seconds — the inverse of the civil-date
 /// walk report.rs uses for the library table.
 fn date_secs(s: &str) -> Option<i64> {
@@ -579,11 +812,12 @@ fn desktops<'a>(v: &'a Plist, out: &mut Vec<&'a Plist>) {
     }
 }
 
-/// Does this record name our image? The helper writes the path inside the
-/// nested binary plist under `Configuration`, so the URI must sit there as a
-/// WHOLE string object — a bare substring would read a record naming
-/// `…/new.jpg2` as one naming `…/new.jpg`. Older builds put the path in
-/// `Files` as plain text instead, which is exact already.
+/// Does this record name our image? The `Configuration` blob is a nested
+/// binary plist, and the answer is read from its FIELDS — an `imageFile`
+/// choice whose `url.relative` IS our URI — never from the bytes it happens
+/// to contain. A record can mention a path in a field that does not choose
+/// it, so anything short of parsing attributes the wrong wallpaper. Older
+/// builds put the path in `Files` as plain text instead, already exact.
 fn names(rec: &Plist, uri: &str) -> bool {
     let choice = match rec.get("Content").and_then(|c| c.get("Choices")) {
         Some(Plist::Array(a)) => match a.first() {
@@ -594,36 +828,15 @@ fn names(rec: &Plist, uri: &str) -> bool {
     };
     if let Some(Plist::Data(b64)) = choice.get("Configuration")
         && let Some(bytes) = b64_decode(b64)
-        && framed_string(&bytes, uri.as_bytes())
+        && let Some(conf) = bplist(&bytes)
+        && matches!(conf.get("type"), Some(Plist::String(t)) if t == "imageFile")
+        && matches!(conf.get("url").and_then(|u| u.get("relative")),
+                    Some(Plist::String(r)) if r == uri)
     {
         return true;
     }
     matches!(choice.get("Files"), Some(Plist::Array(fs))
         if fs.iter().any(|f| matches!(f.get("relative"), Some(Plist::String(r)) if r == uri)))
-}
-
-/// Does `blob` hold `want` as a COMPLETE binary-plist ASCII string object?
-/// The length sits in the marker just before the bytes — `0x50|n` while it
-/// fits, else its own integer — so a declared length equal to ours is what
-/// proves the object ends where we do. (Percent-encoding leaves the URI
-/// pure ASCII, so the UTF-16 markers cannot arise.)
-fn framed_string(blob: &[u8], want: &[u8]) -> bool {
-    let n = want.len();
-    if n == 0 || blob.len() < n {
-        return false;
-    }
-    let marker: Vec<u8> = match n {
-        1..=14 => vec![0x50 | n as u8],
-        15..=255 => vec![0x5F, 0x10, n as u8],
-        _ if n <= u16::MAX as usize => {
-            let [hi, lo] = (n as u16).to_be_bytes();
-            vec![0x5F, 0x11, hi, lo]
-        }
-        _ => return false,
-    };
-    blob.windows(n)
-        .enumerate()
-        .any(|(at, w)| w == want && blob[..at].ends_with(&marker))
 }
 
 /// The freshest record of this image, or nothing. `after` is the helper's
@@ -686,11 +899,17 @@ fn rewrite(tree: &mut Plist, template: &Plist) -> Result<usize, String> {
         && let Some((_, all)) = root.iter_mut().find(|(k, _)| k == "AllSpacesAndDisplays")
         && matches!(all, Plist::Dict(_))
     {
-        if all.get("Desktop").is_none() {
+        let seeded = all.get("Desktop").is_none();
+        if seeded {
             all.set("Desktop", template.clone());
             n += 1;
         }
-        if all.get("Idle").is_some() {
+        // A slot we just gave a desktop is no longer the "idle" shape, with
+        // or without an Idle record beside it — leaving Type as "idle" is
+        // what made the seeded wallpaper invisible. A slot that already had
+        // a Desktop and no Idle keeps whatever Type it had: not ours to
+        // invent.
+        if seeded || all.get("Idle").is_some() {
             all.set("Type", Plist::String("individual".into()));
         }
     }
@@ -739,12 +958,22 @@ fn walk(v: &mut Plist, template: &Plist, n: &mut usize) {
 
 // ---------------------------------------------------------------- the write
 
-/// Replace the store through the audited descriptor: a fresh temp with the
-/// original's mode, fsync, the identity of what we read re-checked, then
-/// rename(2). Any failure unlinks the temp and the store is as it was. The
-/// quarantine xattr is deliberately not carried over — the agent re-applies
-/// its own.
-fn replace_store(dirfd: &OwnedFd, was: &rustix::fs::Stat, bytes: &[u8]) -> Result<(), String> {
+/// Replace the store through the audited descriptor: a fresh temp carrying
+/// the original's mode, group and extended attributes, fsync, the identity
+/// of what we read re-checked, then rename(2) and an fsync of the folder.
+/// Any failure unlinks the temp and the store is as it was.
+///
+/// ACLs and BSD flags are deliberately NOT carried: neither has a safe
+/// binding here and this crate denies unsafe code, so copying them would
+/// cost the guarantee that buys everything else. The store carries neither
+/// on a stock system — and a refusal is not the failure mode, an
+/// unannounced one is, which is why every attribute copy below is fatal.
+fn replace_store(
+    dirfd: &OwnedFd,
+    src: &OwnedFd,
+    was: &rustix::fs::Stat,
+    bytes: &[u8],
+) -> Result<(), String> {
     let mut made = None;
     for seq in 0..8u32 {
         let name = format!(".Index.plist.theme.{}.{seq}", std::process::id());
@@ -763,36 +992,37 @@ fn replace_store(dirfd: &OwnedFd, was: &rustix::fs::Stat, bytes: &[u8]) -> Resul
         }
     }
     let (tmp, fd) = made.ok_or("the store folder is full of stale theme temporaries")?;
-    let mut f = std::fs::File::from(fd);
-    let done = (|| -> Result<(), String> {
+    let name = tmp.as_str();
+    let done = (move || -> Result<(), String> {
+        // umask filters open(2)'s mode but never fchmod(2), so the exact
+        // permission bits are set through the descriptor afterwards.
+        rustix::fs::fchmod(&fd, Mode::from_raw_mode(was.st_mode & 0o7777))
+            .map_err(|e| format!("cannot set the store's mode: {e}"))?;
+        // The group travels with the file; the owner stays us. A refusal is
+        // only tolerable when the group is already right.
+        if let Err(e) = rustix::fs::fchown(&fd, None, Some(rustix::fs::Gid::from_raw(was.st_gid)))
+            && !(e == Errno::PERM && rustix::fs::fstat(&fd).map(|s| s.st_gid) == Ok(was.st_gid))
+        {
+            return Err(format!("cannot set the store's group: {e}"));
+        }
+        copy_xattrs(src, &fd)?;
+        let mut f = std::fs::File::from(fd);
         f.write_all(bytes)
             .map_err(|e| format!("cannot write the store: {e}"))?;
         f.sync_all().map_err(|e| format!("fsync failed: {e}"))?;
         let now = rustix::fs::statat(dirfd, "Index.plist", AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|e| format!("cannot re-check the store: {e}"))?;
-        if (
-            now.st_dev,
-            now.st_ino,
-            now.st_size,
-            now.st_mtime,
-            now.st_mtime_nsec,
-        ) != (
-            was.st_dev,
-            was.st_ino,
-            was.st_size,
-            was.st_mtime,
-            was.st_mtime_nsec,
-        ) {
+        if !same_file(&now, was) {
             return Err("the store changed underneath the sync".into());
         }
-        rustix::fs::renameat(dirfd, tmp.as_str(), dirfd, "Index.plist")
+        rustix::fs::renameat(dirfd, name, dirfd, "Index.plist")
             .map_err(|e| format!("cannot replace the store: {e}"))
     })();
     match done {
-        Ok(()) => {
-            let _ = rustix::fs::fsync(dirfd);
-            Ok(())
-        }
+        // The rename is only durable once the DIRECTORY is synced; a crash
+        // in between can leave the entry pointing at neither file.
+        Ok(()) => rustix::fs::fsync(dirfd)
+            .map_err(|e| format!("the store was replaced but its folder did not sync: {e}")),
         Err(e) => {
             let _ = rustix::fs::unlinkat(dirfd, tmp.as_str(), AtFlags::empty());
             Err(e)
@@ -800,24 +1030,59 @@ fn replace_store(dirfd: &OwnedFd, was: &rustix::fs::Stat, bytes: &[u8]) -> Resul
     }
 }
 
+/// Carry every extended attribute across to the replacement — macOS keeps
+/// the quarantine flag here, and a store that quietly loses its attributes
+/// is not the file we promised to replace. Bounded buffers, so an
+/// attribute set larger than anything legitimate refuses (ERANGE) rather
+/// than growing; and every failure is fatal BEFORE the rename, never a
+/// silent half-copy.
+fn copy_xattrs(from: &OwnedFd, to: &OwnedFd) -> Result<(), String> {
+    let mut names = [0u8; 4096];
+    let n = rustix::fs::flistxattr(from, &mut names[..])
+        .map_err(|e| format!("cannot list the store's attributes: {e}"))?;
+    let mut value = [0u8; 64 * 1024];
+    for raw in names[..n].split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        let name = std::str::from_utf8(raw)
+            .map_err(|_| "the store has an attribute name that is not text".to_string())?;
+        let len = rustix::fs::fgetxattr(from, name, &mut value[..])
+            .map_err(|e| format!("cannot read the store's {name}: {e}"))?;
+        rustix::fs::fsetxattr(to, name, &value[..len], rustix::fs::XattrFlags::empty())
+            .map_err(|e| format!("cannot carry over the store's {name}: {e}"))?;
+    }
+    Ok(())
+}
+
 /// The user's own WallpaperAgent, by exact process name and our uid only —
-/// no other process ever receives a signal from here.
-fn agent_pids() -> Vec<Pid> {
+/// no other process ever receives a signal from here. Anything short of a
+/// clean answer is an error: a missing or untrusted pgrep, a spawn that
+/// failed, an exit code that means neither "found" nor "no match", a line
+/// that is not a pid. An agent whose state we do not know is one we must
+/// not write behind.
+fn agent_pids() -> Result<Vec<Pid>, String> {
     if !trusted_system_binary(PGREP) {
-        return Vec::new();
+        return Err("no trusted /usr/bin/pgrep".into());
     }
     let uid = rustix::process::getuid().as_raw().to_string();
-    let Ok(out) = trusted_spawn(Path::new(PGREP))
+    let out = trusted_spawn(Path::new(PGREP))
         .args(["-x", "-u", &uid, "WallpaperAgent"])
         .output()
-    else {
-        return Vec::new();
-    };
+        .map_err(|e| format!("cannot run pgrep: {e}"))?;
+    match out.status.code() {
+        Some(0) => {}
+        // pgrep's documented "nothing matched" — a real answer, not a fault.
+        Some(1) => return Ok(Vec::new()),
+        other => return Err(format!("pgrep answered {other:?}")),
+    }
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
-        .filter_map(|l| l.parse().ok().and_then(Pid::from_raw))
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            l.parse()
+                .ok()
+                .and_then(Pid::from_raw)
+                .ok_or_else(|| format!("pgrep printed {l:?}, which is not a pid"))
+        })
         .collect()
 }
 
@@ -827,19 +1092,58 @@ fn agent_pids() -> Vec<Pid> {
 struct Paused(Vec<Pid>);
 
 impl Paused {
-    fn new(pids: Vec<Pid>) -> Paused {
-        for p in &pids {
-            let _ = kill_process(*p, Signal::STOP);
+    /// Only pids that ACTUALLY stopped are held: one that vanished (ESRCH)
+    /// was never ours to resume, and any other refusal means we cannot hold
+    /// the store still at all — so the ones already stopped are resumed and
+    /// nothing is written.
+    fn new(pids: Vec<Pid>) -> Result<Paused, String> {
+        let mut held = Vec::new();
+        for p in pids {
+            match kill_process(p, Signal::STOP) {
+                Ok(()) => held.push(p),
+                Err(Errno::SRCH) => {}
+                Err(e) => {
+                    drop(Paused(held));
+                    return Err(format!("cannot pause the wallpaper agent: {e}"));
+                }
+            }
         }
-        Paused(pids)
+        Ok(Paused(held))
     }
 
-    fn release(mut self) {
-        let pids = std::mem::take(&mut self.0);
-        for p in &pids {
-            let _ = kill_process(*p, Signal::CONT);
+    /// Resume, then ask the agent to reload. Both are checked against a
+    /// FRESH pgrep, so a pid the kernel reused since the pause is never
+    /// signalled — but if that check itself fails, CONT still goes out: an
+    /// agent left stopped is a desktop that never repaints again, while a
+    /// CONT to something that is not stopped does nothing. TERM has no such
+    /// excuse and is skipped instead. A pid that would not resume stays in
+    /// the guard, so Drop tries once more.
+    fn release(mut self) -> Result<(), String> {
+        let fresh = agent_pids();
+        let held = std::mem::take(&mut self.0);
+        let mut stuck = Vec::new();
+        {
+            let known = fresh.as_ref().ok();
+            let mine = |p: &Pid| known.is_none_or(|l| l.contains(p));
+            for p in held.iter().copied().filter(mine) {
+                if let Err(e) = kill_process(p, Signal::CONT)
+                    && e != Errno::SRCH
+                {
+                    stuck.push(format!("{} ({e})", p.as_raw_nonzero()));
+                    self.0.push(p);
+                }
+            }
         }
-        reload_agent(&pids);
+        if !stuck.is_empty() {
+            return Err(format!(
+                "the wallpaper agent is still paused (pid {})",
+                stuck.join(", ")
+            ));
+        }
+        let live = fresh?;
+        let still: Vec<Pid> = held.into_iter().filter(|p| live.contains(p)).collect();
+        reload_agent(&still);
+        Ok(())
     }
 }
 
@@ -941,10 +1245,37 @@ mod tests {
 "#;
 
     const NEW_URI: &str = "file:///Users/example/wallpapers/new.jpg";
-    /// `bplist00` + the `0x5F 0x10 0x28` string marker + the URI — the
-    /// framing the live store really uses, which `names` now demands.
-    const NEW_B64: &str = "YnBsaXN0MDBfEChmaWxlOi8vL1VzZXJzL2V4YW1wbGUvd2FsbHBhcGVycy9uZXcuanBn";
-    const OLD_B64: &str = "YnBsaXN0MDBfEChmaWxlOi8vL1VzZXJzL2V4YW1wbGUvd2FsbHBhcGVycy9vbGQuanBn";
+
+    // The Configuration fixtures are REAL binary plists: each was written
+    // once as XML, converted with `plutil -convert binary1`, and pasted here
+    // base64. Their shape is the live store's own, verified read-only —
+    // `{type: "imageFile", url: {relative: <the URI>}}`.
+    const NEW_B64: &str = concat!(
+        "YnBsaXN0MDDSAQIDBFR0eXBlU3VybFlpbWFnZUZpbGXRBQZYcmVsYXRpdmVfEC",
+        "hmaWxlOi8vL1VzZXJzL2V4YW1wbGUvd2FsbHBhcGVycy9uZXcuanBnCA0SFiAj",
+        "LAAAAAAAAAEBAAAAAAAAAAcAAAAAAAAAAAAAAAAAAABX",
+    );
+    const OLD_B64: &str = concat!(
+        "YnBsaXN0MDDSAQIDBFR0eXBlU3VybFlpbWFnZUZpbGXRBQZYcmVsYXRpdmVfEC",
+        "hmaWxlOi8vL1VzZXJzL2V4YW1wbGUvd2FsbHBhcGVycy9vbGQuanBnCA0SFiAj",
+        "LAAAAAAAAAEBAAAAAAAAAAcAAAAAAAAAAAAAAAAAAABX",
+    );
+    /// `{ActualTarget: file:///different.jpg, type: imageFile,
+    /// url: {relative: file:///different.jpg}, unrelated: <NEW_URI>}` — our
+    /// URI is in there, but not as the thing this choice chooses.
+    const DECOY_B64: &str = concat!(
+        "YnBsaXN0MDDUAQIDBAUIBwlTdXJsVHR5cGVcQWN0dWFsVGFyZ2V0WXVucmVsYX",
+        "RlZNEGB1hyZWxhdGl2ZV8QFWZpbGU6Ly8vZGlmZmVyZW50LmpwZ1lpbWFnZUZp",
+        "bGVfEChmaWxlOi8vL1VzZXJzL2V4YW1wbGUvd2FsbHBhcGVycy9uZXcuanBnCB",
+        "EVGicxND1VXwAAAAAAAAEBAAAAAAAAAAoAAAAAAAAAAAAAAAAAAACK",
+    );
+    /// The same shape with `url.relative` written as DATA holding the URI's
+    /// bytes: the right field, the wrong kind of object.
+    const INDATA_B64: &str = concat!(
+        "YnBsaXN0MDDSAQIDBFR0eXBlU3VybFlpbWFnZUZpbGXRBQZYcmVsYXRpdmVPEC",
+        "hmaWxlOi8vL1VzZXJzL2V4YW1wbGUvd2FsbHBhcGVycy9uZXcuanBnCA0SFiAj",
+        "LAAAAAAAAAEBAAAAAAAAAAcAAAAAAAAAAAAAAAAAAABX",
+    );
     const AERIALS: &str = "com.apple.wallpaper.choice.aerials";
 
     fn d(items: Vec<(&str, Plist)>) -> Plist {
@@ -1167,24 +1498,72 @@ mod tests {
         assert!(template(&none, NEW_URI, None).is_none());
     }
 
-    /// The URI must sit in the blob as a WHOLE bplist string object. The
-    /// length prefix is what proves it: a record naming a longer path that
-    /// merely starts with ours is a different wallpaper.
+    /// Attribution reads the Configuration's FIELDS. Mentioning our URI
+    /// somewhere in the blob is not choosing it, and neither is carrying it
+    /// in the right field as the wrong kind of object.
     #[test]
-    fn only_a_framed_string_object_attributes_a_record() {
-        let uri = NEW_URI.as_bytes();
-        let n = uri.len() as u8;
-        let blob = |m: &[u8], tail: &[u8]| [b"bplist00".as_slice(), m, uri, tail].concat();
-        assert!(framed_string(&blob(&[0x5F, 0x10, n], b""), uri));
-        // One byte longer: the same prefix, a different file.
-        assert!(!framed_string(&blob(&[0x5F, 0x10, n + 1], b"2"), uri));
-        // Unframed, and framed with the wrong length marker.
-        assert!(!framed_string(uri, uri));
-        assert!(!framed_string(&blob(&[0x5F, 0x11, 0, n], b""), uri));
-        // A short name carries its length in the marker itself.
-        let short = b"file:///a.jpg";
-        assert!(framed_string(&[&[0x5D][..], short].concat(), short));
-        assert!(!framed_string(short, short));
+    fn only_the_chosen_url_attributes_a_record() {
+        let slot = |b64: &str| rec(IMAGE, b64, Plist::Array(vec![]), "2026-09-03T06:44:55Z");
+        assert!(names(&slot(NEW_B64), NEW_URI));
+        assert!(!names(&slot(OLD_B64), NEW_URI));
+        // A valid plist naming a different file, with our URI sitting in an
+        // unrelated field.
+        assert!(!names(&slot(DECOY_B64), NEW_URI));
+        // url.relative holding the URI's BYTES rather than the string.
+        assert!(!names(&slot(INDATA_B64), NEW_URI));
+        // The decoy really does contain our URI — the old substring test
+        // would have taken it.
+        assert!(
+            b64_decode(DECOY_B64)
+                .unwrap()
+                .windows(NEW_URI.len())
+                .any(|w| w == NEW_URI.as_bytes())
+        );
+    }
+
+    /// The blob is somebody else's file, so every malformed one refuses —
+    /// and none of them may panic or recurse off the stack.
+    #[test]
+    fn hostile_bplists_refuse_without_panicking() {
+        let good = b64_decode(NEW_B64).unwrap();
+        assert!(bplist(&good).is_some());
+        let patch = |at: usize, with: &[u8]| {
+            let mut b = good.clone();
+            b[at..at + with.len()].copy_from_slice(with);
+            b
+        };
+        let n = good.len();
+        let cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"bplist00".to_vec(),
+            // Truncated trailer, and a body cut off mid-object.
+            good[..n - 10].to_vec(),
+            good[..12].to_vec(),
+            // An offset table pointing past the end of the blob.
+            patch(n - 8, &[0xFF; 8]),
+            // The first object's offset, past the end.
+            patch(n - 33, &[0xFE]),
+            // An object count, and a top-object index, beyond any ceiling.
+            patch(n - 24, &[0xFF; 8]),
+            patch(n - 16, &[0xFF; 8]),
+            // Nonsense offset and reference widths.
+            patch(n - 26, &[0]),
+            patch(n - 25, &[0xFF]),
+            // A dict of one entry whose value is the dict itself.
+            [
+                b"bplist00".as_slice(),
+                &[0xD1, 0x01, 0x00, 0x51, b'a'],
+                &[8, 11],
+                &[0, 0, 0, 0, 0, 0, 0, 1, 1],
+                &[0, 0, 0, 0, 0, 0, 0, 2],
+                &[0, 0, 0, 0, 0, 0, 0, 0],
+                &[0, 0, 0, 0, 0, 0, 0, 13],
+            ]
+            .concat(),
+        ];
+        for bad in cases {
+            assert!(bplist(&bad).is_none(), "accepted {} bytes", bad.len());
+        }
     }
 
     /// A slot may carry fields this tool has never heard of — a future
@@ -1203,6 +1582,22 @@ mod tests {
         assert_eq!(got.get("LastUse"), dest.get("LastUse"));
         assert_eq!(got.get("Content"), template.get("Content"));
         assert_eq!(got.get("LastSet"), template.get("LastSet"));
+    }
+
+    /// A store with no all-Spaces slot gets one, and it must say what it is:
+    /// a seeded Desktop left under Type "idle" never shows.
+    #[test]
+    fn a_seeded_all_spaces_slot_says_it_is_individual() {
+        let template = image(NEW_B64, "2026-09-03T06:44:55Z");
+        let mut tree = d(vec![(
+            "SystemDefault",
+            d(vec![("Desktop", template.clone())]),
+        )]);
+        rewrite(&mut tree, &template).unwrap();
+        let all = tree.get("AllSpacesAndDisplays").unwrap();
+        assert_eq!(all.get("Desktop"), Some(&template));
+        assert_eq!(all.get("Type"), Some(&s("individual")));
+        assert_eq!(all.get("Idle"), None);
     }
 
     /// A shape we do not recognise is refused whole — never half-converted.
@@ -1251,10 +1646,20 @@ mod tests {
     }
 
     #[test]
-    fn base64_decodes_wrapped_text_and_refuses_junk() {
-        assert!(b64_decode(NEW_B64).unwrap().ends_with(NEW_URI.as_bytes()));
+    fn base64_round_trips_and_refuses_junk() {
+        // Both directions, against a real plutil-written blob.
+        assert_eq!(b64_encode(&b64_decode(NEW_B64).unwrap()), NEW_B64);
         assert_eq!(b64_decode("aGVs\n\t bG8=").unwrap(), b"hello");
         assert_eq!(b64_decode("").unwrap(), b"");
+        for (bytes, text) in [
+            (&b""[..], ""),
+            (b"a", "YQ=="),
+            (b"ab", "YWI="),
+            (b"abc", "YWJj"),
+        ] {
+            assert_eq!(b64_encode(bytes), text);
+            assert_eq!(b64_decode(text).unwrap(), bytes);
+        }
         for bad in ["a", "!!!!", "aGVsbG8=x", "====", "aG=l", "aGVsbG8-"] {
             assert!(b64_decode(bad).is_none(), "accepted {bad:?}");
         }
