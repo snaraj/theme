@@ -3,8 +3,8 @@ name: release
 # Standalone release chain: an immutable v*.*.* tag on main builds binaries
 # for every supported target and publishes them as a GitHub Release with
 # checksums. No coupling to anything outside this repository. The
-# workflow_dispatch path is the pre-tag proof: it runs the full build matrix
-# and skips publishing.
+# workflow_dispatch path is the pre-tag proof: it runs the full build
+# matrix, installs what it built, and skips publishing.
 
 on:
   push:
@@ -99,9 +99,53 @@ jobs:
             theme-*.rpm
           if-no-files-found: error
 
+  # Nothing ships that has not been installed and run. The packages go in
+  # through the real package managers — offline, artifact mounted
+  # read-only — on the runner itself (Ubuntu 22.04 IS the glibc floor) and
+  # in three distro images. Those images are the only third-party artifact
+  # in the release path, so each is pinned by manifest-list digest with the
+  # tag it was resolved from beside it.
+  smoke:
+    needs: build
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: theme-${{ matrix.target }}
+      - run: |
+          VER=$([ "$GITHUB_REF_TYPE" = tag ] && echo "${GITHUB_REF_NAME#v}" || echo 0.0.0)
+          # `theme version` reports the CRATE version, which equals the
+          # package version only on a real tag; the package manager is the
+          # one asked what version it installed.
+          cat >check.sh <<'EOF'
+          set -eu
+          export THEME_NO_UPDATE_CHECK=1 THEME_NO_APPLY=1 THEME_CACHE_DIR=/tmp/tc
+          theme version
+          theme version | grep -qE '^version: v[0-9]+\.[0-9]+\.[0-9]+'
+          theme help >/dev/null
+          EOF
+          sudo apt-get install -y ./theme_*.deb
+          dpkg -s theme | grep -qx "Version: $VER"
+          sh check.sh
+          deb='apt-get install -y /pkg/theme_*.deb && dpkg -s theme | grep -qx "Version: $VER" && sh /pkg/check.sh'
+          rpm='dnf -y --disablerepo="*" install /pkg/theme-*.rpm && rpm -q theme | grep -q "^theme-$VER-1\." && sh /pkg/check.sh'
+          box() { docker run --rm --network none -e VER="$VER" -e DEBIAN_FRONTEND=noninteractive -v "$PWD:/pkg:ro" "$@"; }
+          box debian:12@sha256:6ebd97fa83deb272194a2cf015b3d26a4d538e9ad3a7a79d544c8af5b0a01443 sh -c "$deb" # debian:12
+          box ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc sh -c "$deb" # ubuntu:22.04
+          box fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80 sh -c "$rpm" # fedora:latest
+
   publish:
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [build, smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
