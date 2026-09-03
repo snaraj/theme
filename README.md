@@ -25,11 +25,9 @@ brew install snaraj/theme/theme
 **Debian, Ubuntu, Fedora, RHEL** — take the `.deb` or `.rpm` for your
 architecture from the
 [releases page](https://github.com/snaraj/theme/releases), then
-`sudo apt install ./theme_*.deb` or `sudo dnf install ./theme-*.rpm`.
-Both want glibc 2.39 or newer (Ubuntu 24.04, Debian 13, Fedora 40) and say
-so rather than installing a binary that cannot run.
-
-**Arch** — `theme-bin` on the AUR.
+`sudo apt install ./theme_*.deb` or `sudo dnf install ./theme-*.rpm`. Each
+declares the glibc it needs (2.39 today), so an older distro refuses the
+install rather than leaving you a command that cannot run.
 
 **Anywhere else** — the tarball, one file, no installer:
 
