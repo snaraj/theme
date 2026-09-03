@@ -172,9 +172,10 @@ pub fn usage(cfg: &Config) {
         Some(d) => display_text(d.file_stem().and_then(|s| s.to_str()).unwrap_or("")),
         None => "<none>".into(),
     };
-    // The title line opens every bare screen — the same compile-time
-    // version the `version` subcommand reports.
-    println!("theme v{}", env!("CARGO_PKG_VERSION"));
+    // The wallpaper's own name opens the header, unlabelled; the CLI's
+    // version closes it as the last field — the same compile-time answer
+    // the `version` subcommand gives.
+    let ver = format!("v{}", env!("CARGO_PKG_VERSION"));
     let cols = columns();
     let desk_file = desk.as_deref().filter(|d| d.is_file());
     if cols >= SIDE_MIN {
@@ -191,15 +192,16 @@ pub fn usage(cfg: &Config) {
             };
             format!("{}{tail}", swatch_row(&eight))
         };
+        // The name row spans the label column too, so it gets those 13
+        // cells back on top of a value's width.
         let availw = cols.saturating_sub(18 + 13).max(12);
-        let name = truncate_ellipsis(&name, availw);
         let rlines = [
             String::new(),
-            format!("{:<12} {}", "THEME", name),
+            truncate_ellipsis(&name, availw + 13),
             format!("{:<12} {}", "COLORSCHEME", sw),
             format!("{:<12} {}", "TERMINAL", term),
             format!("{:<12} {}", "OS", os),
-            String::new(),
+            format!("{:<12} {}", "THEME CLI", ver),
         ];
         let pv = desk_file.and_then(|d| render_preview(d, IMG_COLS, IMG_ROWS));
         match pv {
@@ -239,6 +241,8 @@ pub fn usage(cfg: &Config) {
         }
         println!();
         let vw = cols.saturating_sub(4).max(12);
+        // No label column to share here, so the name simply leads the block.
+        println!("  {}", truncate_ellipsis(&name, vw));
         let n = (cols.saturating_sub(4) / 4).clamp(1, 8);
         let sw = if eight.is_empty() {
             "<none>".to_string()
@@ -246,10 +250,10 @@ pub fn usage(cfg: &Config) {
             swatch_row(&eight[..n.min(eight.len())])
         };
         for (l, v) in [
-            ("THEME", truncate_ellipsis(&name, vw)),
             ("COLORSCHEME", sw),
             ("TERMINAL", term),
             ("OS", truncate_ellipsis(&os, vw)),
+            ("THEME CLI", ver),
         ] {
             println!("  {l}");
             println!("    {v}");

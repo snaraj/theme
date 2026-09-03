@@ -1502,7 +1502,7 @@ else:
 starters = ('Apply Commands:', 'Library Commands:', 'Info Commands:', 'Usage:',
             'Global Flags', 'Use "', 'current theme:', 'mode:', 'color scheme:',
             'palette source:', 'palette image:', 'wallpaper dir:', 'variables:',
-            'update to the latest', 'to update run:', 'wallpapers', 'theme v')
+            'update to the latest', 'to update run:', 'wallpapers')
 for l in lines:
     if l and not l.startswith(' ') and not l.startswith(starters):
         sys.exit('column-0 line outside the known starters: %r' % l)
@@ -1520,12 +1520,12 @@ narrow_run() { # $1 COLUMNS, rest: theme args
 narrowck() { python3 "$fixture/narrowck.py" "$narrow_out" "$@" 2>&1; }
 
 narrow_run 100
-if [ "$narrow_rc" = 0 ] && why=$(narrowck 100 6 14) && grep -q '#.*THEME' "$narrow_out"; then
+if [ "$narrow_rc" = 0 ] && why=$(narrowck 100 6 14) && grep -q '#.*COLORSCHEME' "$narrow_out"; then
     pass "wide bare screen keeps the side-by-side header"
 else fail "wide bare screen regressed (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
 narrow_run 40
 if [ "$narrow_rc" = 0 ] && why=$(narrowck 40 6 14) && ! grep -q '#.*THEME' "$narrow_out" \
-   && grep -q '^  THEME$' "$narrow_out"; then
+   && grep -q '^  THEME CLI$' "$narrow_out"; then
     pass "40 columns stacks: image whole above, fields below"
 else fail "40-column bare screen broke (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
 narrow_run 25
@@ -1585,19 +1585,19 @@ narrow_pty() { # $1 cols, rest: theme args — a real tty answer, no COLUMNS
 }
 narrow_pty 42
 if [ "$narrow_rc" = 0 ] && why=$(narrowck 42 6 14) && ! grep -q '#.*THEME' "$narrow_out" \
-   && grep -q '^  THEME$' "$narrow_out"; then
+   && grep -q '^  THEME CLI$' "$narrow_out"; then
     pass "a real 42-column tty stacks with COLUMNS unset"
 else fail "the tty's own width was ignored (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
 
-# The title line opens the bare screen at every width, shaped like the
-# version subcommand's answer.
-if [ "$(head -1 "$narrow_out")" = "theme v$cur_ver" ]; then
-    pass "the narrow bare screen opens with 'theme v$cur_ver'"
-else fail "narrow title line wrong: $(head -1 "$narrow_out")"; fi
+# The header opens with the wallpaper's OWN name — no label, no title line —
+# and closes with the CLI version the `version` subcommand reports.
+if grep -q '^  narrow-check.*…$' "$narrow_out" && grep -q "^    v$cur_ver\$" "$narrow_out"; then
+    pass "the stacked header leads with the truncated name and ends with v$cur_ver"
+else fail "stacked header wrong: $(tail -3 "$narrow_out")"; fi
 narrow_run 100
-if [ "$(head -1 "$narrow_out")" = "theme v$cur_ver" ]; then
-    pass "the wide bare screen opens with 'theme v$cur_ver'"
-else fail "wide title line wrong: $(head -1 "$narrow_out")"; fi
+if grep -q '#.*narrow-check' "$narrow_out" && grep -q "THEME CLI *v$cur_ver" "$narrow_out"; then
+    pass "the wide header carries the name beside the image and ends with v$cur_ver"
+else fail "wide header wrong: $(tail -3 "$narrow_out")"; fi
 
 # --- no kitty, no protocol: absence is clean (portability doctrine) ---------
 # On an iTerm2-class terminal (no KITTY_WINDOW_ID) the screen must carry
@@ -1608,7 +1608,7 @@ env COLUMNS=42 KITTY_WINDOW_ID= PATH="$narrowbin:$sweepbin:$PATH" \
     THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
     "$THEME" >"$narrow_out" 2>&1
 if [ "$?" = 0 ] && ! grep -q "$(printf '\033_G')" "$narrow_out" \
-   && ! grep -q '#' "$narrow_out" && grep -q '^  THEME$' "$narrow_out" \
+   && ! grep -q '#' "$narrow_out" && grep -q '^  THEME CLI$' "$narrow_out" \
    && why=$(narrowck 42 0 0); then
     pass "no kitty means no graphics bytes, fields intact"
 else fail "non-kitty degradation leaked protocol: ${why:-$(tail -3 "$narrow_out")}"; fi
