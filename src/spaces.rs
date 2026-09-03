@@ -22,6 +22,7 @@ use crate::save::{trusted_spawn, trusted_system_binary};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process};
+use std::cell::Cell;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,13 @@ const MAX_DEPTH: usize = 64;
 /// bytes, so both sit orders of magnitude above anything legitimate.
 const MAX_OBJECTS: usize = 4096;
 const MAX_ITEMS: usize = 1024;
+/// Total objects one blob may cost to decode. Depth and object count bound
+/// the SHAPE but not the WORK: references may be shared, so a blob whose
+/// every level points at the same few objects re-walks them once per path —
+/// exponential while still shallow, small and cycle-free. A legitimate plist
+/// visits each object about once, so sixteen visits apiece is generous cover
+/// for shared keys and values and still turns that blob into a refusal.
+const MAX_EVALS: usize = MAX_OBJECTS * 16;
 
 /// Copy the record the helper just wrote into every other slot of the store.
 /// `helper_started` is the instant BEFORE the helper ran: it is what
@@ -621,6 +629,7 @@ fn bplist(blob: &[u8]) -> Option<Plist> {
         b: blob,
         offsets,
         ref_size,
+        budget: Cell::new(MAX_EVALS),
     }
     .object(top, 0)
 }
@@ -629,6 +638,8 @@ struct Bin<'a> {
     b: &'a [u8],
     offsets: Vec<usize>,
     ref_size: usize,
+    /// What is left of [`MAX_EVALS`], spent across the whole decode.
+    budget: Cell<usize>,
 }
 
 impl Bin<'_> {
@@ -636,6 +647,9 @@ impl Bin<'_> {
         if depth > MAX_DEPTH {
             return None;
         }
+        // One budget for the entire decode, not per branch: that is what
+        // makes a fan-out blob cost arithmetic rather than exponential work.
+        self.budget.set(self.budget.get().checked_sub(1)?);
         let at = *self.offsets.get(idx)?;
         let marker = *self.b.get(at)?;
         let low = (marker & 0x0F) as usize;
@@ -1582,6 +1596,52 @@ mod tests {
         assert_eq!(got.get("LastUse"), dest.get("LastUse"));
         assert_eq!(got.get("Content"), template.get("Content"));
         assert_eq!(got.get("LastSet"), template.get("LastSet"));
+    }
+
+    /// `levels` arrays, each holding `fan` references to the next, with a
+    /// string at the bottom. Built by hand because the shape that costs
+    /// exponential work — small, shallow, cycle-free, and all fan-out — is
+    /// not one plutil would ever write.
+    fn fanout(levels: usize, fan: usize) -> Vec<u8> {
+        let mut b: Vec<u8> = b"bplist00".to_vec();
+        let mut offsets = Vec::new();
+        for i in 0..levels {
+            offsets.push(b.len());
+            match fan {
+                0..15 => b.push(0xA0 | fan as u8),
+                _ => b.extend_from_slice(&[0xAF, 0x10, fan as u8]),
+            }
+            b.extend(std::iter::repeat_n(i as u8 + 1, fan));
+        }
+        offsets.push(b.len());
+        b.extend_from_slice(&[0x51, b'x']);
+        let table = b.len();
+        for o in &offsets {
+            b.extend_from_slice(&(*o as u16).to_be_bytes());
+        }
+        b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 2, 1]);
+        b.extend_from_slice(&(offsets.len() as u64).to_be_bytes());
+        b.extend_from_slice(&0u64.to_be_bytes());
+        b.extend_from_slice(&(table as u64).to_be_bytes());
+        b
+    }
+
+    /// Shared references make the walk exponential without making the blob
+    /// deep, large or cyclic, so the depth and object caps never see it. The
+    /// evaluation budget is what refuses — and it must not refuse an
+    /// ordinary chain of the same depth.
+    #[test]
+    fn a_fan_out_blob_exhausts_the_budget_instead_of_the_machine() {
+        // The builder really does emit decodable blobs, fan-out and all —
+        // so the refusal below is the budget, not a malformed fixture.
+        let small = bplist(&fanout(3, 4)).unwrap();
+        assert!(matches!(&small, Plist::Array(a) if a.len() == 4));
+        assert!(bplist(&fanout(6, 32)).is_none());
+        let chain = bplist(&fanout(6, 1)).unwrap();
+        assert_eq!(
+            chain,
+            (0..6).fold(Plist::String("x".into()), |v, _| Plist::Array(vec![v]))
+        );
     }
 
     /// A store with no all-Spaces slot gets one, and it must say what it is:
