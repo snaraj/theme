@@ -13,6 +13,7 @@ pub struct Flags {
     pub list_n: usize,
     pub desktop_only: bool,
     pub wallpaper: String,
+    pub mkdir: String,
     pub source_url: String,
     pub args: Vec<String>,
 }
@@ -63,8 +64,15 @@ pub fn parse(argv: &[String]) -> Flags {
     let mut want_rotate = false;
     let mut want_n = false;
     let mut want_w = false;
+    let mut want_mkdir = false;
+    let mut saw_mkdir = false;
     let mut list_n_raw = String::from("10");
     for a in argv {
+        if want_mkdir {
+            f.mkdir = a.clone();
+            want_mkdir = false;
+            continue;
+        }
         if want_rotate {
             f.rotate = a.clone();
             want_rotate = false;
@@ -93,6 +101,14 @@ pub fn parse(argv: &[String]) -> Flags {
             s if s.starts_with("--limit=") => list_n_raw = s["--limit=".len()..].to_string(),
             "--all" => list_n_raw = "0".into(),
             "--desktop-only" => f.desktop_only = true,
+            "--mkdir" => {
+                want_mkdir = true;
+                saw_mkdir = true;
+            }
+            s if s.starts_with("--mkdir=") => {
+                f.mkdir = s["--mkdir=".len()..].to_string();
+                saw_mkdir = true;
+            }
             "-w" | "--wallpaper" => want_w = true,
             s if s.starts_with("--wallpaper=") => {
                 f.wallpaper = s["--wallpaper=".len()..].to_string();
@@ -108,6 +124,21 @@ pub fn parse(argv: &[String]) -> Flags {
     }
     if want_w {
         die("--wallpaper takes a wallpaper name");
+    }
+    // --mkdir is the ONE caller-chosen component of a save path: one library
+    // folder name, fenced here — before dispatch, so no traversal reaches the
+    // saver's own guard, and nothing is downloaded first. A dangling
+    // `--mkdir` leaves the name empty and refuses on the same line, and an
+    // option-shaped value refuses rather than silently swallowing the flag
+    // that followed it.
+    if saw_mkdir
+        && (f.mkdir.is_empty()
+            || f.mkdir.starts_with(['.', '-'])
+            || f.mkdir.contains('/')
+            || f.mkdir.chars().count() > 64
+            || f.mkdir.chars().any(|c| c.is_ascii_control()))
+    {
+        die("--mkdir takes one folder name (no slashes, no leading dot or dash)");
     }
     if !matches!(f.rotate.as_str(), "" | "left" | "right") {
         die("--rotate takes left or right");

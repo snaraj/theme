@@ -35,7 +35,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             (
                 "set",
-                "apply a wallpaper: local name/path, or any actionable link",
+                "apply a wallpaper: library name/path, image URL, Pinterest pin, or Unsplash photo page",
             ),
             (
                 "random",
@@ -46,8 +46,8 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
                 "Unsplash photos: search, page-url, random; auth and status",
             ),
             (
-                "url",
-                "download a direct image URL or Pinterest pin, save it, apply it",
+                "get",
+                "download a link into the library and preview it, without applying",
             ),
         ],
     ),
@@ -95,6 +95,10 @@ const FLAGS: &[(&str, &str)] = &[
     (
         "--desktop-only",
         "set the desktop wallpaper only; terminal colors stay",
+    ),
+    (
+        "--mkdir <folder>",
+        "get only: save into this library subfolder, created if missing",
     ),
 ];
 
@@ -306,17 +310,20 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
 "
         ),
         "set" => print!(
-            "theme set <image | url> [--rotate left|right] [--extend[=RRGGBB]]
+            "theme set <image | link> [--rotate left|right] [--extend[=RRGGBB]]
 
-  Apply a specific wallpaper: desktop + palette + kitty. <image> is a
-  path or a name under {wdir} (extension optional). set also
-  understands actionable links: an unsplash.com/photos/… page routes
-  through 'theme unsplash', any other URL through 'theme url'.
+  Apply a wallpaper: desktop + palette + kitty. <image> is a path or a
+  name under {wdir} (extension optional). A link is downloaded first —
+  an unsplash.com/photos/… page, a direct image URL, or an og:image
+  page (Pinterest pins), whose i.pinimg.com /NNNx/ downscales upgrade
+  to the full-resolution /originals/. The desktop is set in fill mode
+  (crop to cover, never letterbox bars); --rotate turns a portrait pin
+  90° into a landscape, --extend centres flat art on a matching canvas.
 
   Examples:
     theme set spain-city-mountains
     theme set nebulosa-red.png --extend
-    theme set https://unsplash.com/photos/a-computer-screen-with-a-wave-on-it-mOpfECCgeC4
+    theme set https://www.pinterest.com/pin/300685712645323833/
 "
         ),
         "unsplash" => print!(
@@ -347,22 +354,16 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
     theme unsplash auth
 "
         ),
-        "url" => print!(
-            "theme url <link> [--rotate left|right]
+        "get" => print!(
+            "theme get <link> [--mkdir <folder>] [--rotate left|right]
 
-  Download an image from a direct URL or a Pinterest pin page, save it
-  into {wdir}, then apply it (desktop + palette + kitty).
-
-  Sharpness: direct i.pinimg.com /NNNx/ downscales are auto-upgraded to
-  the full-resolution /originals/ variant when it exists, and the desktop
-  is set in fill mode (crop to cover — never letterbox bars).
-  --rotate turns a portrait pin 90° into a landscape before applying.
-  --extend centres flat-background art on a matching-color canvas instead.
+  Download a link into {wdir} and preview what landed — no desktop, no
+  palette, no terminal change. Same links as 'theme set'. --mkdir files
+  the download under a library subfolder of your own, created if missing.
 
   Examples:
-    theme url https://www.pinterest.com/pin/300685712645323833/
-    theme url https://i.pinimg.com/1200x/39/76/d8/3976d….jpg --rotate right
-    theme url https://i.pinimg.com/736x/cc/a1/35/cca13….jpg --extend
+    theme get https://unsplash.com/photos/winged-person…-coy_MhYMLHs --mkdir studies
+    theme get https://i.pinimg.com/1200x/39/76/d8/3976d….jpg --rotate right
 "
         ),
         "list" | "ls" => print!(

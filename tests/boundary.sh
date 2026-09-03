@@ -498,13 +498,14 @@ mkdir -p "$urlbin"
 cat >"$urlbin/curl" <<'EOS'
 #!/bin/bash
 o=""; prev=""
+[ -n "${CURL_LOG-}" ] && printf 'ARGV: %s\n' "$*" >>"$CURL_LOG"
 for a in "$@"; do [ "$prev" = "-o" ] && o="$a"; prev="$a"; done
 [ -n "$o" ] && printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' | base64 -d >"$o"
 exit 0
 EOS
 chmod +x "$urlbin/curl"
 run_url() { PATH="$urlbin:$PATH" THEME_WALLPAPER_DIR="$1" THEME_NO_APPLY=1 \
-    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" url "$2"; }
+    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" set "$2"; }
 
 # A dangling symlink is an occupied name, not a free one.
 ln -s "$out/redirected.png" "$lib/hijacked.png"
@@ -551,7 +552,7 @@ EOS
 chmod +x "$webpbin/curl"
 webplib="$fixture/webplib"; mkdir -p "$webplib"
 run_webp() { PATH="$webpbin:$PATH" THEME_WALLPAPER_DIR="$webplib" THEME_NO_APPLY=1 \
-    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" url "$@"; }
+    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" set "$@"; }
 webpout=$(run_webp https://img.invalid/photo.webp --rotate right 2>&1)
 exists "a transformed webp is saved as png"    yes "$webplib/photo-rotated-right.png"
 case "$webpout" in
@@ -597,7 +598,7 @@ EOS
 chmod +x "$ssrfbin/curl"
 ssrflib="$fixture/ssrflib"; mkdir -p "$ssrflib"
 run_ssrf() { PATH="$ssrfbin:$PATH" THEME_WALLPAPER_DIR="$ssrflib" THEME_NO_APPLY=1 \
-    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" url "$1"; }
+    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" set "$1"; }
 for kind in file loop opt; do
     err=$(run_ssrf "https://pin.example/page-$kind" 2>&1)
     case "$err" in
@@ -659,6 +660,43 @@ check  "download onto a free name succeeds"    0 run_url "$lib" https://img.inva
 if [ -f "$lib/plain-name.png" ] && [ ! -L "$lib/plain-name.png" ]; then
     pass "a free name yields a regular file in the library"
 else fail "free-name download did not produce a regular library file"; fi
+
+# --- `get`: the same download, stopping at the library ----------------------
+# get lands a link's bytes and SHOWS them; applying is set's job alone. The
+# retired `url` spelling explains itself instead of reading as a typo.
+check  "the retired 'url' verb refuses"        1 run "$lib" url https://img.invalid/x.png
+urlerr=$(run "$lib" url https://img.invalid/x.png 2>&1)
+case "$urlerr" in
+*"theme set"*) pass "the retired verb names its replacement" ;;
+*) fail "the url refusal does not name 'theme set': $urlerr" ;;
+esac
+getlib="$fixture/getlib"; mkdir -p "$getlib"
+getlog="$fixture/curl-get.log"; : >"$getlog"
+run_get() { PATH="$urlbin:$PATH" THEME_WALLPAPER_DIR="$getlib" THEME_NO_APPLY=1 \
+    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" CURL_LOG="$getlog" \
+    KITTY_WINDOW_ID='' COLUMNS=120 "$THEME" get "$@"; }
+getout=$(run_get https://img.invalid/get-me.png 2>&1)
+exists "get saves the download into the library"      yes "$getlib/get-me.png"
+if printf '%s\n' "$getout" | grep -q '^  TITLE ' && printf '%s\n' "$getout" | grep -q '^  LOCATION '; then
+    pass "get previews what it saved"
+else fail "get printed no preview block: $getout"; fi
+case "$getout" in
+*"[no-apply] would"*) fail "get applied what it downloaded" ;;
+*) pass "get changes no desktop and no palette" ;;
+esac
+exists "get exports no palette"                       no "$fixture/cache/wal"
+run_get https://img.invalid/study.png --mkdir studies >/dev/null 2>&1
+exists "--mkdir files the download in its own folder" yes "$getlib/studies/study.png"
+: >"$getlog"
+for bad in ../x .hidden a/b; do
+    check "--mkdir '$bad' is refused" 1 run_get https://img.invalid/nope.png --mkdir "$bad"
+done
+check  "--mkdir swallows no following flag"    1 run_get https://img.invalid/nope.png --mkdir --rotate
+check  "get refuses a library name"            1 run_get name-not-a-link
+if [ ! -s "$getlog" ]; then pass "a refused get never reaches the network"
+else fail "a refused get still ran curl: $(cat "$getlog")"; fi
+check  "rm refuses get's --mkdir"              1 run "$lib" rm keepme.jpg --mkdir x
+exists "and the named victim survives"         yes "$lib/keepme.jpg"
 
 # --- filenames are DATA, never terminal protocol ---------------------------
 oscname="osc52-safe$(printf '\033]52;c;U0FGRQ==\007')"
@@ -775,7 +813,7 @@ help_run() { # $1 label, $2 TERM_PROGRAM, $3 TERM, $4… theme arguments
     printf '%s\n' "$o" >>"$help_all"
     return 0
 }
-for c in random set unsplash url list preview status rename rm update help; do
+for c in random set unsplash get list preview status rename rm update help; do
     help_run "$c--help" TermSAFE xtermSAFE "$c" --help
 done
 help_run help-TERM_PROGRAM "TermSAFE$oscpay" xtermSAFE help

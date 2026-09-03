@@ -41,12 +41,13 @@ mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 `theme help` is the reference. In brief:
 
 ```
-theme random | set <name> | unsplash [query|page-url] | url <link>
+theme random | set <name|link> | unsplash [query|page-url] | get <link>
 theme list | preview [-w] <name> | status | update | version | rename | rm
 ```
 
 `--rotate left|right`, `--extend[=hex]`, and `--desktop-only` (wallpaper
-without recoloring the terminal) are accepted anywhere.
+without recoloring the terminal) are accepted anywhere; `--mkdir <folder>`
+files a `get` download under a library subfolder of your own.
 
 ## Terminals
 
