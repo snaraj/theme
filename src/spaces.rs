@@ -127,15 +127,24 @@ fn sync_with(
     cutoff: i64,
     name: &str,
 ) -> Result<(), String> {
-    // Which INSTANCE of the service we are transacting with, before anything
-    // else happens. If a different one is running by the time we come to
-    // rename, the agent died and relaunched mid-flight — and a fresh agent
-    // holds the old store in memory, so our write would be overwritten.
-    let first = agent.pid()?;
     // The agent has to be RUNNING for the helper's record to reach the store
-    // at all, so it is paused only after that record is found.
+    // at all, so it is paused only after that record is found — and the
+    // waiting is the point: `load` can spend a second looking, which is a
+    // second for the instance to change. So the identity is read HERE, with
+    // the STOP one statement away, and it is the only read there is.
     let (was, template) = load(dirfd, uri, cutoff, name)?;
-    let paused = Paused::new(agent, first)?;
+    let paused = match Paused::new(agent, agent.pid()?) {
+        Ok(guard) => guard,
+        // A pause that could not be confirmed may still owe a resume; when
+        // it does it comes back as a guard, and it is released like any
+        // other rather than dropped on the floor.
+        Err((why, None)) => return Err(why),
+        Err((why, Some(guard))) => return finish(guard, Err(why)),
+    };
+    // The instance everything after this binds to: a DIFFERENT one at the
+    // rename means the agent died and relaunched mid-flight, and a fresh
+    // agent holds the old store in memory.
+    let instance = paused.instance();
     // Everything from here to the rename is one fallible block, so there is
     // exactly ONE exit — through `finish`, which always releases the guard
     // and never lets a teardown failure hide what really went wrong.
@@ -155,7 +164,7 @@ fn sync_with(
         // Re-asked with the rename one statement away, because everything
         // above took time somebody else could have used.
         let before_rename = || {
-            if agent.pid()? != first {
+            if agent.pid()? != instance {
                 return Err("the wallpaper agent restarted during the sync".into());
             }
             copyable(path, &src, probe, &now)
@@ -444,6 +453,13 @@ impl Plist {
                 Some(slot) => slot.1 = val,
                 None => e.push((key.to_string(), val)),
             }
+        }
+    }
+
+    fn get_mut(&mut self, key: &str) -> Option<&mut Plist> {
+        match self {
+            Plist::Dict(e) => e.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
         }
     }
 
@@ -980,22 +996,64 @@ fn date_secs(s: &str) -> Option<i64> {
 
 // -------------------------------------------------------------- the rewrite
 
-/// Every value filed under a key named `Desktop`, anywhere — whatever its
-/// type, so [`check_shape`] can refuse the ones we do not understand rather
-/// than this walk hiding them.
-fn desktops<'a>(v: &'a Plist, out: &mut Vec<&'a Plist>) {
-    match v {
-        Plist::Dict(e) => {
-            for (k, val) in e {
-                if k == "Desktop" {
-                    out.push(val);
-                }
-                desktops(val, out);
+/// The slots this store documents, and ONLY those: `Displays/<uuid>`,
+/// `Spaces/<uuid>/Default`, `Spaces/<uuid>/Displays/<uuid>`,
+/// `SystemDefault` and `AllSpacesAndDisplays`. Scoping by PATH rather than
+/// by the presence of a `Desktop` key is what keeps this tool out of
+/// subtrees it does not own — a future macOS state that happens to be
+/// shaped like a slot is not one, and rewriting it would be a change
+/// nobody asked for. Whatever a slot's `Desktop` turns out to be is
+/// returned as it is, so [`check_shape`] can refuse what it does not
+/// understand rather than this walk hiding it.
+fn slots(tree: &Plist) -> Vec<&Plist> {
+    let mut out = Vec::new();
+    out.extend(tree.get("SystemDefault"));
+    out.extend(tree.get("AllSpacesAndDisplays"));
+    if let Some(Plist::Dict(displays)) = tree.get("Displays") {
+        out.extend(displays.iter().map(|(_, v)| v));
+    }
+    if let Some(Plist::Dict(spaces)) = tree.get("Spaces") {
+        for (_, space) in spaces {
+            out.extend(space.get("Default"));
+            if let Some(Plist::Dict(per)) = space.get("Displays") {
+                out.extend(per.iter().map(|(_, v)| v));
             }
         }
-        Plist::Array(a) => a.iter().for_each(|e| desktops(e, out)),
-        _ => {}
     }
+    out
+}
+
+/// The same five paths, for the rewrite. A visitor rather than a list
+/// because each slot is borrowed mutably in turn, and they may not be
+/// borrowed all at once.
+fn for_each_slot(tree: &mut Plist, mut f: impl FnMut(&mut Plist)) {
+    for key in ["SystemDefault", "AllSpacesAndDisplays"] {
+        if let Some(slot) = tree.get_mut(key) {
+            f(slot);
+        }
+    }
+    if let Some(Plist::Dict(displays)) = tree.get_mut("Displays") {
+        displays.iter_mut().for_each(|(_, v)| f(v));
+    }
+    if let Some(Plist::Dict(spaces)) = tree.get_mut("Spaces") {
+        for (_, space) in spaces.iter_mut() {
+            if let Some(slot) = space.get_mut("Default") {
+                f(slot);
+            }
+            if let Some(Plist::Dict(per)) = space.get_mut("Displays") {
+                per.iter_mut().for_each(|(_, v)| f(v));
+            }
+        }
+    }
+}
+
+/// The `Desktop` record of every documented slot — the only records this
+/// tool reads a template from or writes one into.
+fn desktops(tree: &Plist) -> Vec<&Plist> {
+    slots(tree)
+        .into_iter()
+        .filter_map(|s| s.get("Desktop"))
+        .collect()
 }
 
 /// Does this record name our image? The `Configuration` blob is a nested
@@ -1064,10 +1122,9 @@ fn chooses(b64: &str, uri: &str, budget: &Cell<usize>) -> bool {
 /// else's bytes. A store whose records are all stale must cost no decodes
 /// at all.
 fn template(tree: &Plist, uri: &str, after: Option<i64>, budget: &Cell<usize>) -> Option<Plist> {
-    let mut all = Vec::new();
-    desktops(tree, &mut all);
     let mut memo = HashMap::new();
-    all.into_iter()
+    desktops(tree)
+        .into_iter()
         .filter_map(|r| {
             let set = match r.get("LastSet") {
                 Some(Plist::Date(d)) => date_secs(d),
@@ -1095,9 +1152,7 @@ fn check_shape(tree: &Plist) -> Result<(), String> {
     if tree.get("AllSpacesAndDisplays").is_some_and(odd) {
         return Err("the store's all-Spaces slot is not a dictionary".into());
     }
-    let mut slots = Vec::new();
-    desktops(tree, &mut slots);
-    if slots.into_iter().any(odd) {
+    if desktops(tree).into_iter().any(odd) {
         return Err("the store has a wallpaper slot that is not a dictionary".into());
     }
     Ok(())
@@ -1108,7 +1163,7 @@ fn check_shape(tree: &Plist) -> Result<(), String> {
 fn rewrite(tree: &mut Plist, template: &Plist) -> Result<usize, String> {
     check_shape(tree)?;
     let mut n = 0;
-    walk(tree, template, &mut n);
+    for_each_slot(tree, |slot| rewrite_slot(slot, template, &mut n));
     // The slot System Settings' "Show on all Spaces" writes, and the one a
     // Space with no record of its own falls back to: seeding it is what
     // makes a Space created tomorrow inherit today's wallpaper.
@@ -1141,40 +1196,37 @@ fn rewrite(tree: &mut Plist, template: &Plist) -> Result<usize, String> {
     Ok(n)
 }
 
-fn walk(v: &mut Plist, template: &Plist, n: &mut usize) {
-    match v {
-        Plist::Array(a) => a.iter_mut().for_each(|e| walk(e, template, n)),
-        Plist::Dict(_) => {
-            if let Plist::Dict(e) = v {
-                e.iter_mut().for_each(|(_, val)| walk(val, template, n));
-            }
-            // A `linked` slot keeps ONE record for both the desktop and the
-            // screensaver, so it has no Desktop key to replace. Split it:
-            // the screensaver keeps the record it had, the desktop takes the
-            // template.
-            if matches!(v.get("Type"), Some(Plist::String(t)) if t == "linked") {
-                if v.get("Idle").is_none()
-                    && let Some(linked) = v.get("Linked").cloned()
-                {
-                    v.set("Idle", linked);
-                }
-                v.remove("Linked");
-                v.set("Type", Plist::String("individual".into()));
-                v.set("Desktop", template.clone());
-            }
-            // OVERLAY, not replace: a slot may carry keys this tool has never
-            // heard of, and losing them is a change nobody asked for.
-            if let Some(mut dest) = v.get("Desktop").cloned() {
-                if let Plist::Dict(fields) = template {
-                    for (k, val) in fields {
-                        dest.set(k, val.clone());
-                    }
-                }
-                v.set("Desktop", dest);
-                *n += 1;
+/// What a wallpaper change actually consists of. Everything else a record
+/// carries — `LastUse` included, which is the agent's business and not
+/// ours — belongs to whoever put it there.
+const OVERLAID: [&str; 2] = ["Content", "LastSet"];
+
+fn rewrite_slot(slot: &mut Plist, template: &Plist, n: &mut usize) {
+    // A `linked` slot keeps ONE record for both the desktop and the
+    // screensaver, so it has no Desktop key to replace. Split it: the
+    // screensaver keeps the record it had, the desktop takes the template
+    // whole, there being no destination record to preserve.
+    if matches!(slot.get("Type"), Some(Plist::String(t)) if t == "linked") {
+        if slot.get("Idle").is_none()
+            && let Some(linked) = slot.get("Linked").cloned()
+        {
+            slot.set("Idle", linked);
+        }
+        slot.remove("Linked");
+        slot.set("Type", Plist::String("individual".into()));
+        slot.set("Desktop", template.clone());
+    }
+    // OVERLAY, and only the two fields that ARE the wallpaper: a record may
+    // carry state this tool has never heard of, and replacing it wholesale
+    // would rewrite facts that were never ours to state.
+    if let Some(mut dest) = slot.get("Desktop").cloned() {
+        for key in OVERLAID {
+            if let Some(v) = template.get(key) {
+                dest.set(key, v.clone());
             }
         }
-        _ => {}
+        slot.set("Desktop", dest);
+        *n += 1;
     }
 }
 
@@ -1426,6 +1478,11 @@ fn first_line(err: &[u8]) -> String {
 /// SIGSTOP across the write, so the agent cannot rewrite the store mid
 /// transaction. One service and one stop, so a failed pause has nothing to
 /// roll back — and a guard, because the resume is owed on every path.
+/// A pause that did not take: why, and — when the compensating resume did
+/// not land either — the guard still owing one, so the debt is the caller's
+/// to settle rather than something this function walked away from.
+type PauseFailed<'a> = (String, Option<Paused<'a>>);
+
 struct Paused<'a> {
     agent: &'a dyn Agent,
     /// The pid we actually stopped — the one every later signal must still
@@ -1441,27 +1498,52 @@ impl<'a> Paused<'a> {
     /// the store underneath us and nothing to restart into what we write.
     /// Pausing it would only fail, and failing there would cost a sync that
     /// had nothing to coordinate in the first place.
-    fn new(agent: &'a dyn Agent, running: Option<i32>) -> Result<Paused<'a>, String> {
+    fn new(agent: &'a dyn Agent, running: Option<i32>) -> Result<Paused<'a>, PauseFailed<'a>> {
         let Some(pid) = running else {
             return Ok(Paused { agent, held: None });
         };
-        agent.pause(pid)?;
+        if let Err(e) = agent.pause(pid) {
+            // Nothing stopped, so nothing is owed.
+            return Err((e, None));
+        }
+        let mut guard = Paused {
+            agent,
+            held: Some(pid),
+        };
         // A STOP that was ACCEPTED is not a process that stopped. The whole
         // transaction rests on the store holding still, so ask the process
         // table what state it actually reached — and on ANY answer but yes,
         // including one we could not read, put it back the way we found it
         // rather than walking away from a frozen agent.
         let confirmed = agent.stopped(pid);
-        if !matches!(confirmed, Ok(true)) {
-            let _ = agent.resume(pid);
-            return Err(confirmed
-                .err()
-                .unwrap_or_else(|| "the wallpaper agent did not stop".into()));
+        if matches!(confirmed, Ok(true)) {
+            return Ok(guard);
         }
-        Ok(Paused {
-            agent,
-            held: Some(pid),
-        })
+        let why = confirmed.err().map_or_else(
+            || "the wallpaper agent did not stop".to_string(),
+            |e| format!("cannot confirm the wallpaper agent stopped: {e}"),
+        );
+        match agent.resume(pid) {
+            // Put back cleanly: the debt is settled, only the refusal
+            // travels on.
+            Ok(()) => {
+                guard.held = None;
+                Err((why, None))
+            }
+            // It is still stopped and we could not fix it, so the guard
+            // keeps the pid and goes back to the caller still owing a
+            // resume — the one thing that must not be dropped here.
+            Err(e) => Err((
+                format!("{why}; and it could not be resumed: {e}"),
+                Some(guard),
+            )),
+        }
+    }
+
+    /// The instance this transaction is bound to, or None if there was no
+    /// agent to pause.
+    fn instance(&self) -> Option<i32> {
+        self.held
     }
 
     /// Resume, then let the service restart itself into the file we wrote.
@@ -1675,6 +1757,28 @@ mod tests {
         image(OLD_B64, "2026-08-01T00:00:00Z")
     }
 
+    /// A store holding these records as `Spaces/<uuid>/Default/Desktop` —
+    /// the documented shape, which since round 6 is the only one the walk
+    /// looks at. A record parked under an undocumented key is invisible to
+    /// it by design.
+    fn spaces_with(records: Vec<Plist>) -> Plist {
+        d(vec![(
+            "Spaces",
+            Plist::Dict(
+                records
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        (
+                            format!("SPACE-{i}"),
+                            d(vec![("Default", d(vec![("Desktop", r)]))]),
+                        )
+                    })
+                    .collect(),
+            ),
+        )])
+    }
+
     /// Two displays, three Spaces (one with its own per-display entry, one
     /// `linked`), a SystemDefault, an all-Spaces slot with only a
     /// screensaver, and unknown keys at two depths.
@@ -1746,11 +1850,15 @@ mod tests {
 
         // Six existing slots, the split `linked` one, and the fallback.
         assert_eq!(n, 8);
-        let mut wrote = Vec::new();
-        desktops(&tree, &mut wrote);
+        let wrote = desktops(&tree);
         assert_eq!(wrote.len(), 8);
+        // Every slot now shows the template's wallpaper — its Content and
+        // the date it was set. What else each record carries is its own.
         assert!(
-            wrote.iter().all(|r| **r == template),
+            wrote
+                .iter()
+                .all(|r| r.get("Content") == template.get("Content")
+                    && r.get("LastSet") == template.get("LastSet")),
             "a slot kept its old image"
         );
 
@@ -1796,7 +1904,6 @@ mod tests {
 
     #[test]
     fn the_template_is_the_newest_record_of_this_image() {
-        let slot = |v: Plist| d(vec![("Desktop", v)]);
         // Older builds record the path in Files as plain text instead of
         // inside the Configuration blob; both shapes must count.
         let by_files = |when: &str| {
@@ -1804,12 +1911,12 @@ mod tests {
             rec(IMAGE, "", files, when)
         };
         let floor = date_secs("2026-09-03T06:44:45Z").unwrap();
-        let tree = d(vec![
-            ("A", slot(image(NEW_B64, "2026-09-03T06:44:50Z"))),
-            ("B", slot(image(NEW_B64, "2026-09-03T06:44:55Z"))),
-            ("C", slot(by_files("2026-09-03T06:44:52Z"))),
+        let tree = spaces_with(vec![
+            image(NEW_B64, "2026-09-03T06:44:50Z"),
+            image(NEW_B64, "2026-09-03T06:44:55Z"),
+            by_files("2026-09-03T06:44:52Z"),
             // A newer record of a DIFFERENT image must never win.
-            ("D", slot(image(OLD_B64, "2026-09-03T06:44:59Z"))),
+            image(OLD_B64, "2026-09-03T06:44:59Z"),
         ]);
         let won = template(&tree, NEW_URI, Some(floor), &budget()).unwrap();
         assert_eq!(
@@ -1818,18 +1925,26 @@ mod tests {
         );
 
         // The Files shape on its own still qualifies.
-        let only_files = slot(by_files("2026-09-03T06:44:52Z"));
+        let only_files = spaces_with(vec![by_files("2026-09-03T06:44:52Z")]);
         assert!(template(&only_files, NEW_URI, Some(floor), &budget()).is_some());
 
         // Another image never qualifies, whatever its date.
-        let other = slot(image(OLD_B64, "2026-09-03T06:44:59Z"));
+        let other = spaces_with(vec![image(OLD_B64, "2026-09-03T06:44:59Z")]);
         assert!(template(&other, NEW_URI, Some(floor), &budget()).is_none());
 
         // A record older than the helper's run is skipped — until the
         // patience runs out and the date stops being a requirement.
-        let stale = slot(image(NEW_B64, "2026-09-01T00:00:00Z"));
+        let stale = spaces_with(vec![image(NEW_B64, "2026-09-01T00:00:00Z")]);
         assert!(template(&stale, NEW_URI, Some(floor), &budget()).is_none());
         assert!(template(&stale, NEW_URI, None, &budget()).is_some());
+
+        // And a record parked outside the documented slots is not a
+        // candidate at all, however well it matches.
+        let elsewhere = d(vec![(
+            "FutureAppleState",
+            d(vec![("Desktop", image(NEW_B64, "2026-09-03T06:44:55Z"))]),
+        )]);
+        assert!(template(&elsewhere, NEW_URI, None, &budget()).is_none());
     }
 
     /// Fail closed: only the DATE is ever relaxed. A record the helper
@@ -1838,16 +1953,12 @@ mod tests {
     #[test]
     fn a_foreign_record_is_never_the_template() {
         let (stale, fresh) = ("2026-09-01T00:00:00Z", "2026-09-03T06:44:55Z");
-        let slot = |v: Plist| d(vec![("Desktop", v)]);
         let floor = date_secs("2026-09-03T06:44:45Z").unwrap();
-        let tree = d(vec![
-            ("Stale", slot(image(NEW_B64, stale))),
-            ("Fresh", slot(image(OLD_B64, fresh))),
-        ]);
+        let tree = spaces_with(vec![image(NEW_B64, stale), image(OLD_B64, fresh)]);
         assert!(template(&tree, NEW_URI, Some(floor), &budget()).is_none());
         let ours = template(&tree, NEW_URI, None, &budget());
         assert_eq!(ours, Some(image(NEW_B64, stale)));
-        let none = d(vec![("Fresh", slot(image(OLD_B64, fresh)))]);
+        let none = spaces_with(vec![image(OLD_B64, fresh)]);
         assert!(template(&none, NEW_URI, None, &budget()).is_none());
     }
 
@@ -1925,22 +2036,84 @@ mod tests {
         }
     }
 
-    /// A slot may carry fields this tool has never heard of — a future
-    /// macOS key, a per-display tweak. The template overlays its own keys
-    /// and leaves the rest standing.
+    /// A wallpaper change is `Content` and `LastSet`. Everything else a
+    /// destination record carries — its own `LastUse`, and any field this
+    /// tool has never heard of — stays where it was.
     #[test]
-    fn a_destination_record_keeps_the_keys_the_template_lacks() {
-        let mut template = image(NEW_B64, "2026-09-03T06:44:55Z");
-        template.remove("LastUse");
+    fn only_content_and_lastset_are_overlaid_onto_a_slot() {
+        // The template is the REAL shape the helper writes, LastUse and all.
+        // The previous version of this test deleted LastUse from it so the
+        // assertion would pass; that hid exactly the bug this now catches,
+        // and shaping a fixture to fit an assertion is not a thing to do.
+        let template = image(NEW_B64, "2026-09-03T06:44:55Z");
+        assert!(
+            template.get("LastUse").is_some(),
+            "the fixture is not the real template shape"
+        );
         let mut dest = image(OLD_B64, "2026-09-01T12:30:10Z");
         dest.set("Extra", s("mine"));
+        dest.set("LastUse", Plist::Date("2026-08-01T00:00:00Z".into()));
         let mut tree = d(vec![("SystemDefault", d(vec![("Desktop", dest.clone())]))]);
         rewrite(&mut tree, &template).unwrap();
+
         let got = tree.get("SystemDefault").unwrap().get("Desktop").unwrap();
-        assert_eq!(got.get("Extra"), Some(&s("mine")));
-        assert_eq!(got.get("LastUse"), dest.get("LastUse"));
         assert_eq!(got.get("Content"), template.get("Content"));
         assert_eq!(got.get("LastSet"), template.get("LastSet"));
+        // The record's own state survives, INCLUDING a LastUse the template
+        // also carries and differs on.
+        assert_eq!(got.get("Extra"), Some(&s("mine")));
+        assert_eq!(got.get("LastUse"), dest.get("LastUse"));
+        assert_ne!(got.get("LastUse"), template.get("LastUse"));
+
+        // The two slots with no destination record take the template whole.
+        assert_eq!(
+            tree.get("AllSpacesAndDisplays").unwrap().get("Desktop"),
+            Some(&template)
+        );
+        let mut split = d(vec![(
+            "SystemDefault",
+            d(vec![("Linked", linked()), ("Type", s("linked"))]),
+        )]);
+        rewrite(&mut split, &template).unwrap();
+        assert_eq!(
+            split.get("SystemDefault").unwrap().get("Desktop"),
+            Some(&template)
+        );
+    }
+
+    /// The walk is scoped to the slot PATHS the store documents. A subtree
+    /// that merely looks like a slot is not one, and an unknown key beside
+    /// a real slot is nobody's business but its owner's.
+    #[test]
+    fn only_the_documented_slots_are_touched() {
+        let template = image(NEW_B64, "2026-09-03T06:44:55Z");
+        // Shaped exactly like a linked slot, and parked where no slot lives.
+        let future = d(vec![
+            ("Desktop", d(vec![("Sentinel", s("keep"))])),
+            ("Linked", d(vec![("Sentinel", s("also keep"))])),
+            ("Type", s("linked")),
+        ]);
+        let space = d(vec![
+            (
+                "Default",
+                d(vec![("Desktop", image(OLD_B64, "2026-09-01T12:30:10Z"))]),
+            ),
+            ("Unknown", s("keep me")),
+        ]);
+        let mut tree = d(vec![
+            ("FutureAppleState", future.clone()),
+            ("Spaces", d(vec![("SPACE-ONE", space)])),
+        ]);
+        rewrite(&mut tree, &template).unwrap();
+
+        // Byte-identical: not split, not seeded, not counted.
+        assert_eq!(tree.get("FutureAppleState"), Some(&future));
+        let one = tree.get("Spaces").unwrap().get("SPACE-ONE").unwrap();
+        assert_eq!(one.get("Unknown"), Some(&s("keep me")));
+        // While the real slot beside it IS rewritten.
+        let real = one.get("Default").unwrap().get("Desktop").unwrap();
+        assert_eq!(real.get("Content"), template.get("Content"));
+        assert_eq!(real.get("LastSet"), template.get("LastSet"));
     }
 
     /// `levels` arrays, each holding `fan` references to the next, with a
@@ -2013,12 +2186,9 @@ mod tests {
         // through to a decode that then has to be stopped.
         let hostile = |i: usize| b64_encode(&fanout(6, 32, &format!("{NEW_URI}{i}")));
         let store = |when: &str, blob: &dyn Fn(usize) -> String| {
-            Plist::Dict(
+            spaces_with(
                 (0..512)
-                    .map(|i| {
-                        let r = rec(IMAGE, &blob(i), Plist::Array(vec![]), when);
-                        (format!("S{i}"), d(vec![("Desktop", r)]))
-                    })
+                    .map(|i| rec(IMAGE, &blob(i), Plist::Array(vec![]), when))
                     .collect(),
             )
         };
@@ -2151,6 +2321,15 @@ mod tests {
         date_secs("2026-09-03T06:44:45Z").unwrap()
     }
 
+    /// A guard the test expects to have been taken. (`Paused` carries a
+    /// borrowed agent, so it has no Debug to unwrap through.)
+    fn paused<'a>(agent: &'a dyn Agent, pid: Option<i32>) -> Paused<'a> {
+        match Paused::new(agent, pid) {
+            Ok(g) => g,
+            Err((why, _)) => panic!("the agent should have paused: {why}"),
+        }
+    }
+
     /// The whole transaction, against a store of our own and a launchd that
     /// does nothing: it pauses, writes, and resumes and restarts the service
     /// — in that order.
@@ -2236,6 +2415,11 @@ mod tests {
             agent.ops().contains(&"resume"),
             "the guard was not released"
         );
+        // The STOP binds to the pid read immediately before it: the FIRST
+        // agent call of the sync IS that read, so there is no earlier answer
+        // for it to have gone stale against while `load` was waiting.
+        assert_eq!(agent.ops()[..2], ["pid", "pause"]);
+        assert_eq!(agent.signalled()[0], 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2264,7 +2448,7 @@ mod tests {
     #[test]
     fn a_release_that_fails_twice_reports_both() {
         let agent = Fake::new(&[Some(7)], &["resume", "restart"]);
-        let e = Paused::new(&agent, Some(7)).unwrap().release().unwrap_err();
+        let e = paused(&agent, Some(7)).release().unwrap_err();
         assert!(e.contains("cannot resume"), "{e}");
         assert!(e.contains("cannot restart"), "{e}");
         assert_eq!(
@@ -2275,16 +2459,14 @@ mod tests {
         // One failing on its own still surfaces, from either side.
         let agent = Fake::new(&[Some(7)], &["restart"]);
         assert!(
-            Paused::new(&agent, Some(7))
-                .unwrap()
+            paused(&agent, Some(7))
                 .release()
                 .unwrap_err()
                 .contains("cannot restart")
         );
         let agent = Fake::new(&[Some(7)], &["resume"]);
         assert!(
-            Paused::new(&agent, Some(7))
-                .unwrap()
+            paused(&agent, Some(7))
                 .release()
                 .unwrap_err()
                 .contains("cannot resume")
@@ -2303,20 +2485,39 @@ mod tests {
     #[test]
     fn a_stop_that_was_accepted_but_not_obeyed_is_refused() {
         let agent = Fake::new(&[Some(7)], &[]).that_never_stops();
-        let Err(e) = Paused::new(&agent, Some(7)) else {
+        let Err((e, owed)) = Paused::new(&agent, Some(7)) else {
             panic!("a process that never stopped must not yield a guard");
         };
         assert!(e.contains("did not stop"), "{e}");
+        // The compensating CONT landed, so nothing is still owed.
+        assert!(owed.is_none());
         assert_eq!(agent.ops(), ["pause", "stopped", "resume"]);
 
         // An answer we could not READ is treated the same way: we stopped
         // it, so it gets put back whatever went wrong.
         let agent = Fake::new(&[Some(7)], &["stopped"]);
-        let Err(e) = Paused::new(&agent, Some(7)) else {
+        let Err((e, owed)) = Paused::new(&agent, Some(7)) else {
             panic!("an unreadable process state must not yield a guard");
         };
-        assert!(e.contains("cannot stopped"), "{e}");
+        assert!(e.contains("cannot confirm"), "{e}");
+        assert!(owed.is_none());
         assert_eq!(agent.ops(), ["pause", "stopped", "resume"]);
+
+        // And when the compensating CONT does NOT land, the debt travels
+        // with the guard rather than being dropped here: the caller resumes
+        // it, and Drop tries once more behind that.
+        let agent = Fake::new(&[Some(7)], &["stopped", "resume"]).that_never_stops();
+        let Err((e, owed)) = Paused::new(&agent, Some(7)) else {
+            panic!("a stop that could not be undone must not yield a guard");
+        };
+        assert!(e.contains("cannot confirm"), "{e}");
+        assert!(e.contains("could not be resumed"), "{e}");
+        drop(owed.expect("the resume debt must come back with the guard"));
+        assert_eq!(
+            agent.ops(),
+            ["pause", "stopped", "resume", "resume"],
+            "Drop did not retry the resume"
+        );
 
         // And it costs the sync rather than the store.
         let (dir, fd) = scratch_store("nostop");
@@ -2335,7 +2536,7 @@ mod tests {
     #[test]
     fn finish_reports_both_halves() {
         let agent = Fake::new(&[Some(7)], &["resume"]);
-        let g = Paused::new(&agent, Some(7)).unwrap();
+        let g = paused(&agent, Some(7));
         let both = finish(g, Err("the write failed".into())).unwrap_err();
         assert!(
             both.starts_with("the write failed; and the wallpaper agent could not be resumed: "),
@@ -2343,11 +2544,11 @@ mod tests {
         );
 
         let agent = Fake::new(&[Some(7)], &["resume"]);
-        let g = Paused::new(&agent, Some(7)).unwrap();
+        let g = paused(&agent, Some(7));
         assert!(finish(g, Ok(())).unwrap_err().contains("cannot resume"));
 
         let agent = Fake::new(&[Some(7)], &[]);
-        let g = Paused::new(&agent, Some(7)).unwrap();
+        let g = paused(&agent, Some(7));
         assert!(finish(g, Ok(())).is_ok());
     }
 
