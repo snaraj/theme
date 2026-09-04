@@ -35,6 +35,55 @@ pub fn wallpaper_get() -> Option<PathBuf> {
     lines.into_iter().next().map(PathBuf::from)
 }
 
+/// The same answer for every SCREEN — bare, `status`, `preview` — without
+/// asking the helper twice for it. `wallpaper get` costs 57 ms, which was
+/// the whole cost of the bare screen, and macOS keeps every Space's choice
+/// in ONE file whose identity moves whenever anything at all changes the
+/// desktop. So the helper's answer is recorded against that identity, in
+/// the cache dir with every other derived thing, and reused only while the
+/// identity holds: the spawn is paid once after a real change instead of on
+/// every screen, and a stale name can never reach the header. A cache that
+/// cannot be written just means asking the helper every time, which is what
+/// used to happen anyway; and this records a READ, so `THEME_NO_APPLY` —
+/// which is about the desktop and the terminal — does not gate it. The
+/// mutating verbs (`rm`, `rename`) keep asking the desktop directly: a
+/// record is fast enough to print by, never enough to delete by.
+#[cfg(target_os = "macos")]
+pub fn current_wallpaper(cfg: &Config) -> Option<PathBuf> {
+    let stamp = desktop_stamp();
+    let record = cfg.cache_dir.join("desktop");
+    if let Some(s) = &stamp
+        && let Ok(text) = fs::read_to_string(&record)
+        && let Some((head, path)) = text.split_once('\n')
+        && head == s
+        && !path.is_empty()
+    {
+        return Some(PathBuf::from(path.strip_suffix('\n').unwrap_or(path)));
+    }
+    let got = wallpaper_get()?;
+    if let Some(s) = &stamp {
+        let _ = fs::write(&record, format!("{s}\n{}\n", got.display()));
+    }
+    Some(got)
+}
+
+/// The per-Space store's identity as one line: every field that a change to
+/// the file moves, including the inode a replace-by-rename gives it.
+#[cfg(target_os = "macos")]
+fn desktop_stamp() -> Option<String> {
+    let store = PathBuf::from(std::env::var_os("HOME")?).join(crate::spaces::STORE);
+    let st = rustix::fs::stat(&store).ok()?;
+    Some(format!(
+        "{}.{:09} {} {}",
+        st.st_mtime, st.st_mtime_nsec, st.st_size, st.st_ino
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn current_wallpaper(_cfg: &Config) -> Option<PathBuf> {
+    wallpaper_get()
+}
+
 fn have(cmd: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;

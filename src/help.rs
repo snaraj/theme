@@ -4,12 +4,11 @@
 //! literal. Keep help generic and extensible, and never let it grow:
 //! additions pay for themselves by consolidating something else.
 
-use crate::apply::wallpaper_get;
+use crate::apply::current_wallpaper;
 use crate::config::Config;
 use crate::report::{include_line, render_preview, scheme_colors};
 use crate::ui::{display_text, swatch_row, truncate_ellipsis, wrap_prefixed};
 use std::path::Path;
-use std::process::Command;
 
 fn columns() -> usize {
     crate::ui::term_cols()
@@ -126,17 +125,38 @@ fn print_table(cols: usize, items: &[(&str, &str)], keyw: usize) {
     }
 }
 
-fn cmd_out(cmd: &str, args: &[&str]) -> String {
-    Command::new(cmd)
-        .args(args)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+/// The OS line of the header, from the kernel rather than from PATH. The
+/// three facts `uname -s`/`-m`/`-srm` were spawned for come out of one
+/// `uname(2)`, and macOS's marketing version — `sw_vers -productVersion`,
+/// 9 ms — is a string in a root-owned XML plist that the store's own reader
+/// parses. Same text as before, on both platforms; no PATH in it any more.
+#[cfg(target_os = "macos")]
+fn os_line() -> String {
+    let un = rustix::system::uname();
+    format!(
+        "macOS {} ({})",
+        crate::spaces::system_plist_string(
+            Path::new("/System/Library/CoreServices/SystemVersion.plist"),
+            "ProductVersion",
+        )
+        .unwrap_or_default(),
+        un.machine().to_string_lossy()
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn os_line() -> String {
+    let un = rustix::system::uname();
+    format!(
+        "{} {} {}",
+        un.sysname().to_string_lossy(),
+        un.release().to_string_lossy(),
+        un.machine().to_string_lossy()
+    )
 }
 
 pub fn usage(cfg: &Config) {
-    let desk = wallpaper_get();
+    let desk = current_wallpaper(cfg);
     let inc = include_line(cfg);
     let label = if inc.is_empty() || inc.ends_with("colors-kitty.conf") {
         String::new()
@@ -167,18 +187,9 @@ pub fn usage(cfg: &Config) {
             .unwrap_or_default();
         display_text(&raw)
     };
-    // uname/sw_vers resolve through PATH, so their output is not ours to
-    // trust either.
-    let os = if cmd_out("uname", &["-s"]) == "Darwin" {
-        format!(
-            "macOS {} ({})",
-            cmd_out("sw_vers", &["-productVersion"]),
-            cmd_out("uname", &["-m"])
-        )
-    } else {
-        cmd_out("uname", &["-srm"])
-    };
-    let os = display_text(&os);
+    // Kernel and system file, not PATH — but a header still prints its
+    // facts through the same display copy every other value gets.
+    let os = display_text(&os_line());
     let name = match &desk {
         Some(d) => display_text(d.file_stem().and_then(|s| s.to_str()).unwrap_or("")),
         None => "<none>".into(),
