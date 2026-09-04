@@ -214,22 +214,33 @@ jobs:
       - run: sha256sum theme-*.tar.gz theme_*.deb theme-*.rpm > SHA256SUMS
       # Resume-safe: a rerun after a failed release step finds its own tag
       # on this commit and goes on — the commits API peels the tag, so a
-      # signed annotated tag pushed by hand counts too. A run whose version
-      # has already shipped, or whose tag sits on another commit, is refused
-      # here with the fix named: the backstop under slot's decision, and the
-      # tag ruleset would refuse to move it anyway.
-      - if: github.ref_type != 'tag'
+      # signed annotated tag pushed by hand counts too. A version that has
+      # already shipped from an ANCESTOR of this commit is not an error:
+      # two merges seconds apart race here (slot cannot see a tag the first
+      # run has not created yet), and the loser did not move the version,
+      # so it says so in the summary and ends green. A tag on an unrelated
+      # commit is still refused with the fix named — the tag ruleset would
+      # refuse to move it anyway.
+      - id: tag
+        if: github.ref_type != 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "$TAG" | grep -qxE 'v[0-9]+\.[0-9]+\.[0-9]+' || { echo "::error::no crate version reached publish ('$TAG')"; exit 1; }
+          shipped() { # the existing tag sits on this commit or an ancestor of it
+            gh api "repos/$GITHUB_REPOSITORY/compare/$TAG...$GITHUB_SHA" --jq .status 2>/dev/null | grep -qxE 'ahead|identical'
+          }
+          nothing() { echo "$TAG already shipped from $(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq '.sha[0:7]'), an ancestor of this commit: nothing to publish" | tee -a "$GITHUB_STEP_SUMMARY"; echo "go=false" >>"$GITHUB_OUTPUT"; exit 0; }
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::$TAG is already released: bump the version in Cargo.toml and merge"; exit 1
+            shipped && nothing
+            echo "::error::$TAG is already released from a commit that is not an ancestor of this one: bump the version in Cargo.toml and merge"; exit 1
           fi
           gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" ||
             gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha | grep -qx "$GITHUB_SHA" ||
-            { echo "::error::$TAG already exists on another commit: bump the version in Cargo.toml"; exit 1; }
-      - env:
+            { shipped && nothing; echo "::error::$TAG already exists on another commit: bump the version in Cargo.toml"; exit 1; }
+          echo "go=true" >>"$GITHUB_OUTPUT"
+      - if: github.ref_type == 'tag' || steps.tag.outputs.go == 'true'
+        env:
           GH_TOKEN: ${{ github.token }}
         run: >
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY"
