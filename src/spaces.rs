@@ -326,7 +326,7 @@ fn parse_store(bytes: &[u8]) -> Result<Plist, String> {
 /// O_NOFOLLOW walk, and the fd's identity checked against the name again.
 fn store_dir(dir: &Path) -> Result<OwnedFd, String> {
     let canon = std::fs::canonicalize(dir).map_err(|e| format!("cannot resolve the store: {e}"))?;
-    crate::save::audit_chain(&canon, crate::save::native_platform())?;
+    crate::save::audit_chain(&canon, &crate::save::AclAudit::native())?;
     let fd = crate::update::open_chain_nofollow(&canon)
         .ok_or("the store folder could not be opened without following a symlink")?;
     let st = rustix::fs::fstat(&fd).map_err(|e| format!("cannot stat the store folder: {e}"))?;
