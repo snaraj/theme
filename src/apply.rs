@@ -35,6 +35,70 @@ pub fn wallpaper_get() -> Option<PathBuf> {
     lines.into_iter().next().map(PathBuf::from)
 }
 
+/// The desktop's picture for the SCREENS THAT PRINT ITS NAME — the bare
+/// header and `status` — without asking the helper twice for it.
+/// `wallpaper get` costs 57 ms, which was the whole cost of the bare
+/// screen, and macOS keeps every Space's choice in ONE file whose identity
+/// moves whenever anything at all changes the desktop. So the helper's
+/// answer is recorded against that identity, in the cache dir with every
+/// other derived thing, and reused only while the identity holds AND still
+/// names a real file: the spawn is paid once after a real change instead of
+/// on every screen, and a stale name can never reach the header. A cache
+/// that cannot be written just means asking the helper every time, which is
+/// what used to happen anyway; and this records a READ, so `THEME_NO_APPLY`
+/// — which is about the desktop and the terminal — does not gate it.
+///
+/// The record is a plain file in the cache dir and carries none of the
+/// custody the update stamp gets, so the rule that keeps it honest is who
+/// may act on it: the mutating verbs (`rm`, `rename`) keep asking the
+/// desktop directly, and `preview` with no name — which opens the file it
+/// is given and renders its bytes — asks the helper too. A record is fast
+/// enough to print by, and in kitty to hand the header's thumbnail renderer
+/// (which opens the file, as `status` already does with the `wal` record);
+/// never enough to delete by or to feed an in-process decoder. Issue #47
+/// routes it through the same audited dirfd the update stamp uses, once
+/// S1.4 has made that custody cheap.
+#[cfg(target_os = "macos")]
+pub fn wallpaper_to_print(cfg: &Config) -> Option<PathBuf> {
+    let stamp = desktop_stamp();
+    let record = cfg.cache_dir.join("desktop");
+    if let Some(s) = &stamp
+        && let Ok(text) = fs::read_to_string(&record)
+        && let Some((head, path)) = text.split_once('\n')
+        && head == s
+        && !path.is_empty()
+    {
+        let path = PathBuf::from(path.strip_suffix('\n').unwrap_or(path));
+        // A recorded name whose file is gone is not an answer: ask again,
+        // so the screen says exactly what the helper says, as it does today.
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let got = wallpaper_get()?;
+    if let Some(s) = &stamp {
+        let _ = fs::write(&record, format!("{s}\n{}\n", got.display()));
+    }
+    Some(got)
+}
+
+/// The per-Space store's identity as one line: every field that a change to
+/// the file moves, including the inode a replace-by-rename gives it.
+#[cfg(target_os = "macos")]
+fn desktop_stamp() -> Option<String> {
+    let store = PathBuf::from(std::env::var_os("HOME")?).join(crate::spaces::STORE);
+    let st = rustix::fs::stat(&store).ok()?;
+    Some(format!(
+        "{}.{:09} {} {}",
+        st.st_mtime, st.st_mtime_nsec, st.st_size, st.st_ino
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn wallpaper_to_print(_cfg: &Config) -> Option<PathBuf> {
+    wallpaper_get()
+}
+
 fn have(cmd: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;

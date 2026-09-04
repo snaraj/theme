@@ -3,7 +3,7 @@
 //! provenance labels decided by the parsed hostname, and the kitty-graphics
 //! inline previews.
 
-use crate::apply::{derive_options, schemes_dir, wallpaper_get};
+use crate::apply::{derive_options, schemes_dir, wallpaper_get, wallpaper_to_print};
 use crate::config::Config;
 use crate::imaging::img_size;
 use crate::library::{all_images, resolve_local};
@@ -276,62 +276,71 @@ pub(crate) fn human_bytes(path: &Path) -> String {
     }
 }
 
-/// BSD `stat`, asked only where that is what `stat` means. Birth time is a
-/// BSD field, and GNU's `-f` selects the FILE SYSTEM rather than a format,
-/// so off macOS this spawn can only fail — and a listing was paying for it
-/// twice per file to learn nothing. None sends the caller to its stand-in.
-fn bsd_stat(args: &[&str], path: &Path) -> Option<String> {
-    if !cfg!(target_os = "macos") {
-        return None;
+/// When the file was BORN, seconds since the epoch — a syscall, where a
+/// `stat` spawn used to be. macOS keeps the birth time in the stat itself;
+/// Linux keeps it behind `statx`, and only on the filesystems that record
+/// one, so there the modification time stays the honest stand-in it has
+/// always been.
+#[cfg(target_os = "macos")]
+fn birth_secs(path: &Path) -> Option<i64> {
+    rustix::fs::stat(path).ok().map(|st| st.st_birthtime)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn birth_secs(path: &Path) -> Option<i64> {
+    #[cfg(target_os = "linux")]
+    if let Ok(x) = rustix::fs::statx(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::AtFlags::empty(),
+        rustix::fs::StatxFlags::BTIME,
+    ) && x.stx_mask & rustix::fs::StatxFlags::BTIME.bits() != 0
+    {
+        return Some(x.stx_btime.tv_sec);
     }
-    Command::new("stat")
-        .args(args)
+    rustix::fs::stat(path).ok().map(|st| st.st_mtime)
+}
+
+/// The ADDED column, spelled the way this machine spells a date. On macOS
+/// that means LOCAL time — `stat -f %SB` runs the birth time through
+/// `localtime`, and the civil arithmetic below is UTC, which is a different
+/// DAY for anything created after 17:00 in this timezone — so that one
+/// spawn stays until a reviewed reader for the zone database can retire it.
+/// It is now paid once per PRINTED date — one per verbose row, where the
+/// sort key alone used to cost ~1 700 for the same library. Everywhere else
+/// the date is computed here, from the same birth time the ordering uses.
+pub(crate) fn added_date(path: &Path) -> String {
+    #[cfg(target_os = "macos")]
+    if let Some(out) = Command::new("stat")
+        .args(["-f", "%SB", "-t", "%Y-%m-%d"])
         .arg(path)
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
-}
-
-pub(crate) fn added_date(path: &Path) -> String {
-    if let Some(out) = bsd_stat(&["-f", "%SB", "-t", "%Y-%m-%d"], path) {
+    {
         return out;
     }
-    // Non-macOS: no birth time — modification time is the honest stand-in.
-    fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| {
-            let days = d.as_secs() / 86400;
-            // Civil date from days since epoch (Howard Hinnant's algorithm).
-            let z = days as i64 + 719_468;
-            let era = z.div_euclid(146_097);
-            let doe = z.rem_euclid(146_097);
-            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-            let y = yoe + era * 400;
-            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-            let mp = (5 * doy + 2) / 153;
-            let d2 = doy - (153 * mp + 2) / 5 + 1;
-            let m = if mp < 10 { mp + 3 } else { mp - 9 };
-            let y = if m <= 2 { y + 1 } else { y };
-            format!("{y:04}-{m:02}-{d2:02}")
-        })
-        .unwrap_or_default()
+    let Some(secs) = birth_secs(path) else {
+        return String::new();
+    };
+    // Civil date from days since epoch (Howard Hinnant's algorithm).
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d2 = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d2:02}")
 }
 
 pub(crate) fn birth_key(path: &Path) -> i64 {
-    bsd_stat(&["-f", "%B"], path)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            fs::metadata(path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0)
-        })
+    birth_secs(path).unwrap_or(0)
 }
 
 pub(crate) fn swatch_cells(scheme: &[String]) -> (String, usize) {
@@ -350,7 +359,9 @@ pub(crate) fn swatch_cells(scheme: &[String]) -> (String, usize) {
 #[allow(clippy::print_literal)] // column headers: the formatter pads them, hand-counted spaces would rot
 pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
     let mut files = all_images(cfg);
-    files.sort_by_key(|f| std::cmp::Reverse(birth_key(f)));
+    // CACHED key: `sort_by_key` recomputes it about twice per COMPARISON,
+    // which is ~2·n·log₂n reads of the same n birth times.
+    files.sort_by_cached_key(|f| std::cmp::Reverse(birth_key(f)));
     let total = files.len();
     let shown = if list_n > 0 && total > list_n {
         list_n
@@ -448,6 +459,8 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
                 cfg.wallpaper_dirs_display
             ))
         }),
+        // The helper, ALWAYS: this path opens the file it is handed and
+        // renders its bytes, and the desktop record is print-only.
         None => match wallpaper_get().filter(|p| p.is_file()) {
             Some(p) => p,
             None => die("no current wallpaper to preview — name one: theme preview <wallpaper>"),
@@ -622,7 +635,7 @@ pub fn cmd_status(cfg: &Config) {
     };
     let current = fs::read_to_string(cfg.cache_dir.join("wal")).unwrap_or_default();
     let current = current.trim().to_string();
-    let desk = wallpaper_get()
+    let desk = wallpaper_to_print(cfg)
         .map(|p| p.display().to_string())
         .unwrap_or_default();
 

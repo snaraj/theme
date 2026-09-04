@@ -14,7 +14,7 @@ unsafe_code = "deny"
 
 [package]
 name = "theme"
-version = "0.3.2"
+version = "0.3.3"
 description = "One command that owns the desktop wallpaper and the terminal palette together"
 edition.workspace = true
 license.workspace = true
@@ -37,8 +37,9 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 # The descriptor-bound saver needs openat/O_NOFOLLOW/fstat-by-fd, which std
 # does not expose; rustix is the safe binding that keeps deny(unsafe_code)
-# intact (raw libc would need unsafe in this crate).
-rustix = { version = "1", default-features = false, features = ["fs", "process", "std", "termios"] }
+# intact (raw libc would need unsafe in this crate). `system` is uname(2),
+# which the bare screen's OS line reads instead of spawning uname(1).
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std", "system", "termios"] }
 # `theme update` verifies a release download against SHA256SUMS before it
 # may replace the running binary. In-process (RustCrypto) rather than
 # shelling to shasum/sha256sum: a PATH-resolved tool must not be the
