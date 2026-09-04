@@ -17,6 +17,40 @@ pub fn display_text(s: &str) -> String {
 /// Print `theme: <msg>` to stderr and exit 1. The message passes through
 /// [`display_text`] like every other sink, and registered scratch files are
 /// swept first — `exit` runs no destructors.
+/// The print!/println! shims' writer (declared atop main.rs, #59): one
+/// locked, line-buffered stdout write. A broken pipe — the reader has gone —
+/// ends the process with 141, the shell's own status for a tool cut off by
+/// its reader, after the scratch sweep every normal exit runs; any other
+/// write error panics with std's own message, as before.
+pub fn out(args: std::fmt::Arguments<'_>, end: &str) {
+    use std::io::Write;
+    let mut o = std::io::stdout().lock();
+    let Err(e) = o.write_fmt(args).and_then(|()| o.write_all(end.as_bytes())) else {
+        return;
+    };
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        drop(o);
+        crate::scratch::cleanup();
+        exit(141);
+    }
+    panic!("failed printing to stdout: {e}");
+}
+
+/// The eprint!/eprintln! shims' writer: unbuffered stderr, as std's. A
+/// broken pipe loses the message and nothing else — the caller keeps its
+/// own exit status, so `die` under `2>&1 | head` still exits 1; any other
+/// write error panics with std's own message.
+pub fn err(args: std::fmt::Arguments<'_>, end: &str) {
+    use std::io::Write;
+    let mut o = std::io::stderr().lock();
+    let Err(e) = o.write_fmt(args).and_then(|()| o.write_all(end.as_bytes())) else {
+        return;
+    };
+    if e.kind() != std::io::ErrorKind::BrokenPipe {
+        panic!("failed printing to stderr: {e}");
+    }
+}
+
 pub fn die(msg: &str) -> ! {
     crate::scratch::cleanup();
     eprintln!("theme: {}", display_text(msg));

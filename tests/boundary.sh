@@ -151,6 +151,28 @@ check  "-n takes the largest count there is"   0 run "$lib" list -n 184467440737
 check  "-n refuses a count past usize"         1 run "$lib" list -n 18446744073709551616
 check  "-n refuses a wildly overflowing count" 1 run "$lib" list -n 184467440737095516160
 
+# A reader that has already gone must not leave a panic behind (#59). The
+# reader exits at once; theme starts 200 ms later and writes into a pipe
+# nobody reads (before the fix: exit 101 + "failed printing to stdout").
+# Exact statuses, so a run where theme somehow wrote before the reader
+# left shows up red rather than passing for nothing: a broken stdout is
+# 141 (the shell's own answer for a tool cut off by its reader), and a
+# broken stderr under 2>&1 loses the message but keeps die's 1. One
+# command per printing module: help.rs, report.rs, update.rs, ui.rs.
+pipe_into_gone() { # $1 expected status, $2 label, then the theme argv
+    ( sleep 0.2; run "$lib" "${@:3}" 2>"$fixture/pipe.err"; echo "$?" >"$fixture/pipe.rc" ) | true
+    if [ ! -s "$fixture/pipe.err" ] && [ "$(cat "$fixture/pipe.rc")" = "$1" ]; then
+        pass "$2 into a gone reader ends with $1, nothing on stderr"
+    else fail "$2 into a gone reader: rc=$(cat "$fixture/pipe.rc") want $1 $(tr '\n' ' ' <"$fixture/pipe.err" | cut -c1-120)"; fi
+}
+pipe_into_gone 141 "help"   help
+pipe_into_gone 141 "list"   list
+pipe_into_gone 141 "status" status
+pipe_into_gone 141 "-V"     -V
+( sleep 0.2; run "$lib" rm no-such-wallpaper 2>&1; echo "$?" >"$fixture/pipe.rc" ) | true
+if [ "$(cat "$fixture/pipe.rc")" = 1 ]; then pass "die under 2>&1 into a gone reader keeps exit 1"
+else fail "die under 2>&1 into a gone reader: rc=$(cat "$fixture/pipe.rc") want 1"; fi
+
 # --- truncated/stem resolution: exactly ONE candidate or refuse ------------
 printf 'x' >"$lib/same-title.jpg"
 printf 'x' >"$lib/same-title.png"
