@@ -53,9 +53,11 @@ pub fn wallpaper_get() -> Option<PathBuf> {
 /// may act on it: the mutating verbs (`rm`, `rename`) keep asking the
 /// desktop directly, and `preview` with no name — which opens the file it
 /// is given and renders its bytes — asks the helper too. A record is fast
-/// enough to print by, never enough to read or delete by. Issue #47 routes
-/// it through the same audited dirfd the update stamp uses, once S1.4 has
-/// made that custody cheap.
+/// enough to print by, and in kitty to hand the header's thumbnail renderer
+/// (which opens the file, as `status` already does with the `wal` record);
+/// never enough to delete by or to feed an in-process decoder. Issue #47
+/// routes it through the same audited dirfd the update stamp uses, once
+/// S1.4 has made that custody cheap.
 #[cfg(target_os = "macos")]
 pub fn wallpaper_to_print(cfg: &Config) -> Option<PathBuf> {
     let stamp = desktop_stamp();
