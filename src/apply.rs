@@ -35,21 +35,29 @@ pub fn wallpaper_get() -> Option<PathBuf> {
     lines.into_iter().next().map(PathBuf::from)
 }
 
-/// The same answer for every SCREEN — bare, `status`, `preview` — without
-/// asking the helper twice for it. `wallpaper get` costs 57 ms, which was
-/// the whole cost of the bare screen, and macOS keeps every Space's choice
-/// in ONE file whose identity moves whenever anything at all changes the
-/// desktop. So the helper's answer is recorded against that identity, in
-/// the cache dir with every other derived thing, and reused only while the
-/// identity holds: the spawn is paid once after a real change instead of on
-/// every screen, and a stale name can never reach the header. A cache that
-/// cannot be written just means asking the helper every time, which is what
-/// used to happen anyway; and this records a READ, so `THEME_NO_APPLY` —
-/// which is about the desktop and the terminal — does not gate it. The
-/// mutating verbs (`rm`, `rename`) keep asking the desktop directly: a
-/// record is fast enough to print by, never enough to delete by.
+/// The desktop's picture for the SCREENS THAT PRINT ITS NAME — the bare
+/// header and `status` — without asking the helper twice for it.
+/// `wallpaper get` costs 57 ms, which was the whole cost of the bare
+/// screen, and macOS keeps every Space's choice in ONE file whose identity
+/// moves whenever anything at all changes the desktop. So the helper's
+/// answer is recorded against that identity, in the cache dir with every
+/// other derived thing, and reused only while the identity holds AND still
+/// names a real file: the spawn is paid once after a real change instead of
+/// on every screen, and a stale name can never reach the header. A cache
+/// that cannot be written just means asking the helper every time, which is
+/// what used to happen anyway; and this records a READ, so `THEME_NO_APPLY`
+/// — which is about the desktop and the terminal — does not gate it.
+///
+/// The record is a plain file in the cache dir and carries none of the
+/// custody the update stamp gets, so the rule that keeps it honest is who
+/// may act on it: the mutating verbs (`rm`, `rename`) keep asking the
+/// desktop directly, and `preview` with no name — which opens the file it
+/// is given and renders its bytes — asks the helper too. A record is fast
+/// enough to print by, never enough to read or delete by. Issue #47 routes
+/// it through the same audited dirfd the update stamp uses, once S1.4 has
+/// made that custody cheap.
 #[cfg(target_os = "macos")]
-pub fn current_wallpaper(cfg: &Config) -> Option<PathBuf> {
+pub fn wallpaper_to_print(cfg: &Config) -> Option<PathBuf> {
     let stamp = desktop_stamp();
     let record = cfg.cache_dir.join("desktop");
     if let Some(s) = &stamp
@@ -58,7 +66,12 @@ pub fn current_wallpaper(cfg: &Config) -> Option<PathBuf> {
         && head == s
         && !path.is_empty()
     {
-        return Some(PathBuf::from(path.strip_suffix('\n').unwrap_or(path)));
+        let path = PathBuf::from(path.strip_suffix('\n').unwrap_or(path));
+        // A recorded name whose file is gone is not an answer: ask again,
+        // so the screen says exactly what the helper says, as it does today.
+        if path.is_file() {
+            return Some(path);
+        }
     }
     let got = wallpaper_get()?;
     if let Some(s) = &stamp {
@@ -80,7 +93,7 @@ fn desktop_stamp() -> Option<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn current_wallpaper(_cfg: &Config) -> Option<PathBuf> {
+pub fn wallpaper_to_print(_cfg: &Config) -> Option<PathBuf> {
     wallpaper_get()
 }
 

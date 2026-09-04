@@ -3,7 +3,7 @@
 //! provenance labels decided by the parsed hostname, and the kitty-graphics
 //! inline previews.
 
-use crate::apply::{current_wallpaper, derive_options, schemes_dir};
+use crate::apply::{derive_options, schemes_dir, wallpaper_get, wallpaper_to_print};
 use crate::config::Config;
 use crate::imaging::img_size;
 use crate::library::{all_images, resolve_local};
@@ -459,7 +459,9 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
                 cfg.wallpaper_dirs_display
             ))
         }),
-        None => match current_wallpaper(cfg).filter(|p| p.is_file()) {
+        // The helper, ALWAYS: this path opens the file it is handed and
+        // renders its bytes, and the desktop record is print-only.
+        None => match wallpaper_get().filter(|p| p.is_file()) {
             Some(p) => p,
             None => die("no current wallpaper to preview — name one: theme preview <wallpaper>"),
         },
@@ -633,7 +635,7 @@ pub fn cmd_status(cfg: &Config) {
     };
     let current = fs::read_to_string(cfg.cache_dir.join("wal")).unwrap_or_default();
     let current = current.trim().to_string();
-    let desk = current_wallpaper(cfg)
+    let desk = wallpaper_to_print(cfg)
         .map(|p| p.display().to_string())
         .unwrap_or_default();
 

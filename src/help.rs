@@ -4,7 +4,7 @@
 //! literal. Keep help generic and extensible, and never let it grow:
 //! additions pay for themselves by consolidating something else.
 
-use crate::apply::current_wallpaper;
+use crate::apply::wallpaper_to_print;
 use crate::config::Config;
 use crate::report::{include_line, render_preview, scheme_colors};
 use crate::ui::{display_text, swatch_row, truncate_ellipsis, wrap_prefixed};
@@ -156,7 +156,7 @@ fn os_line() -> String {
 }
 
 pub fn usage(cfg: &Config) {
-    let desk = current_wallpaper(cfg);
+    let desk = wallpaper_to_print(cfg);
     let inc = include_line(cfg);
     let label = if inc.is_empty() || inc.ends_with("colors-kitty.conf") {
         String::new()
