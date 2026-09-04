@@ -52,12 +52,13 @@ mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 - No Snap or Flatpak build: their sandboxes cut off the kitty socket, the
   wallpaper store and `/dev/tty`, which is the entire job. No Windows build.
 
-**Update** — `theme update` replaces the binary it runs from with the
-latest release, verified against `SHA256SUMS` before a byte of it is
-written; `theme version` and the bare `theme` screen say when one is out.
-Homebrew and package installs update through their own manager
-(`brew upgrade snaraj/theme/theme`, the next `.deb` or `.rpm`): those files
-are the manager's to replace, and `theme update` never elevates.
+**Update** — `theme update` knows how it was installed. A tarball copy is
+replaced in place with the latest release, verified against `SHA256SUMS`
+before a byte of it is written. A Homebrew keg, a `.deb`/`.rpm` or a
+`cargo install` build is left to its manager, and the command is printed
+instead (`brew upgrade snaraj/theme/theme`, the next package, the same
+`cargo install`); `theme update` never elevates. `theme version` and the
+bare `theme` screen say when a release is out.
 
 ### Compatibility
 
