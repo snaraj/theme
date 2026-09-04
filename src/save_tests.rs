@@ -353,6 +353,121 @@ fn darwin_acl_grants() {
     assert!(err.contains("writesecurity"), "{err}");
 }
 
+/// One `ls` for the whole chain must not change what one directory of it
+/// says. The listing below is the shape `ls -lde` gives for three
+/// operands — a plain directory with a DENY entry, one carrying a foreign
+/// grant, and a symlink (whose ` -> target` is not part of its name) — and
+/// each verdict must be the one that path's own reading would have given.
+#[test]
+fn one_listing_gives_each_path_the_verdict_it_would_have_had_alone() {
+    let out = "drwxr-xr-x  5 me  staff  160 Sep  4 02:45 /x\n\
+                0: group:everyone deny delete\n\
+               drwxr-xr-x  5 me  staff  160 Sep  4 02:45 /x/y\n\
+                0: user:daemon allow add_file,delete_child\n\
+                1: group:everyone deny delete\n\
+               lrwxr-xr-x  1 me  staff    4 Sep  4 02:45 /x/z -> /x/y\n";
+    let want = ["/x", "/x/y", "/x/z"];
+    let blocks = attribute(out, &want).expect("a well-formed listing must attribute");
+    let verdict = |p: &str| {
+        let (_, aces) = blocks.iter().find(|(k, _)| *k == p).expect("path missing");
+        acl_write_grant_from(aces.iter().copied())
+    };
+    assert_eq!(verdict("/x"), None, "a DENY entry is not a grant");
+    assert_eq!(
+        verdict("/x/y").as_deref(),
+        Some(
+            "has an ACL granting user:daemon delete_child,add_file, which lets them replace entries regardless of the mode"
+        )
+    );
+    assert_eq!(verdict("/x/z"), None, "the link's own line carries no ACE");
+}
+
+/// Attribution is all-or-nothing: anything the parser cannot place refuses
+/// the WHOLE batch, and the audit then reads each path on its own — a
+/// batch may cost speed, never a verdict.
+#[test]
+fn a_listing_that_cannot_be_attributed_is_trusted_for_nothing() {
+    let hdr = |p: &str| format!("drwxr-xr-x  5 me  staff  160 Sep  4 02:45 {p}\n");
+    let ace = " 0: user:daemon allow add_file\n";
+    let want = ["/x", "/x/y"];
+    let both = format!("{}{}", hdr("/x"), hdr("/x/y"));
+    assert!(attribute(&both, &want).is_some(), "the control listing");
+    // An entry before any directory line has no owner…
+    let orphan = format!("{ace}{both}");
+    assert!(attribute(&orphan, &want).is_none());
+    // …a directory line we never asked about could displace one we did…
+    let foreign = format!("{}{}", both, hdr("/other"));
+    assert!(attribute(&foreign, &want).is_none());
+    // …a path listed twice makes its entries ambiguous…
+    let twice = format!("{}{}", both, hdr("/x"));
+    assert!(attribute(&twice, &want).is_none());
+    // …a path missing from the output was never read…
+    assert!(attribute(&hdr("/x"), &want).is_none());
+    // …and a line of any other shape stops the whole reading.
+    let noise = format!("{both}ls: /x/y: Permission denied\n");
+    assert!(attribute(&noise, &want).is_none());
+}
+
+/// A whole ancestry read in one `ls` must refuse exactly where a per-path
+/// reading refused, with the same words: the deepest ancestor (the library
+/// itself, first block of the listing) and the shallowest one this test
+/// owns (last block) both refuse, whole message asserted; a DENY-only
+/// entry on a third still saves.
+#[test]
+#[cfg(target_os = "macos")]
+fn an_acl_on_either_end_of_the_chain_refuses_in_the_same_words() {
+    let d = tmpdir("acl-chain");
+    let lib = d.join("a/b/lib");
+    fs::create_dir_all(&lib).unwrap();
+    let src = d.join("src.bin");
+    fs::write(&src, b"x").unwrap();
+    let Ok(who) = std::env::var("USER").map(|u| u.trim().to_string()) else {
+        eprintln!("SKIP an_acl_on_either_end_of_the_chain: no USER");
+        return;
+    };
+    let ace = |dir: &Path, spec: &str, on: bool| {
+        Command::new("/bin/chmod")
+            .arg(if on { "+a" } else { "-a" })
+            .arg(spec)
+            .arg(dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    let grant = format!("user:{who} allow add_file,delete_child");
+    if !ace(&lib, &grant, true) {
+        eprintln!("SKIP an_acl_on_either_end_of_the_chain: chmod +a unavailable here");
+        return;
+    }
+    assert!(ace(&lib, &grant, false));
+    for end in [lib.clone(), d.clone()] {
+        assert!(ace(&end, &grant, true), "planting on {}", end.display());
+        let err = save_into(&src, &lib, "", "pic", "png", AclPlatform::Darwin).unwrap_err();
+        assert!(ace(&end, &grant, false));
+        assert_eq!(
+            err,
+            format!(
+                "refusing to save: {} has an ACL granting user:{who} delete_child,add_file, which lets them replace entries regardless of the mode",
+                fs::canonicalize(&end).unwrap().display()
+            )
+        );
+    }
+    // The plain word `write` is the same class, whatever macOS renders it as.
+    let plain = format!("user:{who} allow write");
+    assert!(ace(&d.join("a"), &plain, true));
+    let err = save_into(&src, &lib, "", "pic", "png", AclPlatform::Darwin).unwrap_err();
+    assert!(ace(&d.join("a"), &plain, false));
+    assert!(err.contains("has an ACL granting"), "{err}");
+    // A DENY entry mid-chain restricts; it never granted anything.
+    assert!(ace(&d.join("a"), "group:everyone deny delete", true));
+    let ok = save_into(&src, &lib, "", "pic", "png", AclPlatform::Darwin);
+    assert!(ace(&d.join("a"), "group:everyone deny delete", false));
+    assert!(
+        matches!(ok, Ok(Saved::Created(_))),
+        "a DENY ace mid-chain refused the save: {ok:?}"
+    );
+}
+
 /// A FIFO planted at the first collision name must not hang the save: the
 /// reuse arm opens NONBLOCK and the S_ISREG check rejects it, so the saver
 /// steps to the next free name and returns promptly. Removing either the

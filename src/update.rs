@@ -508,28 +508,38 @@ pub fn cmd_version(cfg: &Config) {
 /// creates nothing anywhere (round 7). Audited, never chmodded. Any
 /// failure gets NOTHING: no stamp, no read, no note, no network.
 fn check_dir(cfg: &Config) -> Option<rustix::fd::OwnedFd> {
-    let platform = crate::save::native_platform();
+    let acl = crate::save::AclAudit::native();
     let parent = cfg.cache_dir.parent()?;
     let leaf = cfg.cache_dir.file_name()?;
-    // The PARENT chain is audited and bound BEFORE anything else — even
-    // the first-run mkdir: a hostile spelled chain must get NOTHING, not
-    // an empty 0700 dir conjured at an attacker-steered target (round 7).
+    let mut spelled = Vec::new();
     let mut prefix = std::path::PathBuf::new();
     for c in parent.components() {
         match c {
             std::path::Component::RootDir => prefix.push("/"),
-            std::path::Component::Normal(n) => {
-                prefix.push(n);
-            }
+            std::path::Component::Normal(n) => prefix.push(n),
             _ => return None, // relative paths and dot-components: no custody
         }
         if prefix.parent().is_none() {
             continue; // "/" itself is every chain's root; audited below
         }
-        crate::save::audit_dir(&prefix, platform).ok()?;
+        spelled.push(prefix.clone());
     }
     let pcanon = std::fs::canonicalize(parent).ok()?;
-    crate::save::audit_chain(&pcanon, platform).ok()?;
+    // Both chains and the endpoint are ONE question, so their ACLs are read
+    // in one `ls` before the first verdict is asked for. Reading decides
+    // nothing: the audits below run in the order they always ran, and each
+    // still re-stats its path for owner and mode.
+    let mut ask = spelled.clone();
+    ask.extend(crate::save::chain_of(&pcanon));
+    ask.push(pcanon.join(leaf));
+    acl.prefetch(&ask);
+    // The PARENT chain is audited and bound BEFORE anything else — even
+    // the first-run mkdir: a hostile spelled chain must get NOTHING, not
+    // an empty 0700 dir conjured at an attacker-steered target (round 7).
+    for p in &spelled {
+        crate::save::audit_dir(p, &acl).ok()?;
+    }
+    crate::save::audit_chain(&pcanon, &acl).ok()?;
     let pfd = open_chain_nofollow(&pcanon)?;
     let me = rustix::process::getuid().as_raw();
     let pst = rustix::fs::fstat(&pfd).ok()?;
@@ -556,7 +566,7 @@ fn check_dir(cfg: &Config) -> Option<rustix::fd::OwnedFd> {
         return None;
     }
     let epath = pcanon.join(leaf);
-    crate::save::audit_dir(&epath, platform).ok()?;
+    crate::save::audit_dir(&epath, &acl).ok()?;
     let now = rustix::fs::stat(&epath).ok()?;
     if now.st_dev != st.st_dev || now.st_ino != st.st_ino {
         return None;
@@ -1593,6 +1603,28 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
         assert_eq!(
             std::fs::read_to_string(real.join("sub2").join("update-check")).unwrap(),
             "v7.7.7"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The whole custody question — spelled chain, canonical chain and the
+    /// endpoint — costs ONE interrogation. Before this it cost one per
+    /// ancestor per chain (a score of spawns for a tree this deep, ~25 ms),
+    /// which is what the default bare screen paid on every run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_whole_custody_audit_asks_ls_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir();
+        let cache = d.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::save::SPAWNS.with(|n| n.set(0));
+        assert!(check_dir(&test_cfg(&cache)).is_some(), "clean control");
+        assert_eq!(
+            crate::save::SPAWNS.with(|n| n.get()),
+            1,
+            "the custody audit asked more than once"
         );
         let _ = std::fs::remove_dir_all(&d);
     }
