@@ -145,6 +145,8 @@ pub fn native_platform() -> AclPlatform {
     }
 }
 
+const LS: &str = "/bin/ls";
+
 /// The one external interrogator left (darwin's `ls -lde`) must itself be
 /// beyond an attacker's reach before its output is trusted: reached by
 /// ABSOLUTE path — PATH plays no part in a custody decision — and both the
@@ -175,9 +177,20 @@ pub(crate) fn trusted_system_binary(p: &str) -> bool {
 /// at an absolute path we pass), no locale (we parse structural output
 /// only). Add a variable here only with a written justification.
 pub(crate) fn trusted_spawn(program: &Path) -> Command {
+    #[cfg(test)]
+    SPAWNS.with(|n| n.set(n.get() + 1));
     let mut cmd = Command::new(program);
     cmd.env_clear();
     cmd
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The spawn census, per thread so a parallel suite cannot blur it,
+    /// and compiled only for tests — a release binary carries no seam.
+    /// Every child of the security boundary passes through
+    /// `trusted_spawn`, so counting there counts them all.
+    pub(crate) static SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A REASON to refuse, or None — the STRICTEST, identity-free rule (round
@@ -192,6 +205,29 @@ pub(crate) fn trusted_spawn(program: &Path) -> Command {
 /// as write-shaped: they let a principal grant itself the rest a moment
 /// later.
 fn acl_write_grant(path: &Path, platform: AclPlatform) -> Option<String> {
+    match platform {
+        AclPlatform::Darwin => {
+            if !trusted_system_binary(LS) {
+                return Some("could not be audited for ACLs: /bin/ls failed validation".into());
+            }
+            let out = match trusted_spawn(Path::new(LS)).arg("-lde").arg(path).output() {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+                _ => return Some("could not be audited for ACLs: ls -lde failed".into()),
+            };
+            acl_write_grant_from(out.lines())
+        }
+        AclPlatform::Posix => match read_posix_acl(path) {
+            Err(why) => Some(why),
+            Ok(None) => None,
+            Ok(Some(bytes)) => posix_acl_grant(&bytes),
+        },
+    }
+}
+
+/// The darwin verdict itself, over ONE directory's `ls -lde` lines — the
+/// single parser, shared by the per-path reading above and the batched one
+/// below, so neither can drift from the other.
+fn acl_write_grant_from<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<String> {
     const GRANTS: [&str; 10] = [
         "write",
         "append",
@@ -204,54 +240,179 @@ fn acl_write_grant(path: &Path, platform: AclPlatform) -> Option<String> {
         "writeextattr",
         "writesecurity",
     ];
-    match platform {
-        AclPlatform::Darwin => {
-            if !trusted_system_binary("/bin/ls") {
-                return Some("could not be audited for ACLs: /bin/ls failed validation".into());
-            }
-            let out = match trusted_spawn(Path::new("/bin/ls"))
-                .arg("-lde")
-                .arg(path)
-                .output()
-            {
-                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-                _ => return Some("could not be audited for ACLs: ls -lde failed".into()),
-            };
-            for ln in out.lines() {
-                let t = ln.trim_start();
-                // ACE lines are numbered: `N: <who> allow|deny <perms>`.
-                let Some((num, ace)) = t.split_once(':') else {
-                    continue;
-                };
-                if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
-                    continue;
-                }
-                let parts: Vec<&str> = ace.split_whitespace().collect();
-                if !parts.contains(&"allow") {
-                    continue;
-                }
-                let who = parts.first().copied().unwrap_or("");
-                let perms: Vec<&str> = parts.last().copied().unwrap_or("").split(',').collect();
-                let hit: Vec<&str> = GRANTS
-                    .iter()
-                    .copied()
-                    .filter(|g| perms.contains(g))
-                    .collect();
-                if hit.is_empty() {
-                    continue;
-                }
-                return Some(format!(
-                    "has an ACL granting {who} {}, which lets them replace entries regardless of the mode",
-                    hit.join(",")
-                ));
-            }
-            None
+    for ln in lines {
+        let Some(ace) = ace_body(ln) else {
+            continue;
+        };
+        let parts: Vec<&str> = ace.split_whitespace().collect();
+        if !parts.contains(&"allow") {
+            continue;
         }
-        AclPlatform::Posix => match read_posix_acl(path) {
-            Err(why) => Some(why),
-            Ok(None) => None,
-            Ok(Some(bytes)) => posix_acl_grant(&bytes),
-        },
+        let who = parts.first().copied().unwrap_or("");
+        let perms: Vec<&str> = parts.last().copied().unwrap_or("").split(',').collect();
+        let hit: Vec<&str> = GRANTS
+            .iter()
+            .copied()
+            .filter(|g| perms.contains(g))
+            .collect();
+        if hit.is_empty() {
+            continue;
+        }
+        return Some(format!(
+            "has an ACL granting {who} {}, which lets them replace entries regardless of the mode",
+            hit.join(",")
+        ));
+    }
+    None
+}
+
+/// The body of a numbered ACE line — `N: <who> allow|deny <perms>`, the
+/// shape `ls -lde` gives each entry — or None for anything else, the
+/// directory's own long line included: its first colon sits in the
+/// timestamp, behind non-digits.
+fn ace_body(l: &str) -> Option<&str> {
+    let (num, ace) = l.trim_start().split_once(':')?;
+    (!num.is_empty() && num.bytes().all(|b| b.is_ascii_digit())).then_some(ace)
+}
+
+/// The name `ls -l` echoed back for one operand: eight fixed fields (mode,
+/// links, owner, group, size, month, day, time) and then the rest of the
+/// line — which is the ABSOLUTE PATH WE PASSED, the one field of the
+/// output that comes from our own argv instead of from the filesystem,
+/// which is what makes attribution unforgeable. A symlink operand adds
+/// ` -> target`, which is not part of the name. None for a line of any
+/// other shape, and None refuses the whole batch.
+fn long_line_name(ln: &str) -> Option<&str> {
+    let mut rest = ln;
+    for _ in 0..8 {
+        rest = rest.trim_start();
+        rest = &rest[rest.find(char::is_whitespace)?..];
+    }
+    let name = rest.trim_start();
+    let name = if ln.starts_with('l') {
+        name.split(" -> ").next()?
+    } else {
+        name
+    };
+    (!name.is_empty()).then_some(name)
+}
+
+/// Split one multi-operand `ls -lde` listing into (path, its ACE lines).
+/// `ls -d` prints each operand's own long line and then that operand's
+/// numbered entries, so every ACE belongs to the header above it. Strict:
+/// a line that is neither an ACE nor a header naming one of the paths we
+/// asked about, an ACE before any header, a path listed twice, or a path
+/// missing from the output all return None — the caller then trusts
+/// nothing from the batch and each path is read on its own, exactly as
+/// today.
+fn attribute<'a>(out: &'a str, want: &[&'a str]) -> Option<Vec<(&'a str, Vec<&'a str>)>> {
+    let mut blocks: Vec<(&str, Vec<&str>)> = Vec::new();
+    for ln in out.lines() {
+        if ace_body(ln).is_some() {
+            blocks.last_mut()?.1.push(ln);
+            continue;
+        }
+        let name = long_line_name(ln)?;
+        let p = want.iter().copied().find(|w| *w == name)?;
+        if blocks.iter().any(|(k, _)| *k == p) {
+            return None;
+        }
+        blocks.push((p, Vec::new()));
+    }
+    (blocks.len() == want.len()).then_some(blocks)
+}
+
+/// The ACL answers ONE custody question has already paid for.
+///
+/// macOS has no in-process ACL reader — `com.apple.system.Security` is
+/// EPERM to read whether or not an ACL exists and is never listed, and
+/// acl(3) needs the FFI this crate denies — so the answer costs a spawn,
+/// and a chain audit asks it of eight or so directories: the spelled
+/// chain, the canonical chain, the endpoint. So it is asked ONCE, for
+/// every path in one argv, through the same validated binary and empty
+/// environment as before, and every ancestor's verdict comes out of that
+/// one reading. Only the ACL reading is remembered: ownership and the mode
+/// bits are re-stat'd for every path, every time. The map lives exactly as
+/// long as the custody question that made it — never process-wide, and
+/// never on disk, because an audit result must not be stored in the
+/// directory it audits.
+pub(crate) struct AclAudit {
+    platform: AclPlatform,
+    seen: std::cell::RefCell<std::collections::HashMap<PathBuf, Option<String>>>,
+}
+
+impl AclAudit {
+    pub(crate) fn new(platform: AclPlatform) -> Self {
+        Self {
+            platform,
+            seen: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub(crate) fn native() -> Self {
+        Self::new(native_platform())
+    }
+
+    /// The verdict for one path — remembered, so the spelled chain, the
+    /// canonical chain and the endpoint never ask twice.
+    fn write_grant(&self, path: &Path) -> Option<String> {
+        if self.platform != AclPlatform::Darwin {
+            // Linux is untouched: its reader is an in-process getxattr, so
+            // there is nothing to save by remembering it, and a reading
+            // that costs nothing is taken fresh every time.
+            return acl_write_grant(path, self.platform);
+        }
+        if let Some(v) = self.seen.borrow().get(path) {
+            return v.clone();
+        }
+        let v = acl_write_grant(path, self.platform);
+        self.seen.borrow_mut().insert(path.to_path_buf(), v.clone());
+        v
+    }
+
+    /// Read the ACLs of every path this question is about to interrogate,
+    /// in ONE `ls`. Cheap and safe to over-ask: nothing here decides
+    /// anything, it only fills in answers the audit is about to want, in
+    /// the audit's own order. Anything unexpected — a validation failure,
+    /// a non-zero `ls` (one unlistable operand fails the whole run), a
+    /// listing that cannot be attributed line for line — records NOTHING,
+    /// and each path is then read on its own by the code that shipped
+    /// before this: a batch can lose speed, never a verdict.
+    pub(crate) fn prefetch(&self, paths: &[PathBuf]) {
+        if self.platform != AclPlatform::Darwin || !trusted_system_binary(LS) {
+            return;
+        }
+        let mut want: Vec<&str> = Vec::new();
+        for p in paths {
+            // A path `ls` cannot list, or cannot be named in one argv,
+            // stays out of the batch and is refused on its own terms.
+            let Some(s) = p.to_str() else { continue };
+            if want.contains(&s) || self.seen.borrow().contains_key(p.as_path()) {
+                continue;
+            }
+            if rustix::fs::lstat(p).is_err() {
+                continue;
+            }
+            want.push(s);
+        }
+        if want.len() < 2 {
+            return; // one path is the per-path reading, spelled twice
+        }
+        let out = match trusted_spawn(Path::new(LS))
+            .arg("-lde")
+            .args(&want)
+            .output()
+        {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            _ => return,
+        };
+        let Some(blocks) = attribute(&out, &want) else {
+            return;
+        };
+        let mut seen = self.seen.borrow_mut();
+        for (p, aces) in blocks {
+            seen.insert(PathBuf::from(p), acl_write_grant_from(aces));
+        }
     }
 }
 
@@ -331,7 +492,7 @@ fn posix_acl_grant(data: &[u8]) -> Option<String> {
     None
 }
 
-pub(crate) fn audit_dir(path: &Path, platform: AclPlatform) -> Result<(), String> {
+pub(crate) fn audit_dir(path: &Path, acl: &AclAudit) -> Result<(), String> {
     let st = rustix::fs::stat(path).map_err(|e| {
         format!(
             "refusing to save: {} could not be audited: {e}",
@@ -351,7 +512,7 @@ pub(crate) fn audit_dir(path: &Path, platform: AclPlatform) -> Result<(), String
             path.display()
         ));
     }
-    if let Some(why) = acl_write_grant(path, platform) {
+    if let Some(why) = acl.write_grant(path) {
         return Err(format!("refusing to save: {} {why}", path.display()));
     }
     Ok(())
@@ -359,14 +520,28 @@ pub(crate) fn audit_dir(path: &Path, platform: AclPlatform) -> Result<(), String
 
 /// Canonical, so a symlinked component is audited as what it really is; then
 /// every ancestor to the root. Shared custody machinery: the update-check
-/// cache (update.rs) audits through this too, never through a copy.
-pub(crate) fn audit_chain(path: &Path, platform: AclPlatform) -> Result<(), String> {
+/// cache (update.rs) audits through this too, never through a copy. The
+/// chain is collected first so its ACLs are read in one go, then audited
+/// leaf-upward in exactly the order it always was.
+pub(crate) fn audit_chain(path: &Path, acl: &AclAudit) -> Result<(), String> {
+    let chain = chain_of(path);
+    acl.prefetch(&chain);
+    for d in &chain {
+        audit_dir(d, acl)?;
+    }
+    Ok(())
+}
+
+/// A canonical path and every ancestor of it, leaf first — the audit's
+/// walk order, as a list.
+pub(crate) fn chain_of(path: &Path) -> Vec<PathBuf> {
     let mut q = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = Vec::new();
     loop {
-        audit_dir(&q, platform)?;
+        out.push(q.clone());
         match q.parent() {
             Some(p) if p != q => q = p.to_path_buf(),
-            _ => return Ok(()),
+            _ => return out,
         }
     }
 }
@@ -443,11 +618,14 @@ pub fn save_into(
     ext: &str,
     platform: AclPlatform,
 ) -> Result<Saved, String> {
+    // One save is one custody question: the library chain and the provider
+    // chain share ancestors, so they share the reading of them.
+    let acl = AclAudit::new(platform);
     let libfd = rustix::fs::open(lib, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .map_err(|e| format!("cannot open the wallpaper library {}: {e}", lib.display()))?;
     trusted(&libfd, &lib.display().to_string())?;
     let mut where_ = fdpath(&libfd, lib);
-    audit_chain(&where_, platform)?;
+    audit_chain(&where_, &acl)?;
 
     let dirfd = if !sub.is_empty() {
         // A provider label is ONE component. Anything else is a caller bug,
@@ -476,7 +654,7 @@ pub fn save_into(
         })?;
         trusted(&sd, &format!("{}/{sub}", lib.display()))?;
         where_ = fdpath(&sd, &lib.join(sub));
-        audit_chain(&where_, platform)?;
+        audit_chain(&where_, &acl)?;
         sd
     } else {
         libfd
