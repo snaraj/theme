@@ -2,17 +2,28 @@
 //! running binary, the way gh/rustup/bun self-update.
 //!
 //! Trust model: this is the OWNER'S OWN repo over TLS — a trusted
-//! destination class, unlike the page-controlled og:image hop. The host set
-//! is GitHub's and nothing else: the API answers directly, and the asset
-//! download is one observed redirect, github.com →
-//! release-assets.githubusercontent.com (chain observed 2026-09-01;
-//! objects.githubusercontent.com kept as the documented previous asset
-//! host). Redirects are walked MANUALLY — curl never follows one on its
-//! own (`--max-redirs 0` everywhere) — so every hop's host is vetted
-//! against that allowlist before it is fetched, and `--proto '=https'`
-//! refuses any protocol downgrade. Integrity is SHA256SUMS + TLS; there is
-//! deliberately no signature infra beyond that (owner's repo, and
-//! required_signatures/cosign gold-plating was ruled out platform-side).
+//! destination class, unlike the page-controlled og:image hop. ONE host
+//! answers, github.com, and the asset download is one observed redirect
+//! from it, github.com → release-assets.githubusercontent.com (chain
+//! observed 2026-09-01; objects.githubusercontent.com kept as the
+//! documented previous asset host). Redirects are walked MANUALLY — curl
+//! never follows one on its own (`--max-redirs 0` everywhere) — so every
+//! hop's host is vetted against that allowlist before it is fetched, and
+//! `--proto '=https'` refuses any protocol downgrade. Integrity is
+//! SHA256SUMS + TLS; there is deliberately no signature infra beyond that
+//! (owner's repo, and required_signatures/cosign gold-plating was ruled
+//! out platform-side).
+//!
+//! Nothing here talks to api.github.com (issue #51). Unauthenticated API
+//! calls share one 60-per-hour budget per address with everything else on
+//! the machine, so ordinary use — a prompt segment asking `theme version`,
+//! a script, the footer's daily refresh — could spend it and make
+//! `theme update` report a network that was never down. The web endpoint
+//! `github.com/snaraj/theme/releases/latest` answers 302 with the tag in
+//! its `Location` and is not API-metered; every asset path below it is
+//! deterministic, so it is BUILT from a shape-checked tag rather than read
+//! out of a document. One parser and one metered host gone, and
+//! `--version` now resolves nothing at all: it makes no lookup request.
 //!
 //! The install invariant: THE RUNNING BINARY IS NEVER REPLACED BY
 //! UNVERIFIED BYTES. The release asset is a tar.gz holding the single
@@ -29,7 +40,6 @@
 //! directory is a clear error — never sudo.
 
 use crate::config::{Config, MAX_DOWNLOAD_BYTES, UA};
-use crate::json::Json;
 use crate::net::{curl_config_trusted, url_host};
 use crate::scratch;
 use crate::ui::{die, display_text};
@@ -40,7 +50,16 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const RELEASES_API: &str = "https://api.github.com/repos/snaraj/theme/releases";
+/// The web endpoint that names the latest release, and the exact prefix
+/// its `Location` must carry. Both are compile-time constants: the only
+/// thing a remote answer contributes is the tag that follows the prefix,
+/// and only after [`tag_shape_ok`].
+const LATEST_URL: &str = "https://github.com/snaraj/theme/releases/latest";
+const TAG_PREFIX: &str = "https://github.com/snaraj/theme/releases/tag/";
+/// Where every release asset lives. The publish job's naming is fixed, so
+/// asset URLs are BUILT from a shape-checked tag — never read out of a
+/// document that could name somewhere else.
+const DOWNLOAD_BASE: &str = "https://github.com/snaraj/theme/releases/download";
 /// How long a footer-note check result stays fresh. One bounded, silent
 /// refresh attempt per window, shared with `theme update` through the same
 /// cache file.
@@ -53,9 +72,9 @@ const ASSET_HOSTS: [&str; 3] = [
     "release-assets.githubusercontent.com",
     "objects.githubusercontent.com",
 ];
-/// The release JSON and SHA256SUMS are small; cap them far below the
-/// binary cap so a wrong asset cannot masquerade as either.
-const API_CAP: u64 = 1024 * 1024;
+/// SHA256SUMS is a few lines and the redirect answer's body is empty;
+/// both are capped far below the binary cap so a wrong asset cannot
+/// masquerade as either.
 const SUMS_CAP: u64 = 64 * 1024;
 
 /// The published release targets. A platform outside this set gets an
@@ -232,22 +251,13 @@ pub fn cmd_update(cfg: &Config, want: &str) {
             "no trusted system curl (a root-owned /usr/bin/curl) — refusing to fetch a binary through an unvetted transport",
         );
     }
-    let url = match &want_tag {
-        Some(t) => format!("{RELEASES_API}/tags/{t}"),
-        None => format!("{RELEASES_API}/latest"),
+    // `--version` names the tag itself, so it asks NOTHING: the parser
+    // above already produced the canonical shape, and a tag that does not
+    // exist surfaces below as its SHA256SUMS 404.
+    let tag = match want_tag.clone() {
+        Some(t) => t,
+        None => latest_tag_remote("30").unwrap_or_else(|e| die(&e)),
     };
-    let json = fetch_release(&url, "30").unwrap_or_else(|| match &want_tag {
-        Some(t) => die(&format!(
-            "no release {t} — see https://github.com/snaraj/theme/releases (or the request failed)"
-        )),
-        None => die("cannot reach the GitHub release API (no network or no release yet)"),
-    });
-
-    let tag = json
-        .str_field("tag_name")
-        .filter(|t| tag_shape_ok(t))
-        .map(str::to_string)
-        .unwrap_or_else(|| die("release has no usable tag"));
     if want_tag.is_none() {
         // Only a LATEST answer refreshes the footer-note cache — one source
         // of truth shared with the update-available check. A --version fetch
@@ -261,26 +271,36 @@ pub fn cmd_update(cfg: &Config, want: &str) {
 
     // SHA256SUMS is the ground truth for both the asset NAME (the unique
     // entry naming this target triple) and its digest — so the asset-naming
-    // scheme lives in the release chain, not here.
-    let sums_url = asset_url(&json, "SHA256SUMS")
-        .unwrap_or_else(|| die("release publishes no SHA256SUMS — refusing an unverifiable build"));
+    // scheme lives in the release chain, not here. Its 404 is also how a
+    // release that does not exist answers, which is the whole cost of
+    // `--version` skipping the resolve.
     let sums_file = scratch::new();
-    fetch_asset(&sums_url, &sums_file, SUMS_CAP)
-        .unwrap_or_else(|e| die(&format!("SHA256SUMS download failed: {e}")));
+    fetch_asset(&asset_url(&tag, "SHA256SUMS"), &sums_file, SUMS_CAP).unwrap_or_else(|e| {
+        die(&match e {
+            Fetch::Missing => {
+                format!("no release {tag} — see https://github.com/snaraj/theme/releases")
+            }
+            Fetch::Failed(why) => format!("SHA256SUMS download failed: {why}"),
+        })
+    });
     let sums = std::fs::read_to_string(&sums_file)
         .unwrap_or_else(|_| die("SHA256SUMS is not readable text"));
     scratch::done(&sums_file);
     let (expect_hex, asset_name) =
         pick_from_sums(&sums, TARGET).unwrap_or_else(|e| die(&display_text(&e)));
 
-    let bin_url = asset_url(&json, &asset_name).unwrap_or_else(|| {
-        die(&display_text(&format!(
-            "SHA256SUMS names '{asset_name}' but the release has no such asset"
-        )))
-    });
     let staged = scratch::new();
-    fetch_asset(&bin_url, &staged, MAX_DOWNLOAD_BYTES)
-        .unwrap_or_else(|e| die(&format!("release download failed: {e}")));
+    fetch_asset(&asset_url(&tag, &asset_name), &staged, MAX_DOWNLOAD_BYTES).unwrap_or_else(|e| {
+        die(&match e {
+            // The check the API's asset list used to give for free: if
+            // SHA256SUMS names a tarball the release does not publish, the
+            // built URL 404s and nothing is installed.
+            Fetch::Missing => {
+                format!("SHA256SUMS names '{asset_name}' but release {tag} has no such asset")
+            }
+            Fetch::Failed(why) => format!("release download failed: {why}"),
+        })
+    });
     let got = std::fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
     if got == 0 || got > MAX_DOWNLOAD_BYTES {
         die("release download is empty or over the byte cap");
@@ -293,44 +313,107 @@ pub fn cmd_update(cfg: &Config, want: &str) {
     println!("updated: {}", display_text(&target.display().to_string()));
 }
 
-/// One release-API request: hardened flags, bounded size, parsed JSON.
-/// `max_time` is the caller's latency budget — 30s for the explicit
-/// `theme update`, 2s for either update check (the footer's silent refresh
-/// and `theme version`'s live ask both wait behind a person).
+/// The latest published tag, resolved from ONE request whose redirect is
+/// read but never followed. `budget` is the caller's latency cap in
+/// seconds — 30 for the explicit `theme update`, 2 for `theme version`'s
+/// live ask and the footer's silent refresh, both of which wait behind a
+/// person.
 ///
 /// The transport is the TRUSTED curl only — resolved and re-validated per
 /// call, never PATH (round 8: one planted curl would control metadata,
 /// digest file, and hashed bytes at once, making SHA-256 self-referential).
 /// `-q` sits FIRST on the argv so no curlrc can inject options, and
-/// [`curl_config_trusted`] scrubs every proxy variable from the child env.
-fn fetch_release(url: &str, max_time: &str) -> Option<Json> {
-    let curl = crate::net::trusted_curl()?;
-    let body = curl_config_trusted(
+/// [`curl_config_trusted`] runs the child under an EMPTY environment.
+/// `-I` asks for the headers alone (github.com answers HEAD with the same
+/// 302, observed 2026-09-04), so there is no body to bound and no reading
+/// of one; and deliberately no `-f`, because the status has to stay
+/// READABLE — "403, rate limited" and "the network is down" are different
+/// answers, and the old API path told the owner the wrong one (#51).
+///
+/// Every Err is a short sentence naming what was asked, what answered and
+/// the budget — and never echoes a byte of the answer.
+fn latest_tag_remote(budget: &str) -> Result<String, String> {
+    // `theme update` refuses earlier, with the full sentence; this arm is
+    // the quiet callers', so it stays short enough for one closing line.
+    let curl = crate::net::trusted_curl().ok_or("no trusted system curl")?;
+    let head = curl_config_trusted(
         &curl,
-        "header = \"Accept: application/vnd.github+json\"\nheader = \"X-GitHub-Api-Version: 2022-11-28\"\n",
+        "",
         &[
             "-q",
-            "-fsg",
+            "-sgI",
             "--proto",
             "=https",
             "--max-redirs",
             "0",
-            "--max-filesize",
-            "1048576",
             "--max-time",
-            max_time,
+            budget,
             "-A",
             UA,
-            "-K",
-            "-",
             "--url",
-            url,
+            LATEST_URL,
         ],
-    )?;
-    if body.len() as u64 > API_CAP {
-        return None;
+    )
+    .ok_or_else(|| format!("could not reach github.com within {budget}s"))?;
+    let head = String::from_utf8_lossy(&head);
+    let (status, loc) = parse_head(&head);
+    match status {
+        301 | 302 | 303 | 307 | 308 => loc
+            .as_deref()
+            .and_then(tag_from_location)
+            .map(str::to_string)
+            .ok_or_else(|| format!("github.com redirected {LATEST_URL} somewhere unexpected")),
+        0 => Err(format!("github.com's answer to {LATEST_URL} had no status")),
+        s => Err(format!(
+            "github.com answered HTTP {s} for {LATEST_URL}{}",
+            limit_note(&head)
+        )),
     }
-    String::from_utf8(body).ok().and_then(|s| Json::parse(&s))
+}
+
+/// The tag inside a `releases/latest` redirect, or nothing. The Location
+/// must be EXACTLY [`TAG_PREFIX`] plus a tag [`tag_shape_ok`] accepts —
+/// which admits only `v` + version characters, so another host, an
+/// `http://` downgrade, a query, a fragment, a trailing slash, an extra
+/// path segment and every `../` shape all fail on the prefix or on the
+/// first character the shape refuses. The Location is never fetched: this
+/// tag is the only thing that survives the answer, and it goes on to build
+/// our own URLs.
+fn tag_from_location(loc: &str) -> Option<&str> {
+    let tag = loc.strip_prefix(TAG_PREFIX)?;
+    tag_shape_ok(tag).then_some(tag)
+}
+
+/// The download URL for one release asset. Deterministic by construction:
+/// a shape-checked tag and a name SHA256SUMS supplied for this build's own
+/// compile-time target — no remote document names a host or a path here.
+fn asset_url(tag: &str, name: &str) -> String {
+    format!("{DOWNLOAD_BASE}/{tag}/{name}")
+}
+
+/// The rate-limit half of a refusal, when the answer carries one: GitHub
+/// says so with `Retry-After` (seconds) or with a spent
+/// `x-ratelimit-remaining` beside an epoch `x-ratelimit-reset`. Empty
+/// otherwise, so the caller's message stays one sentence either way.
+fn limit_note(head: &str) -> String {
+    let mins = |secs: u64| secs.div_ceil(60).max(1);
+    if let Some(after) = header_value(head, "retry-after").and_then(|v| v.parse::<u64>().ok()) {
+        return format!(" — rate limited, retry in {} min", mins(after));
+    }
+    if header_value(head, "x-ratelimit-remaining").as_deref() != Some("0") {
+        return String::new();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match header_value(head, "x-ratelimit-reset")
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|reset| reset.saturating_sub(now))
+    {
+        Some(left) if left > 0 => format!(" — rate limit spent, resets in {} min", mins(left)),
+        _ => " — rate limit spent".to_string(),
+    }
 }
 
 /// The kill switch, read in one place: THEME_NO_UPDATE_CHECK non-empty
@@ -346,42 +429,20 @@ fn check_off() -> bool {
 /// read, and at most one bounded refresh (2s hard cap) runs per
 /// [`CHECK_TTL`] window — stamped even on failure, so an offline machine
 /// pays it once per window, not per run.
-pub fn latest_tag(cfg: &Config) -> Option<(u64, u64, u64)> {
-    latest_tag_with(cfg, false)
-}
-
-/// The latest published release, as a strict triple — or None whenever it
-/// cannot be KNOWN: the kill-switch (THEME_NO_UPDATE_CHECK, non-empty) is
-/// set, custody refuses the cache dir, no trusted transport exists, the
-/// fetch failed, or the cache is malformed. Callers render silence on
-/// None; none of them may guess. Every cache touch — read and stamp alike
-/// — goes through [`check_dir`]'s fail-closed custody.
 ///
-/// `live` is the deliberate question's mode (`theme version`, issue #42):
-/// the cache's freshness is never consulted, the trusted transport is
-/// required, and one bounded request runs on EVERY call — under the same
-/// 2s cap the footer has always lived on, because the caller is waiting.
-/// A usable tag stamps the shared cache so the footer benefits from the
-/// ask; a failed one stamps NOTHING — overwriting a good stamp with a
-/// failure would silence the footer for a whole TTL window — and returns
-/// None, so the caller makes no claim it cannot back.
-fn latest_tag_with(cfg: &Config, live: bool) -> Option<(u64, u64, u64)> {
+/// None whenever the latest cannot be KNOWN: the kill-switch
+/// (THEME_NO_UPDATE_CHECK, non-empty) is set, custody refuses the cache
+/// dir, no trusted transport exists, the refresh failed, or the cache is
+/// malformed. The footer renders silence on None and may never guess.
+/// Every cache touch — read and stamp alike — goes through [`check_dir`]'s
+/// fail-closed custody.
+pub fn latest_tag(cfg: &Config) -> Option<(u64, u64, u64)> {
     if check_off() {
         return None;
     }
     // Custody first: a cache dir that fails the fail-closed audit gets no
     // read, no stamp, no answer — and no network attempt either.
     let dirfd = check_dir(cfg)?;
-    if live {
-        crate::net::trusted_curl()?;
-        let tag = fetch_release(&format!("{RELEASES_API}/latest"), "2").and_then(|j| {
-            j.str_field("tag_name")
-                .filter(|t| tag_shape_ok(t))
-                .map(str::to_string)
-        })?;
-        write_check_at(&dirfd, &tag);
-        return parse_v3(&tag);
-    }
     let (fresh, mut cached) = read_check(&dirfd);
     if !fresh {
         // No trusted transport ⇒ no network AND no stamp (decided, round
@@ -391,19 +452,32 @@ fn latest_tag_with(cfg: &Config, live: bool) -> Option<(u64, u64, u64)> {
         // a transport that recovers a minute later. A still-fresh cache
         // above renders fine without any transport at all.
         crate::net::trusted_curl()?;
-        let tag = fetch_release(&format!("{RELEASES_API}/latest"), "2")
-            .and_then(|j| {
-                j.str_field("tag_name")
-                    .filter(|t| tag_shape_ok(t))
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
+        let tag = latest_tag_remote("2").unwrap_or_default();
         write_check_at(&dirfd, &tag);
         cached = tag;
     }
     // The cached tag is REMOTE data: it survives only as a strict numeric
     // semver triple, so nothing a caller prints is ever the cached string.
     parse_v3(cached.trim())
+}
+
+/// The deliberate question's answer (`theme version`, issue #42): the
+/// cache's freshness is never consulted and one bounded request runs on
+/// EVERY call — under the same 2s cap the footer has always lived on,
+/// because the caller is waiting. A usable tag stamps the shared cache so
+/// the footer benefits from the ask; a failed one stamps NOTHING —
+/// overwriting a good stamp with a failure would silence the footer for a
+/// whole TTL window.
+///
+/// Err carries the REASON, so the closing line can name it instead of
+/// leaving the reader to guess which of five things happened (#51). Two
+/// of those reasons never make a request, and say so. The kill switch is
+/// the CALLER's check — `cmd_version` returns before reaching here.
+fn latest_live(cfg: &Config) -> Result<(u64, u64, u64), String> {
+    let dirfd = check_dir(cfg).ok_or("could not check")?;
+    let tag = latest_tag_remote("2")?;
+    write_check_at(&dirfd, &tag);
+    parse_v3(&tag).ok_or_else(|| "github.com named no numbered release".to_string())
 }
 
 /// This build's own version. `CARGO_PKG_VERSION` is a compile-time constant
@@ -414,8 +488,8 @@ fn current_v3() -> Option<(u64, u64, u64)> {
 }
 
 /// The update-available footer on the bare `theme` screen. Silent on every
-/// failure mode — offline, rate-limited, bad JSON, malformed cache — and
-/// printed ONLY when the latest is strictly newer than this build. Both
+/// failure mode — offline, rate-limited, refused custody, malformed cache —
+/// and printed ONLY when the latest is strictly newer than this build. Both
 /// printed values are RECONSTRUCTED from the parsed numbers, so a
 /// remote-supplied string or URL is never echoed.
 pub fn maybe_note(cfg: &Config) {
@@ -468,18 +542,19 @@ pub fn cmd_version(cfg: &Config) {
     if check_off() {
         return;
     }
-    match (current_v3(), latest_tag_with(cfg, true)) {
-        // "could not check", not "could not reach": two of the three
-        // causes — refused custody, no trusted curl — never make a
-        // request, so naming the network would be a lie about what
-        // happened.
-        (_, None) => println!("latest release: unknown (could not check)"),
-        (Some(c), Some(l)) if l > c => println!(
+    match (current_v3(), latest_live(cfg)) {
+        // The reason, never a guess: a refused custody audit says only
+        // "could not check" because nothing was asked, while an answer
+        // that came back — a rate limit, a status, an unexpected redirect
+        // — names itself. The reason is built from our own constants and
+        // the response's STATUS; not one byte of the answer is echoed.
+        (_, Err(why)) => println!("latest release: unknown ({why})"),
+        (Some(c), Ok(l)) if l > c => println!(
             "latest release: v{}.{}.{} — update with 'theme update'",
             l.0, l.1, l.2
         ),
-        (Some(c), Some(l)) if l == c => println!("you're on the latest release."),
-        (_, Some(l)) => println!("latest release: v{}.{}.{}", l.0, l.1, l.2),
+        (Some(c), Ok(l)) if l == c => println!("you're on the latest release."),
+        (_, Ok(l)) => println!("latest release: v{}.{}.{}", l.0, l.1, l.2),
     }
 }
 
@@ -711,8 +786,8 @@ fn parse_ver_arg(s: &str) -> Option<((u64, u64, u64), String)> {
     Some((v, format!("v{}.{}.{}", v.0, v.1, v.2)))
 }
 
-/// Release tags are API data: `v` + a short run of version characters,
-/// nothing else reaches a message or a comparison.
+/// Release tags are REMOTE data: `v` + a short run of version characters,
+/// nothing else reaches a message, a URL or a comparison.
 fn tag_shape_ok(t: &str) -> bool {
     t.len() <= 64
         && t.starts_with('v')
@@ -720,22 +795,6 @@ fn tag_shape_ok(t: &str) -> bool {
         && t[1..]
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
-/// The download URL for the release asset named exactly `name` — and it
-/// must live under this repo's own release path; anything else in the API
-/// answer is refused, not followed.
-fn asset_url(release: &Json, name: &str) -> Option<String> {
-    let assets = match release.get("assets") {
-        Some(Json::Arr(a)) => a,
-        _ => return None,
-    };
-    let url = assets
-        .iter()
-        .find(|a| a.str_field("name") == Some(name))
-        .and_then(|a| a.str_field("browser_download_url"))?;
-    url.starts_with("https://github.com/snaraj/theme/releases/download/")
-        .then(|| url.to_string())
 }
 
 /// The SHA256SUMS entry for this platform's tarball, matched on the EXACT
@@ -769,23 +828,29 @@ fn pick_from_sums(sums: &str, target: &str) -> Result<(String, String), String> 
         .ok_or_else(|| format!("SHA256SUMS has no entry for {target}"))
 }
 
+/// One header's value out of a `curl -D` dump — the first match,
+/// case-insensitively, empty values not counting. The status line is
+/// skipped so a request line can never be read as a header.
+fn header_value(hdr: &str, name: &str) -> Option<String> {
+    hdr.lines()
+        .skip(1)
+        .map(|l| l.trim_end_matches('\r'))
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+        })
+        .filter(|v| !v.is_empty())
+}
+
 /// First line + Location of a `curl -D` header dump.
 fn parse_head(hdr: &str) -> (u16, Option<String>) {
-    let mut lines = hdr.lines();
-    let status = lines
+    let status = hdr
+        .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
-    let loc = lines
-        .map(|l| l.trim_end_matches('\r'))
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            k.eq_ignore_ascii_case("location")
-                .then(|| v.trim().to_string())
-        })
-        .filter(|v| !v.is_empty());
-    (status, loc)
+    (status, header_value(hdr, "location"))
 }
 
 fn hop_host_ok(url: &str) -> bool {
@@ -795,18 +860,33 @@ fn hop_host_ok(url: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// Why an asset fetch stopped. A 404 is its own variant because "there is
+/// no such release" is an ANSWER the caller states in its own words, not a
+/// transport complaint — and it is the check the API's asset list used to
+/// give for free, now made by the server that owns the file.
+enum Fetch {
+    Missing,
+    Failed(String),
+}
+
+impl From<&str> for Fetch {
+    fn from(e: &str) -> Self {
+        Fetch::Failed(e.to_string())
+    }
+}
+
 /// Fetch a release asset with every redirect walked by hand: each hop runs
 /// curl with `--max-redirs 0`, and a Location only gets fetched if its host
 /// is on [`ASSET_HOSTS`] and its scheme is https. Two hops is one more than
 /// the observed chain needs.
-fn fetch_asset(url: &str, dest: &Path, cap: u64) -> Result<(), String> {
+fn fetch_asset(url: &str, dest: &Path, cap: u64) -> Result<(), Fetch> {
     let mut here = url.to_string();
     for _ in 0..=2 {
         if !hop_host_ok(&here) {
-            return Err(format!(
+            return Err(Fetch::Failed(format!(
                 "refusing non-GitHub download host '{}'",
                 display_text(&url_host(&here).unwrap_or_default())
-            ));
+            )));
         }
         let hdr = scratch::new();
         // Trusted transport, RE-VALIDATED per hop, under the SAME env
@@ -850,7 +930,8 @@ fn fetch_asset(url: &str, dest: &Path, cap: u64) -> Result<(), String> {
             301 | 302 | 303 | 307 | 308 => {
                 here = loc.ok_or("redirect without a Location")?;
             }
-            s => return Err(format!("unexpected HTTP status {s}")),
+            404 => return Err(Fetch::Missing),
+            s => return Err(Fetch::Failed(format!("unexpected HTTP status {s}"))),
         }
     }
     Err("redirect chain too long".into())
@@ -1156,6 +1237,113 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
         assert_eq!(s, 200);
         assert!(l.is_none());
         assert_eq!(parse_head("").0, 0);
+    }
+
+    /// The whole trust surface of the API's replacement (#51): a
+    /// `releases/latest` Location contributes ONE thing, the tag, and only
+    /// when the string is exactly this repo's tag path plus a tag the
+    /// shape check accepts. The Location is never fetched, so a refusal
+    /// here is the end of the road, not a fallback.
+    #[test]
+    fn the_latest_redirect_yields_only_this_repos_tag() {
+        let at = |s: &str| format!("{TAG_PREFIX}{s}");
+        assert_eq!(tag_from_location(&at("v0.3.5")), Some("v0.3.5"));
+        assert_eq!(tag_from_location(&at("v1.2.3-rc.1")), Some("v1.2.3-rc.1"));
+        // The live answer, byte for byte (observed 2026-09-04).
+        assert_eq!(
+            tag_from_location("https://github.com/snaraj/theme/releases/tag/v0.3.4"),
+            Some("v0.3.4")
+        );
+        // Another host, the metered one included, and a downgrade.
+        assert!(tag_from_location("https://evil.invalid/x").is_none());
+        assert!(
+            tag_from_location("https://github.com.evil.invalid/snaraj/theme/releases/tag/v1.0.0")
+                .is_none()
+        );
+        assert!(
+            tag_from_location("https://api.github.com/repos/snaraj/theme/releases/tag/v1.0.0")
+                .is_none()
+        );
+        assert!(tag_from_location("http://github.com/snaraj/theme/releases/tag/v1.0.0").is_none());
+        // Another repo under the same host, and a relative Location.
+        assert!(tag_from_location("https://github.com/evil/theme/releases/tag/v1.0.0").is_none());
+        assert!(tag_from_location("/snaraj/theme/releases/tag/v1.0.0").is_none());
+        // Everything the tag itself may not be: empty, unversioned,
+        // uppercase, traversal, an extra segment, a trailing slash, a
+        // query, a fragment, terminal protocol.
+        for bad in [
+            "",
+            "0.3.5",
+            "V0.3.5",
+            "../../../evil/releases/tag/v1.0.0",
+            "v0.3.5/../../v9.9.9",
+            "v0.3.5/extra",
+            "v0.3.5/",
+            "v0.3.5?next=evil",
+            "v0.3.5#frag",
+            "v0.3.5\u{1b}]52;c;steal\u{7}",
+        ] {
+            assert!(tag_from_location(&at(bad)).is_none(), "accepted {bad:?}");
+        }
+    }
+
+    /// Asset URLs are BUILT from a shape-checked tag and this build's own
+    /// target name — the one property that let the API answer go.
+    #[test]
+    fn asset_urls_are_built_under_this_repos_download_path() {
+        assert_eq!(
+            asset_url("v0.3.5", "SHA256SUMS"),
+            "https://github.com/snaraj/theme/releases/download/v0.3.5/SHA256SUMS"
+        );
+        assert_eq!(
+            asset_url("v0.3.5", "theme-aarch64-apple-darwin.tar.gz"),
+            "https://github.com/snaraj/theme/releases/download/v0.3.5/theme-aarch64-apple-darwin.tar.gz"
+        );
+        // Whatever it is handed, the result stays on the allowlisted host
+        // the hop gate then re-checks.
+        assert!(hop_host_ok(&asset_url("v0.3.5", "SHA256SUMS")));
+    }
+
+    /// The failure the owner actually hit, named instead of guessed (#51):
+    /// a throttled answer says so, and says when it lifts.
+    #[test]
+    fn a_throttled_answer_names_its_limit() {
+        assert_eq!(
+            limit_note("HTTP/2 429\r\nretry-after: 120\r\n"),
+            " — rate limited, retry in 2 min"
+        );
+        // Sub-minute waits round up rather than saying "in 0 min".
+        assert_eq!(
+            limit_note("HTTP/2 429\r\nRetry-After: 5\r\n"),
+            " — rate limited, retry in 1 min"
+        );
+        let soon = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        assert_eq!(
+            limit_note(&format!(
+                "HTTP/2 403\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: {soon}\r\n"
+            )),
+            " — rate limit spent, resets in 10 min"
+        );
+        // A reset already past, and a budget that is not spent.
+        assert_eq!(
+            limit_note("HTTP/2 403\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 1\r\n"),
+            " — rate limit spent"
+        );
+        assert_eq!(
+            limit_note("HTTP/2 403\r\nx-ratelimit-remaining: 41\r\n"),
+            ""
+        );
+        // A 403 that says nothing about limits adds nothing.
+        assert_eq!(limit_note("HTTP/2 403\r\nserver: github.com\r\n"), "");
+        // The status line is not a header, however it is spelled.
+        assert_eq!(
+            header_value("retry-after: 9\r\nx: y\r\n", "retry-after"),
+            None
+        );
     }
 
     #[test]

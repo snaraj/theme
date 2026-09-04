@@ -1195,22 +1195,37 @@ for ((i = 0; i < ${#args[@]}; i++)); do
 done
 [ "$k" = 1 ] && cat >/dev/null
 printf '%s\n' "$url" >>"$UPD_LOG"
-resp() { printf 'HTTP/2 %s\r\n%s\r\n\r\n' "$1" "$2" >"$hdr"; }
-release_json() { # $1 tag — STABLE asset names, no version infix (#14 r3)
-    local a="https://github.com/snaraj/theme/releases/download/$1"
-    printf '{"tag_name":"%s","assets":[{"name":"SHA256SUMS","browser_download_url":"%s/SHA256SUMS"},{"name":"theme-%s.tar.gz","browser_download_url":"%s/theme-%s.tar.gz"}]}' \
-        "$1" "$a" "$UPD_TRIPLE" "$a" "$UPD_TRIPLE"
+# The header dump is a FILE for the asset hops (-D) and STDOUT for the
+# resolve, which asks for headers alone (-I) and needs no file at all.
+resp() {
+    if [ -z "$hdr" ]; then printf 'HTTP/2 %s\r\n%s\r\n\r\n' "$1" "$2"
+    else printf 'HTTP/2 %s\r\n%s\r\n\r\n' "$1" "$2" >"$hdr"; fi
 }
 case "$url" in
-*api.github.com/repos/snaraj/theme/releases/latest*)
-    release_json "$UPD_TAG"
+*github.com/snaraj/theme/releases/latest)
+    # The web redirect that replaced the metered API (#51). UPD_LATEST
+    # plays what github.com answered; the values stay space-free because
+    # the ctl file is SOURCED. A HEAD asks for no body, so nothing is
+    # written to an output file here — there is none.
+    case "${UPD_LATEST:-ok}" in
+    429) resp 429 "retry-after: 120" ;;
+    403) resp 403 "x-ratelimit-remaining: 0" ;;
+    500) resp 500 "server: github.com" ;;
+    evil) resp 302 "location: https://evil.invalid/snaraj/theme/releases/tag/v9.9.9" ;;
+    body) resp 200 "content-type: text/html" ;;
+    *) resp 302 "location: https://github.com/snaraj/theme/releases/tag/$UPD_TAG" ;;
+    esac
     ;;
-*api.github.com/repos/snaraj/theme/releases/tags/*)
-    want="${url##*/}"
-    if [ "$want" = "$UPD_TAG" ]; then release_json "$want"; else exit 22; fi
-    ;;
-*/releases/download/*/SHA256SUMS*)
-    : >"$out"; resp 302 "location: https://release-assets.githubusercontent.com/sums"
+*/releases/download/*/SHA256SUMS)
+    # SHA256SUMS is where a release that does not exist answers now: the
+    # tag in the built path decides, exactly as github.com would.
+    : >"$out"
+    t="${url%/SHA256SUMS}"; t="${t##*/}"
+    if [ "$t" = "$UPD_TAG" ]; then
+        resp 302 "location: https://release-assets.githubusercontent.com/sums"
+    else
+        resp 404 "content-type: text/html"
+    fi
     ;;
 *release-assets.githubusercontent.com/sums*)
     cp "$UPD_SUMS_FILE" "$out"; resp 200 "content-type: text/plain"
@@ -1313,6 +1328,52 @@ else fail "installed bytes differ from the release payload"; fi
 if [ -z "$(find "$updd/bin" -name '.*update*' 2>/dev/null)" ]; then
     pass "no install temp file survives success"
 else fail "an install temp file was left beside the binary"; fi
+
+# --- issue #51: the latest tag comes from the web redirect, not the API ----
+# The METERED host is gone from the whole flow: the resolve is one request
+# to github.com/…/releases/latest, whose Location is parsed and never
+# followed, and every asset URL below it is BUILT from the tag it named.
+if [ "$(sed -n 1p "$updlog")" = "https://github.com/snaraj/theme/releases/latest" ] \
+   && [ "$(sed -n 2p "$updlog")" = "https://github.com/snaraj/theme/releases/download/v9.9.9/SHA256SUMS" ] \
+   && ! grep -q 'api\.github\.com' "$updlog"; then
+    pass "update resolves through the redirect and builds its asset URLs"
+else fail "the resolve path drifted: $(cat "$updlog")"; fi
+if ! grep -q 'releases/tag/v9.9.9' "$updlog"; then
+    pass "the redirect target itself is parsed, never fetched"
+else fail "the Location was followed: $(cat "$updlog")"; fi
+
+# A throttled or failing github.com must NAME what answered — the defect
+# that opened #51 was an unrelated 403 reported as "no network".
+upd_run UPD_TAG=v9.9.9 UPD_LATEST=429
+if [ "$upd_rc" != 0 ] \
+   && grep -qF 'github.com answered HTTP 429' "$upd_out" \
+   && grep -qF 'rate limited, retry in 2 min' "$upd_out" \
+   && ! grep -qiE 'no network|cannot reach' "$upd_out" && upd_intact; then
+    pass "a 429 with Retry-After names the limit and when it lifts"
+else fail "the throttled answer was misreported: $(cat "$upd_out")"; fi
+upd_run UPD_TAG=v9.9.9 UPD_LATEST=403
+if [ "$upd_rc" != 0 ] && grep -qF 'github.com answered HTTP 403' "$upd_out" \
+   && grep -qF 'rate limit spent' "$upd_out" && upd_intact; then
+    pass "a spent rate-limit budget is named, not guessed at"
+else fail "the 403 answer was misreported: $(cat "$upd_out")"; fi
+upd_run UPD_TAG=v9.9.9 UPD_LATEST=500
+if [ "$upd_rc" != 0 ] && grep -qF 'github.com answered HTTP 500' "$upd_out" \
+   && [ "$(wc -l <"$updlog" | tr -d ' ')" = 1 ] && upd_intact; then
+    pass "any other status is printed as itself, with one request made"
+else fail "a 500 was not reported as itself: $(cat "$upd_out")"; fi
+upd_run UPD_TAG=v9.9.9 UPD_LATEST=body
+if [ "$upd_rc" != 0 ] && grep -qF 'github.com answered HTTP 200' "$upd_out" \
+   && upd_intact; then
+    pass "a 200 where a redirect belongs is refused, not mined for a tag"
+else fail "a non-redirect answer was accepted: $(cat "$upd_out")"; fi
+# A Location off this repo's tag path is refused OUTRIGHT — there is no
+# second guess and no fetch, so nothing downstream can be steered.
+upd_run UPD_TAG=v9.9.9 UPD_LATEST=evil
+if [ "$upd_rc" != 0 ] && grep -qF 'redirected' "$upd_out" \
+   && ! grep -q 'evil.invalid' "$updlog" \
+   && [ "$(wc -l <"$updlog" | tr -d ' ')" = 1 ] && upd_intact; then
+    pass "a foreign redirect target is refused and never contacted"
+else fail "the resolve followed a foreign Location: $(cat "$updlog")"; fi
 
 printf '%064d  theme-%s.tar.gz\n' 0 "$triple" >"$updd/sums"
 upd_run UPD_TAG=v9.9.9
@@ -1434,9 +1495,10 @@ if [ "$upd_rc" = 0 ] && grep -qF "theme v$cur_ver → v9.9.9" "$upd_out" \
    && cmp -s "$inner" "$updd/bin/theme"; then
     pass "--version installs the requested release"
 else fail "--version happy path broke: $(cat "$upd_out")"; fi
-if grep -q '/releases/tags/v9.9.9' "$updlog"; then
-    pass "--version normalizes and uses the by-tag endpoint"
-else fail "--version did not hit the by-tag endpoint: $(cat "$updlog")"; fi
+if [ "$(sed -n 1p "$updlog")" = "https://github.com/snaraj/theme/releases/download/v9.9.9/SHA256SUMS" ] \
+   && ! grep -q 'releases/latest' "$updlog"; then
+    pass "--version resolves nothing: the first request is its own SHA256SUMS"
+else fail "--version made a lookup request: $(cat "$updlog")"; fi
 if [ ! -e "$fixture/cache/update-check" ]; then
     pass "a --version fetch never stamps the latest-check cache"
 else fail "--version poisoned the update-check cache"; fi
@@ -1714,8 +1776,11 @@ mkdir -p "$vercache" "$verbin"
 # child is env-cleared (round 9) — and logs every URL it is asked for, so
 # "no request" means curl was never spawned at one. It also copies stdout
 # AS IT STANDS at request time into the witness, which is how the streaming
-# order is proved. An empty tag plays an unreachable API (exit 6, the
-# failing-transport pattern the footer uses).
+# order is proved. It answers as github.com does since #51: a 302 whose
+# Location names the tag, written to stdout because the resolve dumps its
+# headers there (-D -). An empty tag plays an unreachable host (exit 6, the
+# failing-transport pattern the footer uses); the reserved value 429 plays
+# a throttled one, which no tag shape could ever be.
 cat >"$verbin/curl" <<EOS
 #!/bin/sh
 PATH=/usr/bin:/bin
@@ -1731,7 +1796,10 @@ done
 printf '%s\n' "\$url" >>"$verlog"
 cat "$ver_out" >"$verwit"
 [ -n "\$VER_TAG" ] || exit 6
-printf '{"tag_name":"%s"}' "\$VER_TAG"
+case "\$VER_TAG" in
+429) printf 'HTTP/2 429\r\nretry-after: 300\r\n\r\n' ;;
+*) printf 'HTTP/2 302\r\nlocation: https://github.com/snaraj/theme/releases/tag/%s\r\n\r\n' "\$VER_TAG" ;;
+esac
 EOS
 chmod +x "$verbin/curl"
 ver_tag=""
@@ -1766,7 +1834,14 @@ closes() { # the same three lines, then $1 as the fourth, and nothing after
 newer="latest release: v9.9.9 — update with 'theme update'"
 equal="you're on the latest release."
 ahead="latest release: v0.0.0"
-unknown="latest release: unknown (could not check)"
+# The closing line NAMES why it could not answer (#51). Four distinct
+# reasons, each built from this build's own constants and the response's
+# status — never from a byte of the answer.
+lat="https://github.com/snaraj/theme/releases/latest"
+unreachable="latest release: unknown (could not reach github.com within 2s)"
+redirected="latest release: unknown (github.com redirected $lat somewhere unexpected)"
+notransport="latest release: unknown (no trusted system curl)"
+throttled="latest release: unknown (github.com answered HTTP 429 for $lat — rate limited, retry in 5 min)"
 
 # THE SCREENSHOT (#42): a stamp fresh inside the TTL and naming this very
 # build, against a release published since. The cached answer is "latest";
@@ -1777,9 +1852,8 @@ ver_run version
 if closes "$newer"; then
     pass "a fresh stamp cannot stop version seeing a newer release"
 else fail "version answered from the day-old cache (#42): $(cat "$ver_out")"; fi
-if [ "$(verreqs)" = 1 ] \
-   && grep -q 'api\.github\.com/repos/snaraj/theme/releases/latest' "$verlog"; then
-    pass "version asks the releases API exactly once"
+if [ "$(verreqs)" = 1 ] && [ "$(sed -n 1p "$verlog")" = "$lat" ]; then
+    pass "version asks the unmetered web redirect exactly once"
 else fail "version's request accounting is wrong: $(cat "$verlog")"; fi
 if [ "$(vercached)" = v9.9.9 ]; then
     pass "the live answer re-stamps the cache the footer shares"
@@ -1816,40 +1890,48 @@ ver_run version
 if closes "$ahead"; then
     pass "a build ahead of the latest states it and offers no update"
 else fail "a dev build made the wrong claim: $(cat "$ver_out")"; fi
-# The tag is REMOTE data now, on every call: OSC-52 smuggled in as valid
-# JSON escapes (so the parser hands the real ESC/BEL to the shape check)
-# must reach neither the answer, nor the terminal, nor the stamp the footer
-# will read next.
+# The tag is REMOTE data now, on every call: OSC-52 carried raw in the
+# redirect's Location must reach neither the answer, nor the terminal, nor
+# the stamp the footer will read next — and the refusal that names the
+# cause may not quote the answer in order to do it.
 printf 'v%s' "$cur_ver" >"$vercache/update-check"
-ver_tag='v9.9.9\u001b]52;c;steal\u0007'
+ver_tag=$'v9.9.9\033]52;c;steal\007'
 ver_run version
-if closes "$unknown" && ! grep -qF "$(printf '\033]')" "$ver_out" \
+if closes "$redirected" && ! grep -qF "$(printf '\033]')" "$ver_out" \
    && [ "$(vercached)" = "v$cur_ver" ]; then
     pass "a hostile tag reaches neither the answer, the terminal, nor the stamp"
-else fail "hostile API content reached version: $(cat "$ver_out")"; fi
+else fail "hostile redirect content reached version: $(cat "$ver_out")"; fi
+# The named-cause half of #51 as the closing line sees it: a throttled
+# answer says so, and says the wait, instead of shrugging "could not check".
+ver_tag=429
+ver_run version
+if closes "$throttled" && [ "$(verreqs)" = 1 ] \
+   && [ "$(vercached)" = "v$cur_ver" ]; then
+    pass "version names a rate limit rather than shrugging at it"
+else fail "the throttled closing line drifted: $(cat "$ver_out")"; fi
 # #42's other half: a failed ask SAYS it failed rather than guessing, and
 # must never overwrite a good stamp — that silences the footer for a day.
 printf 'v9.9.9' >"$vercache/update-check"
 verstamp=$(cksum <"$vercache/update-check")
 ver_tag=
 ver_run version
-if [ "$ver_rc" = 0 ] && closes "$unknown" && ! grep -qiE 'error|curl' "$ver_out" \
+if [ "$ver_rc" = 0 ] && closes "$unreachable" && ! grep -qiE 'error|curl' "$ver_out" \
    && [ "$(verreqs)" = 1 ]; then
-    pass "an unreachable API says unknown instead of guessing"
+    pass "an unreachable github.com says so, with the budget it waited"
 else fail "the offline answer misbehaved (rc=$ver_rc): $(cat "$ver_out")"; fi
 if [ "$(cksum <"$vercache/update-check")" = "$verstamp" ]; then
     pass "a failed live ask leaves the footer's good stamp byte-identical"
 else fail "a failed ask overwrote the shared stamp: $(vercached)"; fi
 rm -f "$vercache/update-check"
 ver_run version
-if closes "$unknown" && [ ! -e "$vercache/update-check" ]; then
+if closes "$unreachable" && [ ! -e "$vercache/update-check" ]; then
     pass "a failed live ask stamps nothing at all"
 else fail "a failed ask stamped the cache: $(vercached)"; fi
 ver_tag=v9.9.9
 ver_run version THEME_CURL=
-if [ "$ver_rc" = 0 ] && closes "$unknown" && [ "$(verreqs)" = 0 ] \
+if [ "$ver_rc" = 0 ] && closes "$notransport" && [ "$(verreqs)" = 0 ] \
    && [ ! -e "$vercache/update-check" ]; then
-    pass "no trusted transport neither fetches nor stamps, and says unknown"
+    pass "no trusted transport neither fetches nor stamps, and names itself"
 else fail "missing transport misbehaved (rc=$ver_rc): $(cat "$ver_out")"; fi
 ver_run version THEME_NO_UPDATE_CHECK=1
 if three_plain && [ "$(verreqs)" = 0 ] && [ ! -e "$vercache/update-check" ]; then
