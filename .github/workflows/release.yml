@@ -215,30 +215,36 @@ jobs:
       # Resume-safe: a rerun after a failed release step finds its own tag
       # on this commit and goes on — the commits API peels the tag, so a
       # signed annotated tag pushed by hand counts too. A version that has
-      # already shipped from an ANCESTOR of this commit is not an error:
-      # two merges seconds apart race here (slot cannot see a tag the first
-      # run has not created yet), and the loser did not move the version,
-      # so it says so in the summary and ends green. A tag on an unrelated
-      # commit is still refused with the fix named — the tag ruleset would
-      # refuse to move it anyway.
+      # already shipped from this commit's own LINE OF HISTORY — an
+      # ancestor or a descendant — is not an error: two merges seconds apart
+      # race here (slot cannot see a tag the other run has not created yet),
+      # either one can lose, and the loser did not move the version, so it
+      # says so in the summary and ends green. A tag on a diverged commit is
+      # still refused with the fix named — the tag ruleset would refuse to
+      # move it anyway. Only the POST's own "already exists" means the tag
+      # is there; any other failure is reported as itself (run 33901998634:
+      # a transient 403 was read as a ledger conflict).
       - id: tag
         if: github.ref_type != 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "$TAG" | grep -qxE 'v[0-9]+\.[0-9]+\.[0-9]+' || { echo "::error::no crate version reached publish ('$TAG')"; exit 1; }
-          shipped() { # the existing tag sits on this commit or an ancestor of it
-            gh api "repos/$GITHUB_REPOSITORY/compare/$TAG...$GITHUB_SHA" --jq .status 2>/dev/null | grep -qxE 'ahead|identical'
+          shipped() { # the existing tag sits on this commit's line of history
+            gh api "repos/$GITHUB_REPOSITORY/compare/$TAG...$GITHUB_SHA" --jq .status 2>/dev/null | grep -qxE 'ahead|identical|behind'
           }
-          nothing() { echo "$TAG already shipped from $(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq '.sha[0:7]'), an ancestor of this commit: nothing to publish" | tee -a "$GITHUB_STEP_SUMMARY"; echo "go=false" >>"$GITHUB_OUTPUT"; exit 0; }
+          nothing() { echo "$TAG already shipped from $(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq '.sha[0:7]'), on this commit's line of history: nothing to publish" | tee -a "$GITHUB_STEP_SUMMARY"; echo "go=false" >>"$GITHUB_OUTPUT"; exit 0; }
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             shipped && nothing
-            echo "::error::$TAG is already released from a commit that is not an ancestor of this one: bump the version in Cargo.toml and merge"; exit 1
+            echo "::error::$TAG is already released from a diverged commit: bump the version in Cargo.toml and merge"; exit 1
           fi
-          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" ||
-            gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha | grep -qx "$GITHUB_SHA" ||
-            { shipped && nothing; echo "::error::$TAG already exists on another commit: bump the version in Cargo.toml"; exit 1; }
-          echo "go=true" >>"$GITHUB_OUTPUT"
+          if out=$(gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" 2>&1); then
+            echo "go=true" >>"$GITHUB_OUTPUT"; exit 0
+          fi
+          grep -q 'Reference already exists' <<<"$out" || { echo "::error::could not create tag $TAG: $out"; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha | grep -qx "$GITHUB_SHA" && { echo "go=true" >>"$GITHUB_OUTPUT"; exit 0; }
+          shipped && nothing
+          echo "::error::$TAG already exists on a diverged commit: bump the version in Cargo.toml"; exit 1
       - if: github.ref_type == 'tag' || steps.tag.outputs.go == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
