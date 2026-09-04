@@ -9,6 +9,36 @@
 //! unsafe_code is denied by the workspace lints table (`[lints]
 //! workspace = true` in Cargo.toml), not a crate attribute — same as pigment.
 
+// stdout can vanish under a running command — `theme list | head` — and
+// the prelude's print macros answer the EPIPE with a panic (#59). These
+// shims shadow them for every module declared below (macro_rules! scope
+// is textual, and every `mod` line follows): same formatting, same
+// buffering, but a broken stdout ends the process with 141 — the status
+// the shell shows for any tool cut off by its reader, so `theme | head`
+// reads like `ls | head` — after the same scratch sweep every other exit
+// runs; a broken stderr loses the message and changes nothing else, so
+// `die` still exits 1. Any other write error keeps std's own wording.
+// SIGPIPE itself stays ignored on purpose: curl's config, plutil's plist
+// (fed while the wallpaper agent is held under SIGSTOP) and the keychain
+// helper go through a child's stdin, and a child that quits early must
+// stay an error its caller reports — never a silent death that skips the
+// guard which resumes that agent. Under `cargo test` the prelude's macros
+// stay in place, so libtest's output capture keeps working.
+#[cfg(not(test))]
+macro_rules! print {
+    ($($arg:tt)*) => { $crate::ui::out(format_args!($($arg)*), "") };
+}
+#[cfg(not(test))]
+macro_rules! println {
+    () => { $crate::ui::out(format_args!(""), "\n") };
+    ($($arg:tt)*) => { $crate::ui::out(format_args!($($arg)*), "\n") };
+}
+#[cfg(not(test))]
+macro_rules! eprintln {
+    () => { $crate::ui::err(format_args!(""), "\n") };
+    ($($arg:tt)*) => { $crate::ui::err(format_args!($($arg)*), "\n") };
+}
+
 mod apply;
 mod commands;
 mod config;

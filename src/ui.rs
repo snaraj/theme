@@ -23,6 +23,45 @@ pub fn die(msg: &str) -> ! {
     exit(1);
 }
 
+/// The print!/println! shims' writer (declared atop main.rs, #59): one
+/// locked, line-buffered stdout write. A broken pipe — the reader has gone —
+/// ends the process with 141, the shell's own status for a tool cut off by
+/// its reader, after the scratch sweep every normal exit runs; any other
+/// write error panics with std's own message, as before. Like `die`,
+/// `exit` runs no destructors: nothing between `Paused::new` and `finish`
+/// in spaces.rs prints, and nothing may start to — a print there could
+/// leave the wallpaper agent stopped.
+#[cfg(not(test))]
+pub fn out(args: std::fmt::Arguments<'_>, end: &str) {
+    use std::io::Write;
+    let mut o = std::io::stdout().lock();
+    let Err(e) = o.write_fmt(args).and_then(|()| o.write_all(end.as_bytes())) else {
+        return;
+    };
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        drop(o);
+        crate::scratch::cleanup();
+        exit(141);
+    }
+    panic!("failed printing to stdout: {e}");
+}
+
+/// The eprintln! shim's writer: unbuffered stderr, as std's. A
+/// broken pipe loses the message and nothing else — the caller keeps its
+/// own exit status, so `die` under `2>&1 | head` still exits 1; any other
+/// write error panics with std's own message.
+#[cfg(not(test))]
+pub fn err(args: std::fmt::Arguments<'_>, end: &str) {
+    use std::io::Write;
+    let mut o = std::io::stderr().lock();
+    let Err(e) = o.write_fmt(args).and_then(|()| o.write_all(end.as_bytes())) else {
+        return;
+    };
+    if e.kind() != std::io::ErrorKind::BrokenPipe {
+        panic!("failed printing to stderr: {e}");
+    }
+}
+
 /// Print `theme: <msg>` to stdout, sanitized.
 pub fn note(msg: &str) {
     println!("theme: {}", display_text(msg));
