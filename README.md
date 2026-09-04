@@ -11,11 +11,31 @@ the background image as the driver.
 
 ## Install
 
-Prebuilt binaries for macOS and Linux ship on the
-[releases page](https://github.com/snaraj/theme/releases), each release with
-a `SHA256SUMS` to verify against.
+Every release ships prebuilt binaries for macOS and Linux (arm64 and x86_64)
+with a `SHA256SUMS` to verify against — everything below resolves to those
+same four tarballs. The Linux builds need glibc 2.34 or newer, and are
+verified on Ubuntu 22.04 and 24.04, Debian 12, Fedora 44 and Arch.
 
-**macOS**
+**Homebrew** — macOS and Linux. Homebrew 6 requires a third-party tap to be
+trusted; the middle line grants that to this one formula and nothing else:
+
+```sh
+brew tap snaraj/theme https://github.com/snaraj/theme
+brew trust --formula snaraj/theme/theme
+brew install snaraj/theme/theme
+```
+
+The formula is bumped by a pull request after each release, so `brew` can
+be one release behind until that merges; the tarballs below never are.
+
+**Debian, Ubuntu, Fedora, RHEL** — take the `.deb` or `.rpm` for your
+architecture from the
+[releases page](https://github.com/snaraj/theme/releases), then
+`sudo apt install ./theme_*.deb` or `sudo dnf install ./theme-*.rpm`. Each
+declares that glibc floor, so a distro below it refuses the install rather
+than leaving you a command that cannot run.
+
+**Anywhere else** — the tarball, one file, no installer:
 
 ```sh
 curl -fsSLO https://github.com/snaraj/theme/releases/latest/download/theme-aarch64-apple-darwin.tar.gz
@@ -23,18 +43,14 @@ tar -xzf theme-aarch64-apple-darwin.tar.gz
 mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 ```
 
-**Linux**
-
-```sh
-curl -fsSLO https://github.com/snaraj/theme/releases/latest/download/theme-x86_64-unknown-linux-gnu.tar.gz
-tar -xzf theme-x86_64-unknown-linux-gnu.tar.gz
-mkdir -p ~/.local/bin && mv theme ~/.local/bin/
-```
-
-- Intel Mac: `theme-x86_64-apple-darwin.tar.gz` · ARM Linux:
-  `theme-aarch64-unknown-linux-gnu.tar.gz`
+- Other targets: `theme-x86_64-apple-darwin.tar.gz`,
+  `theme-x86_64-unknown-linux-gnu.tar.gz`,
+  `theme-aarch64-unknown-linux-gnu.tar.gz`.
 - `~/.local/bin` must be on your `PATH`.
-- Or build from source: `cargo build --release`.
+- From source:
+  `cargo install --git https://github.com/snaraj/theme --locked`.
+- No Snap or Flatpak build: their sandboxes cut off the kitty socket, the
+  wallpaper store and `/dev/tty`, which is the entire job. No Windows build.
 
 ### Compatibility
 
@@ -44,13 +60,15 @@ mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 | Ubuntu 24.04 | 2.39 | yes | yes |
 | Fedora 44 | 2.43 | yes | yes |
 | Arch | 2.44 | yes | yes |
-| Debian 12 | 2.36 | no | yes |
-| Ubuntu 22.04 | 2.35 | no | yes |
+| Debian 12 | 2.36 | yes | yes |
+| Ubuntu 22.04 | 2.35 | yes | yes |
 | Alpine 3 (musl) | — | no | yes |
 
 The prebuilt Linux binaries inherit the glibc floor of the runner that
-builds them — 2.39 today — so a distribution below that line builds from
-source, as musl systems do. Every Linux row was checked on 2026-09-03 in a
+builds them, which is why they are built on the oldest image GitHub still
+offers: the floor is 2.34, below every glibc row above, so only musl
+systems build from source. (v0.2.2 was built before that and still wants
+2.39.) Every Linux row was checked on 2026-09-03 in a
 container on x86_64 and arm64 (Arch on x86_64, the only architecture it
 publishes an image for): the release tarball for the prebuilt column, a
 source build and the whole `tests/boundary.sh` fixture for the other.
