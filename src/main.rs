@@ -185,8 +185,19 @@ fn main() {
             }
             commands::cmd_rm(&cfg, &args[1..]);
         }
-        "version" | "--version" | "-V" => update::cmd_version(&cfg),
-        "help" | "-h" | "--help" => help::usage(&cfg),
+        // The WORD is the question and asks GitHub; the FLAGS are the
+        // banner scripts call and must never touch the network.
+        "version" => update::cmd_version(&cfg),
+        "--version" | "-V" => update::cmd_version_plain(),
+        // `theme help <command>` asks the same question as `theme <command>
+        // --help` and gets the same answer — the whole bare screen was
+        // never it. A bare `theme help` (and an unknown name) still routes
+        // to the full usage through `usage_cmd`'s own arms.
+        "help" | "-h" | "--help" => {
+            let code = help::usage_cmd(&cfg, args.get(1).map(String::as_str).unwrap_or(""));
+            scratch::cleanup();
+            std::process::exit(code);
+        }
         other => die(&format!(
             "unknown command '{other}' — run 'theme help' for the list"
         )),
