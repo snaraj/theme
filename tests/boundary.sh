@@ -1538,19 +1538,27 @@ else fail "the fresh-cache render needed a transport: $(tail -3 "$note_out")"; f
 # may never outrun the evidence, and (#42) may never come from a day-old
 # stamp: the owner's v0.3.0 binary said "you're on the latest" one minute
 # after v0.3.1 published, because `theme update` had stamped the shared
-# cache an hour earlier. Every call asks now; the cache is only WRITTEN
-# here. Its own cache dir, stub and request log leave the footer's
-# accounting above exactly as pinned.
+# cache an hour earlier. Every call of the WORD asks now, and the cache is
+# only WRITTEN here; the three plain lines are flushed BEFORE the request,
+# so the facts never wait on GitHub, and one closing line follows. The
+# FLAG forms (-V, --version) are the banner scripts call and ask nothing at
+# all. Its own cache dir, stub, request log and ordering witness leave the
+# footer's accounting above exactly as pinned.
 vercache="$fixture/vercache"
 verbin="$fixture/verbin"
 verctl="$fixture/verctl"
 verlog="$fixture/ver.log"
+verwit="$fixture/ver.witness"
+ver_out="$updd/ver.out"
 mkdir -p "$vercache" "$verbin"
 : >"$verlog"
+: >"$verwit"
 # The stub learns its tag from the ctl FILE, never from env — the transport
 # child is env-cleared (round 9) — and logs every URL it is asked for, so
-# "no request" means curl was never spawned at one. An empty tag plays an
-# unreachable API (exit 6, the failing-transport pattern the footer uses).
+# "no request" means curl was never spawned at one. It also copies stdout
+# AS IT STANDS at request time into the witness, which is how the streaming
+# order is proved. An empty tag plays an unreachable API (exit 6, the
+# failing-transport pattern the footer uses).
 cat >"$verbin/curl" <<EOS
 #!/bin/sh
 PATH=/usr/bin:/bin
@@ -1564,17 +1572,18 @@ while [ \$# -gt 0 ]; do
     shift
 done
 printf '%s\n' "\$url" >>"$verlog"
+cat "$ver_out" >"$verwit"
 [ -n "\$VER_TAG" ] || exit 6
 printf '{"tag_name":"%s"}' "\$VER_TAG"
 EOS
 chmod +x "$verbin/curl"
-ver_out="$updd/ver.out"
 ver_tag=""
 ver_run() { # $1 the verb (version|--version|-V); env-pair overrides follow.
     local verb="$1"
     shift
     printf "VER_TAG='%s'\n" "$ver_tag" >"$verctl"
     : >"$verlog"
+    : >"$verwit"
     env THEME_NO_UPDATE_CHECK= \
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$vercache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" KITTY_WINDOW_ID='' \
@@ -1592,6 +1601,15 @@ three_plain() { # today's three lines, and nothing else
     [ "$(verline 1)" = "version: v$cur_ver" ] && [ "$(verline 2)" = "$plain2" ] \
         && [ "$(verline 3)" = "$plain3" ] && [ "$(vercount)" = 3 ]
 }
+closes() { # the same three lines, then $1 as the fourth, and nothing after
+    [ "$(verline 1)" = "version: v$cur_ver" ] && [ "$(verline 2)" = "$plain2" ] \
+        && [ "$(verline 3)" = "$plain3" ] && [ "$(verline 4)" = "$1" ] \
+        && [ "$(vercount)" = 4 ]
+}
+newer="latest release: v9.9.9 — update with 'theme update'"
+equal="you're on the latest release."
+ahead="latest release: v0.0.0"
+unknown="latest release: unknown (could not reach github.com)"
 
 # THE SCREENSHOT (#42): a stamp fresh inside the TTL and naming this very
 # build, against a release published since. The cached answer is "latest";
@@ -1599,11 +1617,7 @@ three_plain() { # today's three lines, and nothing else
 printf 'v%s' "$cur_ver" >"$vercache/update-check"
 ver_tag=v9.9.9
 ver_run version
-if [ "$(verline 1)" = "update to the latest version by running 'theme update'" ] \
-   && [ "$(verline 2)" = "current version: v$cur_ver" ] \
-   && [ "$(verline 3)" = "latest version: v9.9.9" ] \
-   && [ "$(verline 4)" = "$plain2" ] && [ "$(verline 5)" = "$plain3" ] \
-   && [ "$(vercount)" = 5 ]; then
+if closes "$newer"; then
     pass "a fresh stamp cannot stop version seeing a newer release"
 else fail "version answered from the day-old cache (#42): $(cat "$ver_out")"; fi
 if [ "$(verreqs)" = 1 ] \
@@ -1613,27 +1627,38 @@ else fail "version's request accounting is wrong: $(cat "$verlog")"; fi
 if [ "$(vercached)" = v9.9.9 ]; then
     pass "the live answer re-stamps the cache the footer shares"
 else fail "version did not refresh the shared stamp: $(vercached)"; fi
-ver_canon=$(cat "$ver_out")
-ver_run --version
-ver_alias=$(cat "$ver_out")
-ver_run -V
-if [ "$ver_alias" = "$ver_canon" ] && [ "$(cat "$ver_out")" = "$ver_canon" ]; then
-    pass "--version and -V stay byte-identical aliases of version"
-else fail "an alias diverged from version: $(cat "$ver_out")"; fi
+# ORDER: the stub copied stdout as it stood when the request reached it.
+# The three lines must ALREADY be there — the facts never wait on GitHub.
+if [ "$(wc -l <"$verwit" | tr -d ' ')" = 3 ] \
+   && [ "$(sed -n 1p "$verwit")" = "version: v$cur_ver" ]; then
+    pass "the three plain lines are flushed BEFORE the request is made"
+else fail "version withheld its output until the answer: $(cat "$verwit")"; fi
+# The FLAG forms are what scripts and other tools call: they print the
+# build and stop — no request, no witness, no stamp — and byte-for-byte
+# what the question opens with, so the two forms agree on what they share.
+ver_three=$(sed -n 1,3p "$ver_out")
+printf 'v0.0.0' >"$vercache/update-check" # a STALE value they must not touch
+verstamp=$(cksum <"$vercache/update-check")
+for f in --version -V; do
+    ver_run "$f"
+    if three_plain && [ "$(cat "$ver_out")" = "$ver_three" ] \
+       && [ "$(verreqs)" = 0 ] && [ ! -s "$verwit" ] \
+       && [ "$(cksum <"$vercache/update-check")" = "$verstamp" ]; then
+        pass "theme $f prints the build alone: no request, no stamp"
+    else fail "theme $f did more than print the build: $(cat "$ver_out")"; fi
+done
 # The other direction: a stale stamp claiming a release that is not there.
 printf 'v9.9.9' >"$vercache/update-check"
 ver_tag="v$cur_ver"
 ver_run version
-if [ "$(verline 1)" = "you're currently on the latest version." ] \
-   && [ "$(verline 2)" = "version: v$cur_ver" ] && [ "$(verline 3)" = "$plain2" ] \
-   && [ "$(verline 4)" = "$plain3" ] && [ "$(vercount)" = 4 ] \
-   && [ "$(vercached)" = "v$cur_ver" ]; then
+if closes "$equal" && [ "$(vercached)" = "v$cur_ver" ]; then
     pass "a live same-version answer says so and corrects the stamp"
 else fail "the up-to-date answer drifted: $(cat "$ver_out")"; fi
 ver_tag=v0.0.0
 ver_run version
-if three_plain; then pass "a build newer than the latest claims nothing extra"
-else fail "a dev build made a claim: $(cat "$ver_out")"; fi
+if closes "$ahead"; then
+    pass "a build ahead of the latest states it and offers no update"
+else fail "a dev build made the wrong claim: $(cat "$ver_out")"; fi
 # The tag is REMOTE data now, on every call: OSC-52 smuggled in as valid
 # JSON escapes (so the parser hands the real ESC/BEL to the shape check)
 # must reach neither the answer, nor the terminal, nor the stamp the footer
@@ -1641,33 +1666,33 @@ else fail "a dev build made a claim: $(cat "$ver_out")"; fi
 printf 'v%s' "$cur_ver" >"$vercache/update-check"
 ver_tag='v9.9.9\u001b]52;c;steal\u0007'
 ver_run version
-if three_plain && ! grep -qF "$(printf '\033]')" "$ver_out" \
+if closes "$unknown" && ! grep -qF "$(printf '\033]')" "$ver_out" \
    && [ "$(vercached)" = "v$cur_ver" ]; then
     pass "a hostile tag reaches neither the answer, the terminal, nor the stamp"
 else fail "hostile API content reached version: $(cat "$ver_out")"; fi
-# #42's other half: a failed ask claims nothing EITHER WAY, and must never
-# overwrite a good stamp — that would silence the footer for a whole day.
+# #42's other half: a failed ask SAYS it failed rather than guessing, and
+# must never overwrite a good stamp — that silences the footer for a day.
 printf 'v9.9.9' >"$vercache/update-check"
 verstamp=$(cksum <"$vercache/update-check")
 ver_tag=
 ver_run version
-if [ "$ver_rc" = 0 ] && three_plain && ! grep -qiE 'error|curl' "$ver_out" \
+if [ "$ver_rc" = 0 ] && closes "$unknown" && ! grep -qiE 'error|curl' "$ver_out" \
    && [ "$(verreqs)" = 1 ]; then
-    pass "an unreachable API prints three lines and claims nothing"
+    pass "an unreachable API says unknown instead of guessing"
 else fail "the offline answer misbehaved (rc=$ver_rc): $(cat "$ver_out")"; fi
 if [ "$(cksum <"$vercache/update-check")" = "$verstamp" ]; then
     pass "a failed live ask leaves the footer's good stamp byte-identical"
 else fail "a failed ask overwrote the shared stamp: $(vercached)"; fi
 rm -f "$vercache/update-check"
 ver_run version
-if three_plain && [ ! -e "$vercache/update-check" ]; then
+if closes "$unknown" && [ ! -e "$vercache/update-check" ]; then
     pass "a failed live ask stamps nothing at all"
 else fail "a failed ask stamped the cache: $(vercached)"; fi
 ver_tag=v9.9.9
 ver_run version THEME_CURL=
-if [ "$ver_rc" = 0 ] && three_plain && [ "$(verreqs)" = 0 ] \
+if [ "$ver_rc" = 0 ] && closes "$unknown" && [ "$(verreqs)" = 0 ] \
    && [ ! -e "$vercache/update-check" ]; then
-    pass "no trusted transport neither fetches, stamps, nor claims"
+    pass "no trusted transport neither fetches nor stamps, and says unknown"
 else fail "missing transport misbehaved (rc=$ver_rc): $(cat "$ver_out")"; fi
 ver_run version THEME_NO_UPDATE_CHECK=1
 if three_plain && [ "$(verreqs)" = 0 ] && [ ! -e "$vercache/update-check" ]; then

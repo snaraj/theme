@@ -484,13 +484,13 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
 "
         ),
         "version" | "--version" | "-V" => print!(
-            "theme version        (aliases: theme --version, theme -V)
+            "theme version        (also: theme --version, theme -V)
 
-  Print this build's version, the repository and the maintainer — and
-  whether it is the latest release. That answer is asked LIVE on every
-  call (one bounded 5s lookup; THEME_NO_UPDATE_CHECK=1 disables it),
-  never read from the bare screen's day-old cache. When the latest
-  cannot be reached the three plain lines print alone, never a guess.
+  Print this build's version, the repository and the maintainer. The
+  two flag forms print those three lines alone — no network, ever.
+  `theme version` prints them first, then asks GitHub for the latest
+  release (one bounded 2s lookup; THEME_NO_UPDATE_CHECK=1 disables it)
+  and closes with one line saying it, or that it could not be reached.
 
   Example:
     theme version

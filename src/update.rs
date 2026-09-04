@@ -295,7 +295,8 @@ pub fn cmd_update(cfg: &Config, want: &str) {
 
 /// One release-API request: hardened flags, bounded size, parsed JSON.
 /// `max_time` is the caller's latency budget — 30s for the explicit
-/// `theme update`, 2s for the silent footer-note refresh.
+/// `theme update`, 2s for either update check (the footer's silent refresh
+/// and `theme version`'s live ask both wait behind a person).
 ///
 /// The transport is the TRUSTED curl only — resolved and re-validated per
 /// call, never PATH (round 8: one planted curl would control metadata,
@@ -332,6 +333,15 @@ fn fetch_release(url: &str, max_time: &str) -> Option<Json> {
     String::from_utf8(body).ok().and_then(|s| Json::parse(&s))
 }
 
+/// The kill switch, read in one place: THEME_NO_UPDATE_CHECK non-empty
+/// disables every update check — the footer's, and `theme version`'s
+/// closing line with it.
+fn check_off() -> bool {
+    std::env::var("THEME_NO_UPDATE_CHECK")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
 /// The CACHED answer, the footer note's contract: one small cache file is
 /// read, and at most one bounded refresh (2s hard cap) runs per
 /// [`CHECK_TTL`] window — stamped even on failure, so an offline machine
@@ -349,17 +359,14 @@ pub fn latest_tag(cfg: &Config) -> Option<(u64, u64, u64)> {
 ///
 /// `live` is the deliberate question's mode (`theme version`, issue #42):
 /// the cache's freshness is never consulted, the trusted transport is
-/// required, and one bounded request runs on EVERY call — 5s, because a
-/// typed command may wait a moment where the bare screen may not.
+/// required, and one bounded request runs on EVERY call — under the same
+/// 2s cap the footer has always lived on, because the caller is waiting.
 /// A usable tag stamps the shared cache so the footer benefits from the
 /// ask; a failed one stamps NOTHING — overwriting a good stamp with a
 /// failure would silence the footer for a whole TTL window — and returns
 /// None, so the caller makes no claim it cannot back.
 fn latest_tag_with(cfg: &Config, live: bool) -> Option<(u64, u64, u64)> {
-    let off = std::env::var("THEME_NO_UPDATE_CHECK")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    if off {
+    if check_off() {
         return None;
     }
     // Custody first: a cache dir that fails the fail-closed audit gets no
@@ -367,7 +374,7 @@ fn latest_tag_with(cfg: &Config, live: bool) -> Option<(u64, u64, u64)> {
     let dirfd = check_dir(cfg)?;
     if live {
         crate::net::trusted_curl()?;
-        let tag = fetch_release(&format!("{RELEASES_API}/latest"), "5").and_then(|j| {
+        let tag = fetch_release(&format!("{RELEASES_API}/latest"), "2").and_then(|j| {
             j.str_field("tag_name")
                 .filter(|t| tag_shape_ok(t))
                 .map(str::to_string)
@@ -421,29 +428,50 @@ pub fn maybe_note(cfg: &Config) {
     }
 }
 
+/// The three plain lines — this build, the repository, the maintainer.
+/// Compile-time constants only: no cache read, no custody walk, no
+/// network, so printing them costs a process start and nothing more.
+fn print_facts() {
+    println!(
+        "version: v{}\ngithub: https://github.com/snaraj/theme\nmaintainer: Samuel Naranjo",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// `theme -V` / `theme --version` — the build alone. This is the form
+/// scripts and other tools call, so it asks NOTHING and can never wait on
+/// a network round trip: a version banner that blocks is one that hangs
+/// somebody's pipeline. `theme version`, the word, is the question.
+pub fn cmd_version_plain() {
+    print_facts();
+}
+
 /// `theme version` — the release ledger's other question, which is why it
-/// lives beside `update`: the owner wants it to answer "am I current?", and
-/// a deliberate question gets a LIVE answer (issue #42 — a day-old stamp
-/// once said "latest" a minute after the next release). The shared cache is
-/// only WRITTEN here, never trusted: an unreachable API prints the plain
-/// three lines rather than repeating what the footer last heard. When the
-/// latest cannot be known, or this build runs ahead of it, the plain three
-/// lines print alone — a claim nothing can back is never made. The latest
-/// is reconstructed from its parsed triple, never echoed from the answer.
+/// lives beside `update`: the owner wants it to answer "am I current?",
+/// and a deliberate question gets a LIVE answer (issue #42 — a day-old
+/// stamp once said "latest" a minute after the next release). The shared
+/// cache is only WRITTEN here, never trusted.
+///
+/// It STREAMS: the three lines `-V` would print land and flush FIRST, so
+/// the facts never wait on the network, and exactly one closing line
+/// follows when the ask resolves — including when it fails, which says so
+/// rather than leaving the reader to guess. The kill switch removes that
+/// line entirely. The latest is reconstructed from its parsed triple,
+/// never echoed from the answer.
 pub fn cmd_version(cfg: &Config) {
-    const FACTS: &str = "github: https://github.com/snaraj/theme\nmaintainer: Samuel Naranjo";
-    let cur = env!("CARGO_PKG_VERSION");
-    match current_v3().zip(latest_tag_with(cfg, true)) {
-        Some((c, l)) if l > c => {
-            println!("update to the latest version by running 'theme update'");
-            println!("current version: v{}.{}.{}", c.0, c.1, c.2);
-            println!("latest version: v{}.{}.{}", l.0, l.1, l.2);
-            println!("{FACTS}");
-        }
-        Some((c, l)) if l == c => {
-            println!("you're currently on the latest version.\nversion: v{cur}\n{FACTS}")
-        }
-        _ => println!("version: v{cur}\n{FACTS}"),
+    print_facts();
+    let _ = std::io::stdout().flush();
+    if check_off() {
+        return;
+    }
+    match (current_v3(), latest_tag_with(cfg, true)) {
+        (_, None) => println!("latest release: unknown (could not reach github.com)"),
+        (Some(c), Some(l)) if l > c => println!(
+            "latest release: v{}.{}.{} — update with 'theme update'",
+            l.0, l.1, l.2
+        ),
+        (Some(c), Some(l)) if l == c => println!("you're on the latest release."),
+        (_, Some(l)) => println!("latest release: v{}.{}.{}", l.0, l.1, l.2),
     }
 }
 

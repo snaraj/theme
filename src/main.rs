@@ -185,7 +185,10 @@ fn main() {
             }
             commands::cmd_rm(&cfg, &args[1..]);
         }
-        "version" | "--version" | "-V" => update::cmd_version(&cfg),
+        // The WORD is the question and asks GitHub; the FLAGS are the
+        // banner scripts call and must never touch the network.
+        "version" => update::cmd_version(&cfg),
+        "--version" | "-V" => update::cmd_version_plain(),
         // `theme help <command>` asks the same question as `theme <command>
         // --help` and gets the same answer — the whole bare screen was
         // never it. A bare `theme help` (and an unknown name) still routes

@@ -122,11 +122,11 @@ create later inherit it too. Your screensaver choices are left alone.
   once every 24 hours (2-second cap, silent on failure, nothing sent but
   the request itself), cached under `THEME_CACHE_DIR`; the explicit
   `theme update` installs it and is never disabled by this. `theme version`
-  asks live on every call (5-second cap) and prints only the plain version
-  lines when it cannot. The cache is only used while every directory on its
-  path is owned by you and free of write-granting ACLs — a cache you have
-  deliberately ACL'd open is out of contract and the check silently stands
-  down.
+  asks live on every call (2-second cap) and says when it cannot reach
+  GitHub; `-V` and `--version` print the build alone. The cache is only used
+  while every directory on its path is owned by you and free of
+  write-granting ACLs — a cache you have deliberately ACL'd open is out of
+  contract and the check silently stands down.
 - `UNSPLASH_ACCESS_KEY` / `UNSPLASH_SECRET_KEY` / `UNSPLASH_USER_TOKEN` —
   Unsplash credentials (the macOS Keychain is consulted when unset; no
   credential ever appears on an argv).
