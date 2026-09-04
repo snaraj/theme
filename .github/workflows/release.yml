@@ -2,25 +2,70 @@ name: release
 
 # Standalone release chain: a release is an immutable v*.*.* tag on main,
 # published with binaries for every supported target, distro packages and
-# checksums. No coupling to anything outside this repository. Three ways
-# in: pushing the tag; dispatching this workflow on main, which publishes
-# the version Cargo.toml states and creates that tag; dispatching it on any
-# other ref, the pre-tag proof — the full matrix builds and installs, and
-# nothing is published.
+# checksums. No coupling to anything outside this repository. The version in
+# Cargo.toml is the release claim: a push to main publishes it and creates
+# its tag, a dispatch on main or a pushed tag does the same by hand, and a
+# dispatch on any other ref is the pre-tag proof — the full matrix builds
+# and installs, and nothing is published.
 
 on:
   push:
+    branches: [main]
     tags: ["v*.*.*"]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# One group per COMMIT, not per ref: GitHub keeps a single pending run per
+# group, so grouping main pushes by ref would let a third version-moving
+# merge cancel the second's pending run and drop that version from the
+# ledger. A dispatch or a tag on the same commit still queues behind it.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.sha }}
 
 jobs:
+  # One version, one decision, one summary line, before any runner minute
+  # goes to the matrix: the version in Cargo.toml is the release claim, so a
+  # merge that moves it publishes, and a merge that does not costs this job
+  # alone.
+  slot:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.slot.outputs.version }}
+      publish: ${{ steps.slot.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: slot
+        run: |
+          VER=$(cargo pkgid --offline | sed 's/.*[#@]//')
+          echo "$VER" | grep -qxE '[0-9]+\.[0-9]+\.[0-9]+' || { echo "::error::cannot read the crate version off Cargo.toml (got '$VER')"; exit 1; }
+          case "$GITHUB_REF_TYPE:$GITHUB_REF" in
+            tag:*)
+              [ "v$VER" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml says $VER"; exit 1; }
+              publish=true; why="releasing v$VER from tag $GITHUB_REF_NAME" ;;
+            branch:refs/heads/main)
+              # Only an ANSWER decides: ls-remote exits 0 (tag exists), 2 (no
+              # such tag), anything else (could not ask) — and a failed ask
+              # must never read as permission to publish.
+              git ls-remote --exit-code origin "refs/tags/v$VER" >/dev/null && rc=0 || rc=$?
+              case "$rc" in
+                0) publish=false; why="v$VER is already released: nothing to publish (bump the version in Cargo.toml to release again)" ;;
+                2) publish=true; why="releasing v$VER from main at ${GITHUB_SHA:0:7}" ;;
+                *) echo "::error::could not ask origin whether tag v$VER exists (git ls-remote exit $rc)"; exit 1 ;;
+              esac ;;
+            *)
+              publish=false; why="dry run on $GITHUB_REF_NAME: v$VER is built and installed, nothing is published (a release is a merge to main that moves Cargo.toml, a dispatch on main, or a push of tag v$VER)" ;;
+          esac
+          echo "version=$VER" >>"$GITHUB_OUTPUT"
+          echo "publish=$publish" >>"$GITHUB_OUTPUT"
+          echo "$why" | tee -a "$GITHUB_STEP_SUMMARY"
+
   build:
+    needs: slot
+    # A dispatch off main is still the pre-tag proof; a push or a dispatch
+    # on main with nothing left to publish stops at slot.
+    if: needs.slot.outputs.publish == 'true' || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main')
     strategy:
       matrix:
         include:
@@ -42,32 +87,8 @@ jobs:
             deb: arm64
             rpm: aarch64
     runs-on: ${{ matrix.runner }}
-    outputs:
-      version: ${{ steps.ver.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # One version, read off the manifest, for the packages, the smoke
-      # assertions and the tag alike — never a placeholder. A read that
-      # fails is named here, not two steps later (the pipe would hide its
-      # status), and a tag that disagrees with the crate is refused before
-      # anything builds under it.
-      - id: ver
-        run: |
-          VER=$(cargo pkgid --offline | sed 's/.*[#@]//')
-          echo "$VER" | grep -qxE '[0-9]+\.[0-9]+\.[0-9]+' || { echo "::error::cannot read the crate version off Cargo.toml (got '$VER')"; exit 1; }
-          [ "$GITHUB_REF_TYPE" != tag ] || [ "v$VER" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml says $VER"; exit 1; }
-          echo "version=$VER" >>"$GITHUB_OUTPUT"
-      # The run states what it is doing, once, in its summary: a skipped
-      # publish job used to be the only sign that a dry run had published
-      # nothing. Keep the two cases in step with publish's `if`.
-      - if: strategy.job-index == 0
-        env:
-          VER: ${{ steps.ver.outputs.version }}
-        run: >
-          case "$GITHUB_REF_TYPE:$GITHUB_REF" in
-          tag:*|branch:refs/heads/main) echo "releasing v$VER from $GITHUB_REF_NAME" ;;
-          *) echo "dry run on $GITHUB_REF_NAME: v$VER is built and installed, nothing is published (a release is a dispatch on main, or a push of tag v$VER)" ;;
-          esac | tee -a "$GITHUB_STEP_SUMMARY"
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - run: tar -C target/${{ matrix.target }}/release -czf theme-${{ matrix.target }}.tar.gz theme
@@ -80,7 +101,7 @@ jobs:
           BIN: target/${{ matrix.target }}/release/theme
           DEB: ${{ matrix.deb }}
           RPM: ${{ matrix.rpm }}
-          VER: ${{ steps.ver.outputs.version }}
+          VER: ${{ needs.slot.outputs.version }}
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq rpm binutils
           # The glibc floor read OFF THE BINARY, never hardcoded: apt has to
@@ -132,7 +153,7 @@ jobs:
   # in the release path, so each is pinned by manifest-list digest with the
   # tag it was resolved from beside it.
   smoke:
-    needs: build
+    needs: [slot, build]
     permissions:
       contents: read
     strategy:
@@ -148,7 +169,7 @@ jobs:
         with:
           name: theme-${{ matrix.target }}
       - env:
-          VER: ${{ needs.build.outputs.version }}
+          VER: ${{ needs.slot.outputs.version }}
         run: |
           # The package manager is asked what version it installed and the
           # binary what version it is; both must be the crate's.
@@ -171,18 +192,18 @@ jobs:
           box ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc sh -c "$deb" # ubuntu:22.04
           box fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80 sh -c "$rpm" # fedora:latest
 
-  # A tag push publishes that tag. A dispatch ON MAIN publishes the crate
-  # version and creates its tag first — the same immutable ledger, one
-  # click instead of a local tag push. Any other ref stays the pre-tag
-  # proof, and the build summary says so.
+  # Three ways into the same immutable ledger: a merge to main that moves
+  # the version in Cargo.toml, a dispatch ON MAIN, and a pushed tag. The
+  # first two create the tag here first. Any other ref stays the pre-tag
+  # proof, and slot's summary says so.
   publish:
-    if: github.ref_type == 'tag' || github.ref == 'refs/heads/main'
-    needs: [build, smoke]
+    if: needs.slot.outputs.publish == 'true'
+    needs: [slot, build, smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      TAG: v${{ needs.build.outputs.version }}
+      TAG: v${{ needs.slot.outputs.version }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -193,17 +214,17 @@ jobs:
       - run: sha256sum theme-*.tar.gz theme_*.deb theme-*.rpm > SHA256SUMS
       # Resume-safe: a rerun after a failed release step finds its own tag
       # on this commit and goes on — the commits API peels the tag, so a
-      # signed annotated tag pushed by hand counts too. A dispatch after
-      # the version has shipped, or one whose tag sits on another commit,
-      # is refused with the fix named — the tag ruleset would refuse to
-      # move it anyway.
+      # signed annotated tag pushed by hand counts too. A run whose version
+      # has already shipped, or whose tag sits on another commit, is refused
+      # here with the fix named: the backstop under slot's decision, and the
+      # tag ruleset would refuse to move it anyway.
       - if: github.ref_type != 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "$TAG" | grep -qxE 'v[0-9]+\.[0-9]+\.[0-9]+' || { echo "::error::no crate version reached publish ('$TAG')"; exit 1; }
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::$TAG is already released: bump the version in Cargo.toml, merge, dispatch again"; exit 1
+            echo "::error::$TAG is already released: bump the version in Cargo.toml and merge"; exit 1
           fi
           gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" ||
             gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha | grep -qx "$GITHUB_SHA" ||

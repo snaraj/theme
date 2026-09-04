@@ -59,9 +59,9 @@ money, never trade away security.
   update, no delete, no force-push). One release slot, anchored by the tag
   ledger itself: a Draft claims the next unpublished `vX.Y.Z`; parallel
   Drafts each claim base+1, and declared merge order resolves who re-cuts.
-- The owner cuts a release by dispatching `release` on main: it publishes
-  the version `Cargo.toml` states and creates that tag. Pushing the tag by
-  hand does the same. A dispatch on any other ref is a dry run.
+- A merge to main that moves the version in `Cargo.toml` publishes that
+  version; a dispatch on main or a pushed tag does the same by hand; a
+  dispatch on any other ref is a dry run.
 
 ## Code rules
 
