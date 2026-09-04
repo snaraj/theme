@@ -17,11 +17,21 @@ pub fn display_text(s: &str) -> String {
 /// Print `theme: <msg>` to stderr and exit 1. The message passes through
 /// [`display_text`] like every other sink, and registered scratch files are
 /// swept first — `exit` runs no destructors.
+pub fn die(msg: &str) -> ! {
+    crate::scratch::cleanup();
+    eprintln!("theme: {}", display_text(msg));
+    exit(1);
+}
+
 /// The print!/println! shims' writer (declared atop main.rs, #59): one
 /// locked, line-buffered stdout write. A broken pipe — the reader has gone —
 /// ends the process with 141, the shell's own status for a tool cut off by
 /// its reader, after the scratch sweep every normal exit runs; any other
-/// write error panics with std's own message, as before.
+/// write error panics with std's own message, as before. Like `die`,
+/// `exit` runs no destructors: nothing between `Paused::new` and `finish`
+/// in spaces.rs prints, and nothing may start to — a print there could
+/// leave the wallpaper agent stopped.
+#[cfg(not(test))]
 pub fn out(args: std::fmt::Arguments<'_>, end: &str) {
     use std::io::Write;
     let mut o = std::io::stdout().lock();
@@ -36,10 +46,11 @@ pub fn out(args: std::fmt::Arguments<'_>, end: &str) {
     panic!("failed printing to stdout: {e}");
 }
 
-/// The eprint!/eprintln! shims' writer: unbuffered stderr, as std's. A
+/// The eprintln! shim's writer: unbuffered stderr, as std's. A
 /// broken pipe loses the message and nothing else — the caller keeps its
 /// own exit status, so `die` under `2>&1 | head` still exits 1; any other
 /// write error panics with std's own message.
+#[cfg(not(test))]
 pub fn err(args: std::fmt::Arguments<'_>, end: &str) {
     use std::io::Write;
     let mut o = std::io::stderr().lock();
@@ -49,12 +60,6 @@ pub fn err(args: std::fmt::Arguments<'_>, end: &str) {
     if e.kind() != std::io::ErrorKind::BrokenPipe {
         panic!("failed printing to stderr: {e}");
     }
-}
-
-pub fn die(msg: &str) -> ! {
-    crate::scratch::cleanup();
-    eprintln!("theme: {}", display_text(msg));
-    exit(1);
 }
 
 /// Print `theme: <msg>` to stdout, sanitized.

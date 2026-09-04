@@ -22,14 +22,18 @@
 // (fed while the wallpaper agent is held under SIGSTOP) and the keychain
 // helper go through a child's stdin, and a child that quits early must
 // stay an error its caller reports — never a silent death that skips the
-// guard which resumes that agent.
+// guard which resumes that agent. Under `cargo test` the prelude's macros
+// stay in place, so libtest's output capture keeps working.
+#[cfg(not(test))]
 macro_rules! print {
     ($($arg:tt)*) => { $crate::ui::out(format_args!($($arg)*), "") };
 }
+#[cfg(not(test))]
 macro_rules! println {
     () => { $crate::ui::out(format_args!(""), "\n") };
     ($($arg:tt)*) => { $crate::ui::out(format_args!($($arg)*), "\n") };
 }
+#[cfg(not(test))]
 macro_rules! eprintln {
     () => { $crate::ui::err(format_args!(""), "\n") };
     ($($arg:tt)*) => { $crate::ui::err(format_args!($($arg)*), "\n") };

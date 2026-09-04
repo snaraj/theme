@@ -158,7 +158,10 @@ check  "-n refuses a wildly overflowing count" 1 run "$lib" list -n 184467440737
 # left shows up red rather than passing for nothing: a broken stdout is
 # 141 (the shell's own answer for a tool cut off by its reader), and a
 # broken stderr under 2>&1 loses the message but keeps die's 1. One
-# command per printing module: help.rs, report.rs, update.rs, ui.rs.
+# command per printing module the fixture can reach: help.rs, report.rs,
+# update.rs, ui.rs, search.rs (unsplash.rs prints only on its network
+# path). The stderr case pins that a broken stderr never changes die's
+# status; it cannot tell a lost race from a won one — the 141 cases do.
 pipe_into_gone() { # $1 expected status, $2 label, then the theme argv
     ( sleep 0.2; run "$lib" "${@:3}" 2>"$fixture/pipe.err"; echo "$?" >"$fixture/pipe.rc" ) | true
     if [ ! -s "$fixture/pipe.err" ] && [ "$(cat "$fixture/pipe.rc")" = "$1" ]; then
@@ -169,6 +172,7 @@ pipe_into_gone 141 "help"   help
 pipe_into_gone 141 "list"   list
 pipe_into_gone 141 "status" status
 pipe_into_gone 141 "-V"     -V
+pipe_into_gone 141 "search" search tiny
 ( sleep 0.2; run "$lib" rm no-such-wallpaper 2>&1; echo "$?" >"$fixture/pipe.rc" ) | true
 if [ "$(cat "$fixture/pipe.rc")" = 1 ]; then pass "die under 2>&1 into a gone reader keeps exit 1"
 else fail "die under 2>&1 into a gone reader: rc=$(cat "$fixture/pipe.rc") want 1"; fi
