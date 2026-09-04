@@ -975,7 +975,7 @@ else fail "--version/-V do not match the version output"; fi
 # stub plays the whole GitHub flow (API → 302 → asset host), logging every
 # URL curl is asked for — so "refused" means curl was never spawned at it.
 updd="$fixture/upd"
-mkdir -p "$updd/bin" "$updd/stubbin"
+mkdir -p "$updd/bin" "$updd/stubbin" "$updd/Cellar/theme/0.0.0/bin" "$updd/cargo/bin"
 cur_ver=$(printf '%s\n' "$vout" | sed -n 1p | sed 's/^version: v//')
 case "$(uname -s)-$(uname -m)" in
 Darwin-arm64) triple=aarch64-apple-darwin ;;
@@ -1089,7 +1089,10 @@ upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
     # environment provably cannot reach the stub. (UPD_TAR_MARKER stays in
     # the theme process env on purpose — a hypothetical PATH-tar spawn
     # would inherit it, which is exactly what that pin watches for.)
-    local envs=() ctl=() kv
+    # $UPD_BIN (a plain shell variable, not an env pair) moves the install
+    # target so the route section can run the same flow from a keg or a
+    # cargo bin; unset or empty is the ordinary $updd/bin/theme.
+    local envs=() ctl=() kv bin="${UPD_BIN:-$updd/bin/theme}"
     while [ $# -gt 0 ] && [ "$1" != "--" ]; do
         case "$1" in
         UPD_TAR_MARKER=*) envs+=("$1") ;;
@@ -1103,8 +1106,8 @@ upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
     # previously-executed binary poisons it — the next exec dies SIGKILL.
     # DEBUG build: the trusted-transport lane only reaches the curl stub
     # through the THEME_CURL seam — PATH curl is dead to it (round 8).
-    rm -f "$updd/bin/theme"
-    cp "$THEME_DBG" "$updd/bin/theme"
+    rm -f "$bin"
+    cp "$THEME_DBG" "$bin"
     : >"$updlog"
     {
         printf "UPD_LOG='%s'\n" "$updlog"
@@ -1117,12 +1120,13 @@ upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
         PATH="$updd/stubbin:$PATH" \
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
-        "${envs[@]}" "$updd/bin/theme" update "$@" >"$upd_out" 2>&1
+        "${envs[@]}" "$bin" update "$@" >"$upd_out" 2>&1
     upd_rc=$?
 }
 upd_intact() { # target still byte-identical to the run binary, no temp left
-    cmp -s "$THEME_DBG" "$updd/bin/theme" \
-        && [ -z "$(find "$updd/bin" -name '.*update*' 2>/dev/null)" ]
+    local bin="${UPD_BIN:-$updd/bin/theme}"
+    cmp -s "$THEME_DBG" "$bin" \
+        && [ -z "$(find "${bin%/*}" -name '.*update*' 2>/dev/null)" ]
 }
 printf '%s  theme-%s.tar.gz\n' "$paysha" "$triple" >"$updd/sums"
 
@@ -1394,6 +1398,33 @@ if [ "$upd_rc" = 0 ] && grep -qF "theme v$cur_ver → v9.9.9" "$upd_out" \
    && cmp -s "$inner" "$updd/bin/theme" && [ ! -e "$updd/envchan-ran" ]; then
     pass "a fully hostile environment never reaches a boundary child"
 else fail "the environment channel leaked (rc=$upd_rc): $(cat "$upd_out")"; fi
+
+# --- issue #33: a managed install is routed, never replaced ----------------
+# A keg or a cargo build belongs to whoever installed it, so `theme update`
+# prints that route and stops BEFORE the transport check — the stub log
+# stays empty and the binary byte-identical. (Copies of the debug build
+# stand in for the real installs; only the path decides.)
+UPD_BIN="$updd/Cellar/theme/0.0.0/bin/theme"
+upd_run UPD_TAG=v9.9.9
+if [ "$upd_rc" = 0 ] && grep -qF 'brew upgrade snaraj/theme/theme' "$upd_out"; then
+    pass "a Homebrew keg is routed to brew"
+else fail "keg route missing (rc=$upd_rc): $(cat "$upd_out")"; fi
+if [ ! -s "$updlog" ] && upd_intact; then
+    pass "the keg route transfers nothing and replaces nothing"
+else fail "the keg route fetched or installed: $(cat "$updlog")"; fi
+upd_run UPD_TAG=v9.9.9 -- --version v9.9.9
+if [ "$upd_rc" = 0 ] && grep -qF 'brew upgrade snaraj/theme/theme' "$upd_out" \
+   && [ ! -s "$updlog" ] && upd_intact; then
+    pass "--version cannot route around a keg"
+else fail "--version bypassed the keg route (rc=$upd_rc): $(cat "$upd_out")"; fi
+UPD_BIN="$updd/cargo/bin/theme"
+upd_run UPD_TAG=v9.9.9 CARGO_HOME="$updd/cargo"
+if [ "$upd_rc" = 0 ] \
+   && grep -qF 'cargo install --git https://github.com/snaraj/theme --locked' "$upd_out" \
+   && [ ! -s "$updlog" ] && upd_intact; then
+    pass "a cargo install is routed back to cargo, transferring nothing"
+else fail "cargo route missing (rc=$upd_rc): $(cat "$upd_out")"; fi
+UPD_BIN=
 
 # --- the update-available footer on the bare `theme` screen ----------------
 notecache="$fixture/notecache"

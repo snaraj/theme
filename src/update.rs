@@ -37,7 +37,7 @@ use rustix::fs::{Mode, OFlags};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const RELEASES_API: &str = "https://api.github.com/repos/snaraj/theme/releases";
@@ -76,7 +76,133 @@ const TARGET: &str = "x86_64-unknown-linux-gnu";
 )))]
 const TARGET: &str = "";
 
+/// How this copy of theme got here. Everything but [`Install::File`] has an
+/// owner that is not us, and the answer is that owner's own command.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Install {
+    Homebrew,
+    Deb,
+    Rpm,
+    Package,
+    Cargo,
+    File,
+}
+
+/// Where a `cargo install` binary can land, in cargo's own precedence.
+/// Canonicalized to compare against a canonicalized exe; a directory that
+/// does not exist is simply not a candidate.
+fn cargo_bins() -> Vec<PathBuf> {
+    [
+        ("CARGO_INSTALL_ROOT", "bin"),
+        ("CARGO_HOME", "bin"),
+        ("HOME", ".cargo/bin"),
+    ]
+    .iter()
+    .filter_map(|(var, sub)| std::env::var_os(var).map(|v| Path::new(&v).join(sub)))
+    .filter_map(|p| std::fs::canonicalize(p).ok())
+    .collect()
+}
+
+/// Pure over its inputs — the filesystem questions are the caller's — so
+/// every route is testable without planting a tree. Order matters: a keg
+/// lives under a Homebrew prefix that is nobody else's, a cargo bin
+/// outranks the distro directories it may be symlinked beside, and only a
+/// path under a distro bin directory is a package's to own.
+fn classify(exe: &Path, cargo_bins: &[PathBuf], deb_installed: bool, rpm_db: bool) -> Install {
+    // COMPONENTS, never substrings: `Cellar` then this formula's name, so
+    // `/opt/homebrew`, `/usr/local` and linuxbrew prefixes all match while a
+    // directory merely named `Cellarium` — or another formula's keg that
+    // ships a `theme` — does not.
+    if exe
+        .components()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w[0].as_os_str() == "Cellar" && w[1].as_os_str() == "theme")
+    {
+        return Install::Homebrew;
+    }
+    if cargo_bins.iter().any(|d| exe.starts_with(d)) {
+        return Install::Cargo;
+    }
+    if ["/usr/bin", "/usr/sbin", "/bin", "/sbin"]
+        .iter()
+        .any(|d| exe.starts_with(d))
+    {
+        return if deb_installed {
+            Install::Deb
+        } else if rpm_db {
+            Install::Rpm
+        } else {
+            Install::Package
+        };
+    }
+    Install::File
+}
+
+/// The managed-install answer, printed in the manager's own terms; true
+/// when it was given, false for a plain file install that falls through to
+/// the self-updater. Reads the exe path and two well-known package
+/// databases — no network, no child process, nothing installed.
+fn route(exe: &Path) -> bool {
+    let p = display_text(&exe.display().to_string());
+    let kind = classify(
+        exe,
+        &cargo_bins(),
+        Path::new("/var/lib/dpkg/info/theme.list").is_file(),
+        Path::new("/var/lib/rpm").is_dir() || Path::new("/usr/lib/sysimage/rpm").is_dir(),
+    );
+    match kind {
+        Install::File => return false,
+        Install::Homebrew => {
+            println!("theme here is a Homebrew keg ({p}) — Homebrew updates it:");
+            println!("  brew upgrade snaraj/theme/theme");
+            println!(
+                "(the tap's formula can trail a release until its bump merges; every build is at https://github.com/snaraj/theme/releases)"
+            );
+        }
+        // One sentence, one place to keep true; only the extension and the
+        // manager's own install line differ.
+        Install::Deb | Install::Rpm => {
+            let (ext, cmd) = if kind == Install::Deb {
+                (".deb", "sudo apt install ./theme_*.deb")
+            } else {
+                (".rpm", "sudo dnf install ./theme-*.rpm")
+            };
+            println!(
+                "theme here was installed from a {ext} ({p}) — take the next one from https://github.com/snaraj/theme/releases/latest and run:"
+            );
+            println!("  {cmd}");
+        }
+        Install::Package => {
+            println!(
+                "theme here lives under a package manager's directory ({p}) — take the next .deb or .rpm from https://github.com/snaraj/theme/releases/latest"
+            );
+        }
+        Install::Cargo => {
+            println!(
+                "theme here was built by cargo install ({p}) — rebuild it from the current source:"
+            );
+            println!("  cargo install --git https://github.com/snaraj/theme --locked");
+        }
+    }
+    true
+}
+
 pub fn cmd_update(cfg: &Config, want: &str) {
+    // WHO OWNS THESE BYTES comes first — before the platform check, before
+    // the transport check, before any network. A keg or a distro package
+    // belongs to its manager (that route would otherwise fetch a whole
+    // release and then refuse at `install_over`'s "never elevates"), and a
+    // cargo build was chosen deliberately — sometimes because no prebuilt
+    // binary can run there (musl), where the glibc tarball would install a
+    // binary that cannot start. `theme version` and the bare screen still
+    // say "run theme update": this is the one entry point, dispatching.
+    let target = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .unwrap_or_else(|_| die("cannot resolve the running binary's path"));
+    if route(&target) {
+        return;
+    }
     if TARGET.is_empty() {
         die("no published release build for this platform — build from source");
     }
@@ -161,9 +287,6 @@ pub fn cmd_update(cfg: &Config, want: &str) {
     }
 
     verify_file(&staged, &expect_hex).unwrap_or_else(|e| die(&e));
-    let target = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .unwrap_or_else(|_| die("cannot resolve the running binary's path"));
     install_over(&target, &staged).unwrap_or_else(|e| die(&e));
     scratch::done(&staged);
     println!("theme v{current} → {tag}");
@@ -1034,6 +1157,45 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
         assert!(parse_ver_arg("latest").is_none());
         assert!(parse_ver_arg("").is_none());
         assert!(parse_ver_arg("v0.1.0-rc.1").is_none());
+    }
+
+    /// The route table: exe path, whether the cargo bins below are known,
+    /// the two package-database answers, and the install this must be.
+    #[test]
+    #[rustfmt::skip]
+    fn the_install_route_reads_only_where_the_binary_lives() {
+        use Install::{Cargo, Deb, File, Homebrew, Package, Rpm};
+        // CARGO_INSTALL_ROOT/bin, CARGO_HOME/bin, HOME/.cargo/bin.
+        let cargo = ["/ci/root/bin", "/home/u/.cargohome/bin", "/home/u/.cargo/bin"].map(PathBuf::from);
+        let cases: &[(&str, bool, bool, bool, Install)] = &[
+            // Every Homebrew prefix, matched on COMPONENTS — so `Cellarium`
+            // is not a keg, and another formula's keg shipping a `theme` is
+            // not ours. A keg outranks both package databases.
+            ("/opt/homebrew/Cellar/theme/0.3.0/bin/theme",            true,  true,  true,  Homebrew),
+            ("/usr/local/Cellar/theme/0.3.0/bin/theme",               false, false, false, Homebrew),
+            ("/home/linuxbrew/.linuxbrew/Cellar/theme/1.0/bin/theme", false, false, false, Homebrew),
+            ("/opt/Cellarium/theme/bin/theme",                        false, false, false, File),
+            ("/opt/homebrew/Cellar/other/1.0/bin/theme",              false, false, false, File),
+            // Each cargo bin — and each one ONLY while it is on the list.
+            ("/ci/root/bin/theme",                                    true,  false, false, Cargo),
+            ("/ci/root/bin/theme",                                    false, false, false, File),
+            ("/home/u/.cargohome/bin/theme",                          true,  false, false, Cargo),
+            ("/home/u/.cargohome/bin/theme",                          false, false, false, File),
+            ("/home/u/.cargo/bin/theme",                              true,  false, false, Cargo),
+            ("/home/u/.cargo/bin/theme",                              false, false, false, File),
+            // A distro bin directory, named by whichever database exists.
+            ("/usr/bin/theme",                                        false, true,  false, Deb),
+            ("/usr/bin/theme",                                        false, false, true,  Rpm),
+            ("/usr/bin/theme",                                        false, true,  true,  Deb),
+            ("/usr/bin/theme",                                        false, false, false, Package),
+            // Anything a person put somewhere themselves updates in place.
+            ("/usr/local/bin/theme",                                  false, true,  true,  File),
+            ("/home/u/.local/bin/theme",                              false, true,  true,  File),
+        ];
+        for (exe, known, deb, rpm, want) in cases {
+            let bins: &[PathBuf] = if *known { &cargo } else { &[] };
+            assert_eq!(classify(Path::new(exe), bins, *deb, *rpm), *want, "{exe}");
+        }
     }
 
     fn sha_hex(b: &[u8]) -> String {
