@@ -17,8 +17,12 @@ on:
 permissions:
   contents: read
 
+# One group per COMMIT, not per ref: GitHub keeps a single pending run per
+# group, so grouping main pushes by ref would let a third version-moving
+# merge cancel the second's pending run and drop that version from the
+# ledger. A dispatch or a tag on the same commit still queues behind it.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.sha }}
 
 jobs:
   # One version, one decision, one summary line, before any runner minute
@@ -41,11 +45,15 @@ jobs:
               [ "v$VER" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml says $VER"; exit 1; }
               publish=true; why="releasing v$VER from tag $GITHUB_REF_NAME" ;;
             branch:refs/heads/main)
-              if git ls-remote --exit-code origin "refs/tags/v$VER" >/dev/null; then
-                publish=false; why="v$VER is already released: nothing to publish (bump the version in Cargo.toml to release again)"
-              else
-                publish=true; why="releasing v$VER from main at ${GITHUB_SHA:0:7}"
-              fi ;;
+              # Only an ANSWER decides: ls-remote exits 0 (tag exists), 2 (no
+              # such tag), anything else (could not ask) — and a failed ask
+              # must never read as permission to publish.
+              git ls-remote --exit-code origin "refs/tags/v$VER" >/dev/null && rc=0 || rc=$?
+              case "$rc" in
+                0) publish=false; why="v$VER is already released: nothing to publish (bump the version in Cargo.toml to release again)" ;;
+                2) publish=true; why="releasing v$VER from main at ${GITHUB_SHA:0:7}" ;;
+                *) echo "::error::could not ask origin whether tag v$VER exists (git ls-remote exit $rc)"; exit 1 ;;
+              esac ;;
             *)
               publish=false; why="dry run on $GITHUB_REF_NAME: v$VER is built and installed, nothing is published (a release is a merge to main that moves Cargo.toml, a dispatch on main, or a push of tag v$VER)" ;;
           esac
