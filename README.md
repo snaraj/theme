@@ -52,6 +52,13 @@ mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 - No Snap or Flatpak build: their sandboxes cut off the kitty socket, the
   wallpaper store and `/dev/tty`, which is the entire job. No Windows build.
 
+**Update** — `theme update` replaces the binary it runs from with the
+latest release, verified against `SHA256SUMS` before a byte of it is
+written; `theme version` and the bare `theme` screen say when one is out.
+Homebrew and package installs update through their own manager
+(`brew upgrade snaraj/theme/theme`, the next `.deb` or `.rpm`): those files
+are the manager's to replace, and `theme update` never elevates.
+
 ### Compatibility
 
 | Platform | glibc | Prebuilt binary | From source |
@@ -67,8 +74,8 @@ mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 The prebuilt Linux binaries inherit the glibc floor of the runner that
 builds them, which is why they are built on the oldest image GitHub still
 offers: the floor is 2.34, below every glibc row above, so only musl
-systems build from source. (v0.2.2 was built before that and still wants
-2.39.) Every Linux row was checked on 2026-09-03 in a
+systems build from source. (Releases before v0.3.0 were built on 24.04 and
+still want 2.39.) Every Linux row was checked on 2026-09-03 in a
 container on x86_64 and arm64 (Arch on x86_64, the only architecture it
 publishes an image for): the release tarball for the prebuilt column, a
 source build and the whole `tests/boundary.sh` fixture for the other.

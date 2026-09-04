@@ -5,9 +5,10 @@
 # every push. What no runner can prove is the RELEASE TARBALL — the artifact
 # a stranger downloads — because the binary inherits the glibc floor of the
 # runner that built it, and that floor is invisible until it meets an older
-# distribution. This walks the images and reports one line each. Through
-# v0.2.2 that floor is glibc 2.39, so ubuntu:22.04 and debian:12 report FAIL
-# here: the gap this exists to name, not a fault in the script.
+# distribution. This walks the images and reports one line each. Before
+# v0.3.0 that floor was glibc 2.39, so against those releases ubuntu:22.04
+# and debian:12 report FAIL here: the gap this was written to name, not a
+# fault in the script.
 #
 # Nothing is installed inside the images: a base image already carries tar,
 # sha256sum and base64, so a failure here is the binary's, never a missing
