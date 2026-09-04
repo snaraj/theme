@@ -136,7 +136,9 @@ jobs:
           sudo apt-get install -y ./theme_*.deb
           dpkg -s theme | grep -qx "Version: $VER"
           sh check.sh
+          # shellcheck disable=SC2016 # $VER is for the container's shell, via -e
           deb='apt-get install -y /pkg/theme_*.deb && dpkg -s theme | grep -qx "Version: $VER" && sh /pkg/check.sh'
+          # shellcheck disable=SC2016 # same: expanded inside the container
           rpm='dnf -y --disablerepo="*" install /pkg/theme-*.rpm && rpm -q theme | grep -q "^theme-$VER-1\." && sh /pkg/check.sh'
           box() { docker run --rm --network none -e VER="$VER" -e DEBIAN_FRONTEND=noninteractive -v "$PWD:/pkg:ro" "$@"; }
           box debian:12@sha256:6ebd97fa83deb272194a2cf015b3d26a4d538e9ad3a7a79d544c8af5b0a01443 sh -c "$deb" # debian:12
@@ -163,20 +165,3 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
           --verify-tag --title "theme $GITHUB_REF_NAME"
           --generate-notes theme-*.tar.gz theme_*.deb theme-*.rpm SHA256SUMS
-
-  # The tap formula has to point at the release just published. A runner
-  # holds no signing key and main requires signed commits, so the commit is
-  # made through the contents API — GitHub signs that one — and arrives as a
-  # PR the OWNER merges. The elevated scopes stay inside this job.
-  formula:
-    if: github.ref_type == 'tag'
-    needs: publish
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - env:
-          GH_TOKEN: ${{ github.token }}
-        run: .github/bump-formula.sh "$GITHUB_REF_NAME"

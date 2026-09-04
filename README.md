@@ -25,6 +25,9 @@ brew trust --formula snaraj/theme/theme
 brew install snaraj/theme/theme
 ```
 
+The formula is bumped by a pull request after each release, so `brew` can
+be one release behind until that merges; the tarballs below never are.
+
 **Debian, Ubuntu, Fedora, RHEL** — take the `.deb` or `.rpm` for your
 architecture from the
 [releases page](https://github.com/snaraj/theme/releases), then
@@ -57,13 +60,15 @@ mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 | Ubuntu 24.04 | 2.39 | yes | yes |
 | Fedora 44 | 2.43 | yes | yes |
 | Arch | 2.44 | yes | yes |
-| Debian 12 | 2.36 | no | yes |
-| Ubuntu 22.04 | 2.35 | no | yes |
+| Debian 12 | 2.36 | yes | yes |
+| Ubuntu 22.04 | 2.35 | yes | yes |
 | Alpine 3 (musl) | — | no | yes |
 
 The prebuilt Linux binaries inherit the glibc floor of the runner that
-builds them — 2.39 today — so a distribution below that line builds from
-source, as musl systems do. Every Linux row was checked on 2026-09-03 in a
+builds them, which is why they are built on the oldest image GitHub still
+offers: the floor is 2.34, below every glibc row above, so only musl
+systems build from source. (v0.2.2 was built before that and still wants
+2.39.) Every Linux row was checked on 2026-09-03 in a
 container on x86_64 and arm64 (Arch on x86_64, the only architecture it
 publishes an image for): the release tarball for the prebuilt column, a
 source build and the whole `tests/boundary.sh` fixture for the other.

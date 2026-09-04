@@ -3,11 +3,17 @@
 # Homebrew 6 will not use a third-party tap until it is trusted, so the
 # install is: tap, `brew trust --formula snaraj/theme/theme` (the narrowest
 # grant — never the whole tap), then `brew install snaraj/theme/theme`.
-# The release chain rewrites the version, the four URLs and the four sha256
-# lines from the published SHA256SUMS — the trailing `# <target>` comments
-# are its anchors, keep them. The version is STATED, not left to Homebrew's
-# URL scan: that scan reads "64-unknown-linux-gnu" out of the x86_64 asset
-# name and puts the keg under it (seen with `brew test`).
+#
+# Bumping this after a release is a HAND edit, on purpose — a workflow that
+# opens its own pull request would sidestep the review contract every other
+# change obeys. Take the four digests from that release's SHA256SUMS, set
+# the four sha256 lines (the trailing `# <target>` comments say which is
+# which), point the four URLs at the new tag, set `version`, and open a
+# normal Draft PR under the usual contract.
+#
+# The version is STATED, not left to Homebrew's URL scan: that scan reads
+# "64-unknown-linux-gnu" out of the x86_64 asset name and puts the keg
+# under it (seen with `brew test`).
 class Theme < Formula
   desc "Wallpaper and terminal palette driven by one command"
   homepage "https://github.com/snaraj/theme"
