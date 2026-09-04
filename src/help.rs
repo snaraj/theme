@@ -79,7 +79,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("status", "current theme, color-scheme swatches, variables"),
             (
                 "update",
-                "replace this binary with the latest release (verified)",
+                "replace this binary (verified), or say how this install updates",
             ),
             (
                 "version, -V",
@@ -463,13 +463,13 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
         "update" => print!(
             "theme update [--version <vX.Y.Z>]
 
-  Check the latest GitHub release (snaraj/theme) and install it over
-  this binary in one step, printing current → new. Already current is
-  a no-op. The download is verified against the release's SHA256SUMS
-  BEFORE anything is installed, and the swap is atomic — the running
-  binary is never left partial or replaced by unverified bytes. If the
-  install location is not writable the command says so and stops;
-  theme never elevates.
+  A Homebrew keg, a .deb/.rpm or a cargo install belongs to whoever
+  installed it: theme prints that manager's own update command and
+  stops. Otherwise it checks the latest GitHub release (snaraj/theme)
+  and installs it over this binary, printing current → new. Already
+  current is a no-op. The download is verified against the release's
+  SHA256SUMS BEFORE anything is installed and the swap is atomic; an
+  unwritable location says so and stops — theme never elevates.
 
   --version installs a specific release instead of the latest — older
   versions may be unsupported or break (a downgrade says so before it

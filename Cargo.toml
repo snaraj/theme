@@ -14,7 +14,7 @@ unsafe_code = "deny"
 
 [package]
 name = "theme"
-version = "0.3.0"
+version = "0.3.1"
 description = "One command that owns the desktop wallpaper and the terminal palette together"
 edition.workspace = true
 license.workspace = true
