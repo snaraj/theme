@@ -1,6 +1,6 @@
 //! The local-library verbs: apply (named or random), delete, rename.
 
-use crate::apply::{set_desktop, use_image, wallpaper_get};
+use crate::apply::{set_desktop, settle, use_image, wallpaper_get};
 use crate::config::Config;
 use crate::library::{random_local, resolve_library, resolve_local, slugify};
 use crate::main_flags::Flags;
@@ -104,8 +104,9 @@ pub fn cmd_rename(cfg: &Config, args: &[String]) {
         dest.file_name().and_then(|n| n.to_str()).unwrap_or("")
     ));
     let cur = wallpaper_get();
+    let mut desktop = Ok(());
     if cur.as_deref() == Some(img.as_path()) {
-        set_desktop(cfg, &dest);
+        desktop = set_desktop(cfg, &dest);
         note("desktop re-pointed at the new name");
     }
     // Keep the palette-image record accurate too, so status stays truthful.
@@ -116,4 +117,8 @@ pub fn cmd_rename(cfg: &Config, args: &[String]) {
     {
         let _ = fs::write(&record, dest.display().to_string());
     }
+    // The rename itself succeeded and the record is accurate; only the
+    // re-point may have fallen short, and it is judged last like every
+    // other apply.
+    settle(desktop);
 }

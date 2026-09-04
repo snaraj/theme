@@ -27,6 +27,12 @@
 #
 # Run: THEME_BIN=target/release/theme tests/boundary.sh   (exits 0 on pass)
 set -u
+# The fixture builds the library, the cache and every planted directory
+# itself, and the custody audits it pins REFUSE a group-writable one — so
+# the world it builds must not depend on the caller's umask. macOS defaults
+# to 022 and always satisfied this by accident; Ubuntu defaults to 002 and
+# turned every custody positive into a refusal. Stated, not inherited.
+umask 022
 root="$(cd "$(dirname "$0")/.." && pwd)"
 THEME="${THEME_BIN:-$root/target/release/theme}"
 [ -x "$THEME" ] || { echo "FAIL  no binary at $THEME (cargo build --release first)"; exit 1; }
@@ -76,7 +82,14 @@ if [ "$child_env" = "||" ]; then
     pass "no ambient credential reaches an unpinned child (outer token was ${#outer_token} bytes)"
 else fail "an ambient credential reached an unpinned child: $child_env"; fi
 
-fixture=$(mktemp -d -t theme-boundary) || exit 1
+# Spelled-out template, and NOT under TMPDIR: `mktemp -t` means opposite
+# things to BSD and GNU (the GNU form also demands the Xs), and on Linux
+# TMPDIR is the world-writable /tmp — a chain the saver's ancestor audit
+# refuses outright, which is why the unit tests' scratch already lives here
+# (src/save_tests.rs). target/ sits on a user-owned chain wherever the repo
+# is sanely checked out.
+mkdir -p "$root/target/test-tmp" || exit 1
+fixture=$(mktemp -d "$root/target/test-tmp/theme-boundary.XXXXXX") || exit 1
 trap 'rm -rf "$fixture"' EXIT
 lib="$fixture/library"
 out="$fixture/outside"
@@ -108,6 +121,13 @@ run() { THEME_WALLPAPER_DIR="$1" THEME_NO_APPLY=1 THEME_CACHE_DIR="$fixture/cach
 run_nokitty() { THEME_WALLPAPER_DIR="$1" THEME_NO_APPLY=1 THEME_CACHE_DIR="$fixture/cache" \
     TMPDIR="$fixture/tmpdir" KITTY_WINDOW_ID='' "$THEME" "${@:2}"; }
 
+# theme writes and reads a wallpaper's provenance through the macOS `xattr`
+# tool; Linux ships no counterpart, so a planted theme.* attribute is
+# invisible there and the sections that assert on one have nothing to drive.
+# What those cases pin — the display sanitizing and the parsed-host label —
+# is platform-independent code, exercised on the platform that can carry it.
+xattr_meta() { [ "$(uname -s)" = Darwin ]; }
+
 # --- positive destructive ops must MUTATE, not merely exit 0 ---------------
 check  "in-library rm succeeds"                0 run "$lib" rm in-lib.jpg
 exists "in-library rm really deleted"          no "$lib/in-lib.jpg"
@@ -123,6 +143,13 @@ check  "rm refuses nested path"                1 run "$lib" rm outside/delete-vi
 check  "rm of an in-library symlink succeeds"  0 run "$lib" rm escape.jpg
 exists "symlink target beyond boundary intact" yes "$out/delete-victim.jpg"
 exists "outside rename-victim untouched"       yes "$out/rename-victim.jpg"
+
+# A row count past usize used to be all digits, so the shape check passed and
+# the number that did not fit became the default ten rows: exit 0, ten rows,
+# nobody told. It has to REFUSE.
+check  "-n takes the largest count there is"   0 run "$lib" list -n 18446744073709551615
+check  "-n refuses a count past usize"         1 run "$lib" list -n 18446744073709551616
+check  "-n refuses a wildly overflowing count" 1 run "$lib" list -n 184467440737095516160
 
 # --- truncated/stem resolution: exactly ONE candidate or refuse ------------
 printf 'x' >"$lib/same-title.jpg"
@@ -209,6 +236,7 @@ exists "first-dir dupname intact"               yes "$lib/dupname.png"
 exists "second-dir dupname intact"              yes "$lib2/dupname.png"
 
 # --- long values WRAP with a hanging indent — never merging with a label ----
+if xattr_meta; then
 png1x1 "$lib/long-src.png" 0 0 0
 xattr -w theme.source "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bb.invalid/x" "$lib/long-src.png" 2>/dev/null
 pv_out=$(COLUMNS=60 run_nokitty "$lib" preview long-src 2>/dev/null)
@@ -234,6 +262,7 @@ pv_out=$(COLUMNS=80 run_nokitty "$lib" preview ctrl-src 2>/dev/null)
 if printf '%s' "$pv_out" | grep -q 'SOURCE       badlineirl'; then
     pass "control bytes in the source xattr are stripped"
 else fail "control bytes reached the preview table"; fi
+fi
 
 # --- OWNER: only populated fields render; hostile metadata xattrs are inert -
 png1x1 "$lib/bare-meta.png" 5 5 5
@@ -246,6 +275,7 @@ if printf '%s' "$pv_out" | grep -q '^  TITLE        bare-meta' \
    && printf '%s' "$pv_out" | grep -q '^  LOCATION'; then
     pass "a bare file still renders its filesystem facts"
 else fail "preview lost a filesystem fact on a bare file"; fi
+if xattr_meta; then
 xattr -w theme.artist "$(printf 'Ev\033]52;c;steal\ail Artist')" "$lib/bare-meta.png" 2>/dev/null
 pv_out=$(COLUMNS=80 run_nokitty "$lib" preview bare-meta 2>/dev/null)
 if printf '%s' "$pv_out" | grep -qF "$(printf '\033]')"; then
@@ -254,6 +284,7 @@ else pass "hostile metadata cannot emit terminal protocol"; fi
 if printf '%s' "$pv_out" | grep -q '^  ARTIST       Ev]52;c;stealil Artist$'; then
     pass "the sanitized artist value still renders"
 else fail "the artist metadata line was lost or mangled"; fi
+fi
 rm -f "$lib/bare-meta.png"
 rm -f "$lib/long-src.png" "$lib/ctrl-src.png" "$lib/dupname.png" "$lib2/dupname.png"
 
@@ -483,6 +514,44 @@ if printf '%s' "$corrupt_out" | grep -q '48;2;' || [ -s "$fixture/corrupt.err" ]
     fail "a corrupt cache entry produced a swatch or an error"
 else pass "corrupt cache entry degrades to a dash, silently"; fi
 
+# --- `search` answers from FACTS, and from the same cache ------------------
+# The corrupt entries above are still in place, so the first case proves the
+# colors come from a derived scheme and are never invented; the live runs
+# after it re-derive. Solid-color PNGs make every answer here exact.
+run_scheme_search() { COLUMNS=200 THEME_WALLPAPER_DIR="$schemelib" THEME_CACHE_DIR="$schemecache" \
+    KITTY_WINDOW_ID='' TMPDIR="$fixture/tmpdir" "$THEME" search "$@"; }
+if THEME_NO_APPLY=1 run_scheme_search green --all 2>/dev/null | grep -q 'no wallpaper matches'; then
+    pass "a color word finds nothing while no scheme is derived"
+else fail "search invented a color word from an underived scheme"; fi
+srch=$(run_scheme_search red-one --all 2>/dev/null)
+if printf '%s' "$srch" | grep -q '^  red-one .*title: red-one' &&
+    printf '%s' "$srch" | grep -q '^  1 of 3 wallpapers match$'; then
+    pass "a title substring finds exactly its wallpaper"
+else fail "the title search missed or over-matched"; fi
+if run_scheme_search red-one png --all 2>/dev/null | grep -q 'title: red-one, format: png'; then
+    pass "two terms AND together, each naming the fact it landed on"
+else fail "two terms did not AND together"; fi
+if run_scheme_search red-one qqqq --all 2>/dev/null |
+    grep -q 'no wallpaper matches "red-one qqqq"'; then
+    pass "one unanswerable term eliminates every wallpaper"
+else fail "an unanswerable term did not eliminate"; fi
+check  "a search with no hits is not an error"  0 run_scheme_search red-one qqqq --all
+if run_scheme_search green --all 2>/dev/null | grep -q '^  red-one .*colors: .*green'; then
+    pass "a color word matches the backfilled scheme that holds it"
+else fail "the backfilled green accent was not searchable"; fi
+# c81e1e IS red-one.png's own color; its derived red accent sits 43 away.
+if run_scheme_search c81e1e --all 2>/dev/null | grep -q '^  red-one .*colors: #c81e1e'; then
+    pass "a hex term matches a scheme color by distance"
+else fail "a hex term did not match a near scheme color"; fi
+if run_scheme_search 808080 --all 2>/dev/null | grep -q 'no wallpaper matches'; then
+    pass "a hex term far from every scheme color matches nothing"
+else fail "the hex distance gate let a far color through"; fi
+capped=$(run_scheme_search png -n 2 2>/dev/null)
+if printf '%s' "$capped" | grep -q '^  2 of 3 matches shown — more:' &&
+    ! printf '%s' "$capped" | grep -q 'wallpapers match'; then
+    pass "a capped table counts the rows shown, not the matches found"
+else fail "the capped footer claimed the whole match count"; fi
+
 # --- the DEFAULT listing is bounded: newest 10, honestly labelled -----------
 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do printf 'x' >"$lib/bulk-$i.jpg"; done
 if run_nokitty "$lib" list 2>/dev/null | grep -q 'newest 10 of [0-9]* — more:'; then
@@ -498,13 +567,14 @@ mkdir -p "$urlbin"
 cat >"$urlbin/curl" <<'EOS'
 #!/bin/bash
 o=""; prev=""
+[ -n "${CURL_LOG-}" ] && printf 'ARGV: %s\n' "$*" >>"$CURL_LOG"
 for a in "$@"; do [ "$prev" = "-o" ] && o="$a"; prev="$a"; done
 [ -n "$o" ] && printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' | base64 -d >"$o"
 exit 0
 EOS
 chmod +x "$urlbin/curl"
 run_url() { PATH="$urlbin:$PATH" THEME_WALLPAPER_DIR="$1" THEME_NO_APPLY=1 \
-    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" url "$2"; }
+    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" set "$2"; }
 
 # A dangling symlink is an occupied name, not a free one.
 ln -s "$out/redirected.png" "$lib/hijacked.png"
@@ -551,7 +621,7 @@ EOS
 chmod +x "$webpbin/curl"
 webplib="$fixture/webplib"; mkdir -p "$webplib"
 run_webp() { PATH="$webpbin:$PATH" THEME_WALLPAPER_DIR="$webplib" THEME_NO_APPLY=1 \
-    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" url "$@"; }
+    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" set "$@"; }
 webpout=$(run_webp https://img.invalid/photo.webp --rotate right 2>&1)
 exists "a transformed webp is saved as png"    yes "$webplib/photo-rotated-right.png"
 case "$webpout" in
@@ -597,7 +667,7 @@ EOS
 chmod +x "$ssrfbin/curl"
 ssrflib="$fixture/ssrflib"; mkdir -p "$ssrflib"
 run_ssrf() { PATH="$ssrfbin:$PATH" THEME_WALLPAPER_DIR="$ssrflib" THEME_NO_APPLY=1 \
-    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" url "$1"; }
+    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" "$THEME" set "$1"; }
 for kind in file loop opt; do
     err=$(run_ssrf "https://pin.example/page-$kind" 2>&1)
     case "$err" in
@@ -660,6 +730,71 @@ if [ -f "$lib/plain-name.png" ] && [ ! -L "$lib/plain-name.png" ]; then
     pass "a free name yields a regular file in the library"
 else fail "free-name download did not produce a regular library file"; fi
 
+# --- `get`: the same download, stopping at the library ----------------------
+# get lands a link's bytes and SHOWS them; applying is set's job alone. The
+# retired `url` spelling explains itself instead of reading as a typo.
+check  "the retired 'url' verb refuses"        1 run "$lib" url https://img.invalid/x.png
+urlerr=$(run "$lib" url https://img.invalid/x.png 2>&1)
+case "$urlerr" in
+*"theme set"*) pass "the retired verb names its replacement" ;;
+*) fail "the url refusal does not name 'theme set': $urlerr" ;;
+esac
+getlib="$fixture/getlib"; mkdir -p "$getlib"
+getlog="$fixture/curl-get.log"; : >"$getlog"
+run_get() { PATH="$urlbin:$PATH" THEME_WALLPAPER_DIR="$getlib" THEME_NO_APPLY=1 \
+    THEME_CACHE_DIR="$fixture/cache" TMPDIR="$fixture/tmpdir" CURL_LOG="$getlog" \
+    KITTY_WINDOW_ID='' COLUMNS=120 "$THEME" get "$@"; }
+getout=$(run_get https://img.invalid/get-me.png 2>&1)
+exists "get saves the download into the library"      yes "$getlib/get-me.png"
+if printf '%s\n' "$getout" | grep -q '^  TITLE ' && printf '%s\n' "$getout" | grep -q '^  LOCATION '; then
+    pass "get previews what it saved"
+else fail "get printed no preview block: $getout"; fi
+case "$getout" in
+*"[no-apply] would"*) fail "get applied what it downloaded" ;;
+*) pass "get changes no desktop and no palette" ;;
+esac
+exists "get exports no palette"                       no "$fixture/cache/wal"
+run_get https://img.invalid/study.png --mkdir studies >/dev/null 2>&1
+exists "--mkdir files the download in its own folder" yes "$getlib/studies/study.png"
+: >"$getlog"
+for bad in ../x .hidden a/b; do
+    check "--mkdir '$bad' is refused" 1 run_get https://img.invalid/nope.png --mkdir "$bad"
+done
+check  "--mkdir swallows no following flag"    1 run_get https://img.invalid/nope.png --mkdir --rotate
+check  "get refuses a library name"            1 run_get name-not-a-link
+# A second positional is a grammar error, refused before any fetch — the same
+# `theme get takes exactly one link` message the arm dies with pre-side-effect.
+check  "'get' with an extra positional is refused" 1 run_get https://img.invalid/nope2.png unexpected
+getextraerr=$(run_get https://img.invalid/nope2.png unexpected 2>&1)
+case "$getextraerr" in
+*"theme get takes exactly one link"*) pass "the extra-positional refusal names its cause" ;;
+*) fail "the extra-positional refusal message is wrong: $getextraerr" ;;
+esac
+# A dangling --mkdir (nothing following it) is refused the same way rotate/-n
+# already were — no value ever means no fetch.
+check  "a dangling --mkdir on 'get' is refused"     1 run_get https://img.invalid/nope3.png --mkdir
+getdangleerr=$(run_get https://img.invalid/nope3.png --mkdir 2>&1)
+case "$getdangleerr" in
+*"--mkdir takes one folder name"*) pass "the dangling --mkdir refusal names its cause" ;;
+*) fail "the dangling --mkdir refusal message is wrong: $getdangleerr" ;;
+esac
+# A SECOND --mkdir that dangles must still refuse even though the first one
+# already left a valid name behind — the bug this fixture pins.
+check  "--mkdir studies --mkdir (re-dangled) is refused" 1 \
+    run_get https://img.invalid/nope4.png --mkdir studies --mkdir
+getredangleerr=$(run_get https://img.invalid/nope4.png --mkdir studies --mkdir 2>&1)
+case "$getredangleerr" in
+*"--mkdir takes one folder name"*) pass "the re-dangled --mkdir refusal names its cause" ;;
+*) fail "the re-dangled --mkdir refusal message is wrong: $getredangleerr" ;;
+esac
+if [ ! -s "$getlog" ]; then pass "a refused get never reaches the network"
+else fail "a refused get still ran curl: $(cat "$getlog")"; fi
+# The well-formed grammar still downloads after the fix above.
+run_get https://img.invalid/study2.png --mkdir studies2 >/dev/null 2>&1
+exists "well-formed 'get --mkdir' still downloads" yes "$getlib/studies2/study2.png"
+check  "rm refuses get's --mkdir"              1 run "$lib" rm keepme.jpg --mkdir x
+exists "and the named victim survives"         yes "$lib/keepme.jpg"
+
 # --- filenames are DATA, never terminal protocol ---------------------------
 oscname="osc52-safe$(printf '\033]52;c;U0FGRQ==\007')"
 png1x1 "$lib/$oscname.png" 0 0 0
@@ -684,6 +819,7 @@ srccase() { # $1 description, $2 basename, $3 theme.source value, $4 expected la
     got=$(COLUMNS=120 run_nokitty "$lib" preview "$2" 2>/dev/null | sed -n 's/^ *SOURCE  *//p')
     if [ "$got" = "$4" ]; then pass "$1"; else fail "$1 (got '$got', wanted '$4')"; fi
 }
+if xattr_meta; then
 srccase "the genuine host still labels unsplash"  srchost-good \
     "https://unsplash.com/photos/abc" unsplash
 srccase "a subdomain of it still labels unsplash" srchost-sub \
@@ -694,6 +830,7 @@ srccase "a SUFFIX-extended host is not unsplash"  srchost-suffix \
     "https://unsplash.com.evil.invalid/x" unsplash.com.evil.invalid
 srccase "userinfo cannot fake the host"           srchost-userinfo \
     "https://unsplash.com@evil.invalid/x" evil.invalid
+fi
 
 # --- NO command emits terminal control protocol, whatever disk or API says -
 sweeplib="$fixture/sweep"; sweepcache="$fixture/sweepcache"
@@ -730,6 +867,7 @@ sweep help
 sweep status
 sweep list
 sweep list -v
+sweep search sweep-safe
 sweep preview sweep-safe
 sweep preview sizeinject
 sweep set sweep-safe
@@ -744,7 +882,8 @@ else pass "no command emits a filename's OSC sequence"; fi
 sweep_missing=""
 for marker in 'would set the desktop wallpaper to' 'would derive a palette from' \
     'now: ' 'current theme:' 'palette image:' 'COLORSCHEME' 'sizeinject' \
-    'successfully deleted' 'successfully renamed' 'unknown command'; do
+    'successfully deleted' 'successfully renamed' 'unknown command' \
+    'wallpapers match'; do
     grep -qF -- "$marker" "$sweep_all" || sweep_missing="$sweep_missing [$marker]"
 done
 if [ -z "$sweep_missing" ]; then
@@ -775,7 +914,7 @@ help_run() { # $1 label, $2 TERM_PROGRAM, $3 TERM, $4… theme arguments
     printf '%s\n' "$o" >>"$help_all"
     return 0
 }
-for c in random set unsplash url list preview status rename rm update help; do
+for c in random set unsplash get list preview status rename rm update help; do
     help_run "$c--help" TermSAFE xtermSAFE "$c" --help
 done
 help_run help-TERM_PROGRAM "TermSAFE$oscpay" xtermSAFE help
@@ -1355,6 +1494,86 @@ if [ "$note_rc" = 0 ] && grep -qF "$expect1" "$note_out"; then
     pass "a fresh cache renders without any transport"
 else fail "the fresh-cache render needed a transport: $(tail -3 "$note_out")"; fi
 
+# --- version answers "am I current?" (issue #25) ---------------------------
+# The footer's cache, custody and transport, asked as a QUESTION — so the
+# answer may never outrun the evidence. Its own cache dir and attempt log
+# leave the footer's accounting above exactly as pinned.
+vercache="$fixture/vercache"
+verbin="$fixture/verbin"
+verfaillog="$fixture/verfail.log"
+mkdir -p "$vercache" "$verbin"
+: >"$verfaillog"
+cat >"$verbin/curl" <<EOS
+#!/bin/sh
+printf 'x\n' >>"$verfaillog"
+exit 6
+EOS
+chmod +x "$verbin/curl"
+ver_out="$updd/ver.out"
+ver_run() { # $1 the verb (version|--version|-V); env-pair overrides follow.
+    local verb="$1"
+    shift
+    env THEME_NO_UPDATE_CHECK= \
+        THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$vercache" \
+        THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" KITTY_WINDOW_ID='' \
+        THEME_CURL="$verbin/curl" \
+        PATH="$verbin:$sweepbin:$PATH" "$@" "$THEME_DBG" "$verb" >"$ver_out" 2>&1
+    ver_rc=$?
+}
+verline() { sed -n "$1p" "$ver_out"; }
+vercount() { wc -l <"$ver_out" | tr -d ' '; }
+verfails() { wc -l <"$verfaillog" | tr -d ' '; }
+plain2="github: https://github.com/snaraj/theme"
+plain3="maintainer: Samuel Naranjo"
+three_plain() { # today's three lines, and nothing else
+    [ "$(verline 1)" = "version: v$cur_ver" ] && [ "$(verline 2)" = "$plain2" ] \
+        && [ "$(verline 3)" = "$plain3" ] && [ "$(vercount)" = 3 ]
+}
+
+printf 'v9.9.9' >"$vercache/update-check"
+ver_run version
+if [ "$(verline 1)" = "update to the latest version by running 'theme update'" ] \
+   && [ "$(verline 2)" = "current version: v$cur_ver" ] \
+   && [ "$(verline 3)" = "latest version: v9.9.9" ] \
+   && [ "$(verline 4)" = "$plain2" ] && [ "$(verline 5)" = "$plain3" ] \
+   && [ "$(vercount)" = 5 ] && [ "$(verfails)" = 0 ]; then
+    pass "a newer cached release makes version the five-line update answer"
+else fail "version's update shape drifted (attempts $(verfails)): $(cat "$ver_out")"; fi
+ver_canon=$(cat "$ver_out")
+ver_run --version
+ver_alias=$(cat "$ver_out")
+ver_run -V
+if [ "$ver_alias" = "$ver_canon" ] && [ "$(cat "$ver_out")" = "$ver_canon" ]; then
+    pass "--version and -V stay byte-identical aliases of version"
+else fail "an alias diverged from version: $(cat "$ver_out")"; fi
+printf 'v%s' "$cur_ver" >"$vercache/update-check"
+ver_run version
+if [ "$(verline 1)" = "you're currently on the latest version." ] \
+   && [ "$(verline 2)" = "version: v$cur_ver" ] && [ "$(verline 3)" = "$plain2" ] \
+   && [ "$(verline 4)" = "$plain3" ] && [ "$(vercount)" = 4 ]; then
+    pass "an up-to-date cache says so above the three lines"
+else fail "the up-to-date answer drifted: $(cat "$ver_out")"; fi
+printf 'v0.0.0' >"$vercache/update-check"
+ver_run version
+if three_plain; then pass "a build newer than the latest claims nothing extra"
+else fail "a dev build made a claim: $(cat "$ver_out")"; fi
+printf 'v9.9.9\033]52;c;steal\007' >"$vercache/update-check"
+ver_run version
+if three_plain && ! grep -qF "$(printf '\033]')" "$ver_out"; then
+    pass "a hostile cache reaches neither the answer nor the terminal"
+else fail "hostile cache content reached version: $(cat "$ver_out")"; fi
+rm -f "$vercache/update-check"
+ver_run version
+if [ "$ver_rc" = 0 ] && three_plain && ! grep -qiE 'error|curl' "$ver_out" \
+   && [ "$(verfails)" = 1 ] && [ -e "$vercache/update-check" ]; then
+    pass "an unknown latest prints three lines and stamps its one attempt"
+else fail "the offline answer misbehaved (rc=$ver_rc, attempts $(verfails)): $(cat "$ver_out")"; fi
+rm -f "$vercache/update-check"
+ver_run version THEME_NO_UPDATE_CHECK=1
+if three_plain && [ "$(verfails)" = 1 ]; then
+    pass "the kill-switch leaves version at three lines and spawns nothing"
+else fail "THEME_NO_UPDATE_CHECK did not disable version's check: $(cat "$ver_out")"; fi
+
 # --- the cache stamp is fail-closed (Codex round 4) ------------------------
 # An attacker-writable cache dir with a planted symlink: the old stamp
 # followed it and truncated the victim on a bare help. Now custody refuses
@@ -1429,6 +1648,10 @@ for tool in id getfacl ls; do
     printf '#!/bin/sh\n: >"%s/audit-stub-ran-%s"\nexit 0\n' "$fixture" "$tool" >"$auditbin/$tool"
     chmod +x "$auditbin/$tool"
 done
+# The FIFO section above leaves a regular file behind ONLY if the heal it
+# pins actually happened; a stale FIFO here would block this write forever
+# and hang CI instead of failing it, so the entry goes before it is written.
+rm -f "$notecache/update-check"
 printf 'v9.9.9' >"$notecache/update-check"
 note_run PATH="$auditbin:$failbin:$sweepbin:$PATH"
 if grep -qF 'update to the latest theme version: v9.9.9' "$note_out" \
@@ -1502,7 +1725,7 @@ else:
 starters = ('Apply Commands:', 'Library Commands:', 'Info Commands:', 'Usage:',
             'Global Flags', 'Use "', 'current theme:', 'mode:', 'color scheme:',
             'palette source:', 'palette image:', 'wallpaper dir:', 'variables:',
-            'update to the latest', 'to update run:', 'wallpapers', 'theme v')
+            'update to the latest', 'to update run:', 'wallpapers', 'search:')
 for l in lines:
     if l and not l.startswith(' ') and not l.startswith(starters):
         sys.exit('column-0 line outside the known starters: %r' % l)
@@ -1520,12 +1743,12 @@ narrow_run() { # $1 COLUMNS, rest: theme args
 narrowck() { python3 "$fixture/narrowck.py" "$narrow_out" "$@" 2>&1; }
 
 narrow_run 100
-if [ "$narrow_rc" = 0 ] && why=$(narrowck 100 6 14) && grep -q '#.*THEME' "$narrow_out"; then
+if [ "$narrow_rc" = 0 ] && why=$(narrowck 100 6 14) && grep -q '#.*COLORSCHEME' "$narrow_out"; then
     pass "wide bare screen keeps the side-by-side header"
 else fail "wide bare screen regressed (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
 narrow_run 40
 if [ "$narrow_rc" = 0 ] && why=$(narrowck 40 6 14) && ! grep -q '#.*THEME' "$narrow_out" \
-   && grep -q '^  THEME$' "$narrow_out"; then
+   && grep -q '^  THEME CLI$' "$narrow_out"; then
     pass "40 columns stacks: image whole above, fields below"
 else fail "40-column bare screen broke (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
 narrow_run 25
@@ -1544,6 +1767,10 @@ narrow_run 40 status
 if [ "$narrow_rc" = 0 ] && why=$(narrowck 40 0 0); then
     pass "a 40-column status wraps every value with a hanging indent"
 else fail "40-column status broke (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
+narrow_run 40 search narrow-check
+if [ "$narrow_rc" = 0 ] && why=$(narrowck 40 0 0); then
+    pass "a 40-column search stacks its three columns, none at column 0"
+else fail "40-column search broke (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
 
 # --- the REAL terminal width, from the tty itself (issue #21) ---------------
 # v0.2.1 read only COLUMNS, which zsh does not export — every real terminal
@@ -1585,19 +1812,19 @@ narrow_pty() { # $1 cols, rest: theme args — a real tty answer, no COLUMNS
 }
 narrow_pty 42
 if [ "$narrow_rc" = 0 ] && why=$(narrowck 42 6 14) && ! grep -q '#.*THEME' "$narrow_out" \
-   && grep -q '^  THEME$' "$narrow_out"; then
+   && grep -q '^  THEME CLI$' "$narrow_out"; then
     pass "a real 42-column tty stacks with COLUMNS unset"
 else fail "the tty's own width was ignored (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out")}"; fi
 
-# The title line opens the bare screen at every width, shaped like the
-# version subcommand's answer.
-if [ "$(head -1 "$narrow_out")" = "theme v$cur_ver" ]; then
-    pass "the narrow bare screen opens with 'theme v$cur_ver'"
-else fail "narrow title line wrong: $(head -1 "$narrow_out")"; fi
+# The header opens with the wallpaper's OWN name — no label, no title line —
+# and closes with the CLI version the `version` subcommand reports.
+if grep -q '^  narrow-check.*…$' "$narrow_out" && grep -q "^    v$cur_ver\$" "$narrow_out"; then
+    pass "the stacked header leads with the truncated name and ends with v$cur_ver"
+else fail "stacked header wrong: $(tail -3 "$narrow_out")"; fi
 narrow_run 100
-if [ "$(head -1 "$narrow_out")" = "theme v$cur_ver" ]; then
-    pass "the wide bare screen opens with 'theme v$cur_ver'"
-else fail "wide title line wrong: $(head -1 "$narrow_out")"; fi
+if grep -q '#.*narrow-check' "$narrow_out" && grep -q "THEME CLI *v$cur_ver" "$narrow_out"; then
+    pass "the wide header carries the name beside the image and ends with v$cur_ver"
+else fail "wide header wrong: $(tail -3 "$narrow_out")"; fi
 
 # --- no kitty, no protocol: absence is clean (portability doctrine) ---------
 # On an iTerm2-class terminal (no KITTY_WINDOW_ID) the screen must carry
@@ -1608,7 +1835,7 @@ env COLUMNS=42 KITTY_WINDOW_ID= PATH="$narrowbin:$sweepbin:$PATH" \
     THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
     "$THEME" >"$narrow_out" 2>&1
 if [ "$?" = 0 ] && ! grep -q "$(printf '\033_G')" "$narrow_out" \
-   && ! grep -q '#' "$narrow_out" && grep -q '^  THEME$' "$narrow_out" \
+   && ! grep -q '#' "$narrow_out" && grep -q '^  THEME CLI$' "$narrow_out" \
    && why=$(narrowck 42 0 0); then
     pass "no kitty means no graphics bytes, fields intact"
 else fail "non-kitty degradation leaked protocol: ${why:-$(tail -3 "$narrow_out")}"; fi

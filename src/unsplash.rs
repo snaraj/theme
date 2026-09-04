@@ -14,7 +14,15 @@ use crate::save::save_wallpaper;
 use crate::scratch;
 use crate::ui::{die, note};
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+/// The exact photo-page shapes `set` and `get` route here — one predicate,
+/// so the two dispatch arms can never drift apart.
+pub fn is_photo_page(arg: &str) -> bool {
+    arg.starts_with("https://unsplash.com/photos/")
+        || arg.starts_with("https://www.unsplash.com/photos/")
+}
 
 pub fn keychain_read(service: &str) -> Option<String> {
     let out = Command::new("security")
@@ -197,7 +205,10 @@ fn strip_photo_id(slug: &str) -> String {
     slug.to_string()
 }
 
-pub fn cmd_unsplash(cfg: &Config, arg: &str, flags: &mut Flags) {
+/// Download the photo `arg` selects into the library and return the saved
+/// path — no apply. `subdir` overrides the "unsplash" folder the download
+/// would otherwise be filed under (`theme get --mkdir`).
+pub fn fetch_unsplash(cfg: &Config, arg: &str, flags: &mut Flags, subdir: Option<&str>) -> PathBuf {
     if unsplash_key().is_none() {
         die(NO_KEY);
     }
@@ -216,7 +227,7 @@ pub fn cmd_unsplash(cfg: &Config, arg: &str, flags: &mut Flags) {
         match path {
             Some(p) if !p.is_empty() => {}
             _ => die(
-                "only https://unsplash.com/photos/… links work here — for other links use: theme url",
+                "only https://unsplash.com/photos/… links work here — for other links use: theme set",
             ),
         }
         pick = arg.rsplit("/photos/").next().unwrap_or("").to_string();
@@ -341,7 +352,14 @@ pub fn cmd_unsplash(cfg: &Config, arg: &str, flags: &mut Flags) {
         photo.name,
         flags.hint_suffix()
     );
-    let saved = save_wallpaper(cfg, &tmp, &mime, &hint, "unsplash", &flags.source_url);
+    let saved = save_wallpaper(
+        cfg,
+        &tmp,
+        &mime,
+        &hint,
+        subdir.unwrap_or("unsplash"),
+        &flags.source_url,
+    );
     scratch::done(&tmp);
     // The served file carries no EXIF (the CDN strips it) — persist the
     // capture-time facts as theme.* xattrs so preview can render them.
@@ -372,6 +390,11 @@ pub fn cmd_unsplash(cfg: &Config, arg: &str, flags: &mut Flags) {
     if !photo.who.is_empty() {
         note(&format!("photo by {} on Unsplash", photo.who));
     }
+    saved
+}
+
+pub fn cmd_unsplash(cfg: &Config, arg: &str, flags: &mut Flags) {
+    let saved = fetch_unsplash(cfg, arg, flags, None);
     use_image(cfg, &saved, flags.desktop_only);
 }
 

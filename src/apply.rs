@@ -42,20 +42,28 @@ fn have(cmd: &str) -> bool {
     std::env::split_paths(&path).any(|d| d.join(cmd).is_file())
 }
 
-pub fn set_desktop(cfg: &Config, img: &Path) {
+/// Set the desktop. `Err` means the picture IS on the active Space but not
+/// on the others — a partial apply, which the caller owes an exit status
+/// (see [`settle`]) once it has finished the palette work.
+pub fn set_desktop(cfg: &Config, img: &Path) -> Result<(), String> {
     if cfg.no_apply {
         note(&format!(
             "[no-apply] would set the desktop wallpaper to {}",
             img.display()
         ));
-        return;
+        return Ok(());
     }
     if have("wallpaper") {
+        // The helper reaches only the ACTIVE Space of each screen, so note
+        // when it started: spaces::sync_all_spaces tells the record it wrote
+        // from an older one by that instant.
+        #[cfg(target_os = "macos")]
+        let started = std::time::SystemTime::now();
         // fill = cover the screen and crop the overflow — never letterbox.
         let filled = Command::new("wallpaper")
             .args(["set"])
             .arg(img)
-            .args(["--scale", "fill"])
+            .args(["--scale", "fill", "--screen", "all"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -63,6 +71,7 @@ pub fn set_desktop(cfg: &Config, img: &Path) {
             let plain = Command::new("wallpaper")
                 .arg("set")
                 .arg(img)
+                .args(["--screen", "all"])
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
@@ -70,6 +79,11 @@ pub fn set_desktop(cfg: &Config, img: &Path) {
                 die(&format!("wallpaper set failed for {}", img.display()));
             }
         }
+        // Not fatal HERE — the palette must still apply, so the failure
+        // travels back as an Err instead of dying mid-apply — but it does
+        // reach the exit status.
+        #[cfg(target_os = "macos")]
+        crate::spaces::sync_all_spaces(img, started)?;
     } else if std::env::var("XDG_CURRENT_DESKTOP")
         .map(|v| !v.is_empty())
         .unwrap_or(false)
@@ -87,6 +101,17 @@ pub fn set_desktop(cfg: &Config, img: &Path) {
         note(
             "desktop wallpaper not supported here (install the 'wallpaper' brew formula, feh, or GNOME)",
         );
+    }
+    Ok(())
+}
+
+/// Speak [`set_desktop`]'s verdict LAST, once the palette and the `now:`
+/// line are done: a wallpaper that reached only the Space you happen to be
+/// looking at is a partial apply, and a partial apply may not hand back a
+/// zero exit status.
+pub fn settle(desktop: Result<(), String>) {
+    if let Err(e) = desktop {
+        die(&format!("desktop set on the active Space only: {e}"));
     }
 }
 
@@ -330,7 +355,7 @@ pub fn set_palette(cfg: &Config, img: &Path) {
 
 /// Apply `img` everywhere (or desktop-only), then say what is now current.
 pub fn use_image(cfg: &Config, img: &Path, desktop_only: bool) {
-    set_desktop(cfg, img);
+    let desktop = set_desktop(cfg, img);
     if !desktop_only {
         set_palette(cfg, img);
     }
@@ -342,13 +367,36 @@ pub fn use_image(cfg: &Config, img: &Path, desktop_only: bool) {
         format!(" ({size})")
     };
     note(&format!("now: {name}{suffix}"));
+    settle(desktop);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{osc_color, osc_sequences, own_socket, wait_capped};
+    use super::{osc_color, osc_sequences, own_socket, set_desktop, wait_capped};
+    use crate::config::Config;
     use pigment::{Mode, Palette, Rgb, effective_background};
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    /// A wallpaper that reached only the active Space is a partial apply, so
+    /// set_desktop answers with a Result the caller must settle. Under
+    /// no-apply there is nothing to sync and nothing to touch: Ok, and the
+    /// desktop is never approached.
+    #[test]
+    fn no_apply_set_desktop_answers_ok() {
+        let nowhere = PathBuf::from("/nonexistent/theme-apply-test");
+        let cfg = Config {
+            wallpaper_dirs: vec![nowhere.clone()],
+            wallpaper_dirs_display: String::new(),
+            cache_dir: nowhere.clone(),
+            kitty_dir: nowhere.clone(),
+            current: nowhere.join("current-theme.conf"),
+            formats: vec!["jpg".into()],
+            contrast: 4.5,
+            no_apply: true,
+        };
+        assert!(set_desktop(&cfg, &nowhere.join("x.jpg")).is_ok());
+    }
 
     /// A theme apply must never hang on a terminal: a child that outlives its
     /// deadline is killed and reaped, and the call returns near the deadline.

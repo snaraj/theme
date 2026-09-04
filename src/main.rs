@@ -21,6 +21,10 @@ mod net;
 mod report;
 mod save;
 mod scratch;
+mod search;
+/// The per-Space wallpaper store is macOS-only machinery.
+#[cfg(target_os = "macos")]
+mod spaces;
 mod ui;
 mod unsplash;
 mod update;
@@ -79,6 +83,11 @@ fn main() {
             _ => {}
         }
     }
+    // --mkdir belongs to one verb, and it is refused here for the same
+    // reason: `theme rm victim --mkdir x` must delete nothing.
+    if !flags.mkdir.is_empty() && cmd != "get" {
+        die("--mkdir is a 'theme get' flag");
+    }
     if want_help {
         let code = help::usage_cmd(&cfg, cmd);
         scratch::cleanup();
@@ -93,11 +102,9 @@ fn main() {
             // path, anything else is a library name.
             let arg = args.get(1).map(String::as_str).unwrap_or("");
             if arg.is_empty() {
-                die("usage: theme set <image | url>");
+                die("usage: theme set <image | link>");
             }
-            if arg.starts_with("https://unsplash.com/photos/")
-                || arg.starts_with("https://www.unsplash.com/photos/")
-            {
+            if unsplash::is_photo_page(arg) {
                 unsplash::cmd_unsplash(&cfg, arg, &mut flags);
             } else if arg.contains("://") {
                 urlcmd::cmd_url(&cfg, arg, &mut flags);
@@ -124,11 +131,38 @@ fn main() {
                 }
             }
         }
-        "url" => {
-            let arg = args.get(1).map(String::as_str).unwrap_or("").to_string();
-            urlcmd::cmd_url(&cfg, &arg, &mut flags);
+        "get" => {
+            // The library half of `set`: same sources, same saver, and then
+            // it STOPS — the file lands and is shown, nothing is applied.
+            if args.len() != 2 {
+                die("theme get takes exactly one link");
+            }
+            let arg = args[1].as_str();
+            if !arg.contains("://") {
+                die(
+                    "usage: theme get <link> [--mkdir <folder>]   (links only — a library name has nothing to download)",
+                );
+            }
+            let sub: Option<String> = (!flags.mkdir.is_empty()).then(|| flags.mkdir.clone());
+            let saved = if unsplash::is_photo_page(arg) {
+                unsplash::fetch_unsplash(&cfg, arg, &mut flags, sub.as_deref())
+            } else {
+                urlcmd::fetch_url(&cfg, arg, &mut flags, sub.as_deref())
+            };
+            report::cmd_preview(&cfg, Some(&saved.to_string_lossy()));
         }
+        "url" => die("theme url was folded into theme set — run: theme set <link>"),
         "list" | "ls" => report::cmd_list(&cfg, flags.verbose, flags.list_n),
+        "search" => {
+            // Same kubectl-style root as unsplash: bare `theme search` is the
+            // command's help, not a whole-library dump.
+            if args.len() < 2 {
+                let code = help::usage_cmd(&cfg, "search");
+                scratch::cleanup();
+                std::process::exit(code);
+            }
+            search::cmd_search(&cfg, &args[1..], flags.list_n);
+        }
         "preview" => {
             let positional = args.get(1).map(String::as_str);
             let by_flag = if flags.wallpaper.is_empty() {
@@ -151,13 +185,7 @@ fn main() {
             }
             commands::cmd_rm(&cfg, &args[1..]);
         }
-        "version" | "--version" | "-V" => {
-            // Compile-time version — no runtime lookups.
-            println!(
-                "version: v{}\ngithub: https://github.com/snaraj/theme\nmaintainer: Samuel Naranjo",
-                env!("CARGO_PKG_VERSION")
-            );
-        }
+        "version" | "--version" | "-V" => update::cmd_version(&cfg),
         "help" | "-h" | "--help" => help::usage(&cfg),
         other => die(&format!(
             "unknown command '{other}' — run 'theme help' for the list"

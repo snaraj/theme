@@ -1,5 +1,7 @@
-//! `theme url`: a direct image URL or any og:image page (Pinterest pins),
-//! validated by CONTENT, saved through the descriptor-bound saver, applied.
+//! The link path behind `set` and `get`: a direct image URL or any og:image
+//! page (Pinterest pins), validated by CONTENT, saved through the
+//! descriptor-bound saver. Fetching and applying are separate — `get` stops
+//! at the saved file.
 
 use crate::apply::use_image;
 use crate::config::Config;
@@ -9,7 +11,7 @@ use crate::net::{fetch_img, host_label, mime_of, url_host};
 use crate::save::save_wallpaper;
 use crate::ui::{die, note};
 use crate::{scratch, timestamp};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A descriptive filename hint from a URL: its basename, or — when that
 /// carries no letters at all — the whole host-and-path.
@@ -112,9 +114,12 @@ fn attr(tag: &str, name: &str) -> Option<String> {
     }
 }
 
-pub fn cmd_url(cfg: &Config, link: &str, flags: &mut Flags) {
+/// Download `link` into the library and return the saved path — no apply.
+/// `subdir` overrides the provider label the download would otherwise be
+/// filed under (`theme get --mkdir`).
+pub fn fetch_url(cfg: &Config, link: &str, flags: &mut Flags, subdir: Option<&str>) -> PathBuf {
     if link.is_empty() {
-        die("usage: theme url <image-url | pinterest-pin-url>");
+        die("usage: theme set <image-url | pinterest-pin-url>");
     }
     flags.source_url = link.to_string();
     let tmp = scratch::new();
@@ -182,10 +187,15 @@ pub fn cmd_url(cfg: &Config, link: &str, flags: &mut Flags) {
     }
     // Route the download into its provider's subfolder; an unrecognized
     // host keeps the library root.
-    let sub = url_host(&link).and_then(|h| host_label(&h)).unwrap_or("");
+    let sub = subdir.unwrap_or_else(|| url_host(&link).and_then(|h| host_label(&h)).unwrap_or(""));
     let hint = format!("{hint}{}", flags.hint_suffix());
     let saved = save_wallpaper(cfg, &tmp, &mime, &hint, sub, &flags.source_url);
     scratch::done(&tmp);
+    saved
+}
+
+pub fn cmd_url(cfg: &Config, link: &str, flags: &mut Flags) {
+    let saved = fetch_url(cfg, link, flags, None);
     use_image(cfg, &saved, flags.desktop_only);
 }
 

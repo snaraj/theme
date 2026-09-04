@@ -35,7 +35,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             (
                 "set",
-                "apply a wallpaper: local name/path, or any actionable link",
+                "apply a wallpaper: library name/path, image URL, Pinterest pin, or Unsplash photo page",
             ),
             (
                 "random",
@@ -46,8 +46,8 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
                 "Unsplash photos: search, page-url, random; auth and status",
             ),
             (
-                "url",
-                "download a direct image URL or Pinterest pin, save it, apply it",
+                "get",
+                "download a link into the library and preview it, without applying",
             ),
         ],
     ),
@@ -61,6 +61,10 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             (
                 "preview",
                 "one wallpaper up close: picture, colorscheme, title, location",
+            ),
+            (
+                "search",
+                "fuzzy search across titles, folders, artists, places, colors, sizes, dates",
             ),
             (
                 "rename",
@@ -77,7 +81,10 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
                 "update",
                 "replace this binary with the latest release (verified)",
             ),
-            ("version, -V", "version, repository, and maintainer"),
+            (
+                "version, -V",
+                "version, repository, maintainer — and whether a newer release exists",
+            ),
             ("help", "this text (per-command: theme <command> --help)"),
         ],
     ),
@@ -92,6 +99,10 @@ const FLAGS: &[(&str, &str)] = &[
     (
         "--desktop-only",
         "set the desktop wallpaper only; terminal colors stay",
+    ),
+    (
+        "--mkdir <folder>",
+        "get only: save into this library subfolder, created if missing",
     ),
 ];
 
@@ -172,9 +183,10 @@ pub fn usage(cfg: &Config) {
         Some(d) => display_text(d.file_stem().and_then(|s| s.to_str()).unwrap_or("")),
         None => "<none>".into(),
     };
-    // The title line opens every bare screen — the same compile-time
-    // version the `version` subcommand reports.
-    println!("theme v{}", env!("CARGO_PKG_VERSION"));
+    // The wallpaper's own name opens the header, unlabelled; the CLI's
+    // version closes it as the last field — the same compile-time answer
+    // the `version` subcommand gives.
+    let ver = format!("v{}", env!("CARGO_PKG_VERSION"));
     let cols = columns();
     let desk_file = desk.as_deref().filter(|d| d.is_file());
     if cols >= SIDE_MIN {
@@ -191,15 +203,16 @@ pub fn usage(cfg: &Config) {
             };
             format!("{}{tail}", swatch_row(&eight))
         };
+        // The name row spans the label column too, so it gets those 13
+        // cells back on top of a value's width.
         let availw = cols.saturating_sub(18 + 13).max(12);
-        let name = truncate_ellipsis(&name, availw);
         let rlines = [
             String::new(),
-            format!("{:<12} {}", "THEME", name),
+            truncate_ellipsis(&name, availw + 13),
             format!("{:<12} {}", "COLORSCHEME", sw),
             format!("{:<12} {}", "TERMINAL", term),
             format!("{:<12} {}", "OS", os),
-            String::new(),
+            format!("{:<12} {}", "THEME CLI", ver),
         ];
         let pv = desk_file.and_then(|d| render_preview(d, IMG_COLS, IMG_ROWS));
         match pv {
@@ -239,6 +252,8 @@ pub fn usage(cfg: &Config) {
         }
         println!();
         let vw = cols.saturating_sub(4).max(12);
+        // No label column to share here, so the name simply leads the block.
+        println!("  {}", truncate_ellipsis(&name, vw));
         let n = (cols.saturating_sub(4) / 4).clamp(1, 8);
         let sw = if eight.is_empty() {
             "<none>".to_string()
@@ -246,10 +261,10 @@ pub fn usage(cfg: &Config) {
             swatch_row(&eight[..n.min(eight.len())])
         };
         for (l, v) in [
-            ("THEME", truncate_ellipsis(&name, vw)),
             ("COLORSCHEME", sw),
             ("TERMINAL", term),
             ("OS", truncate_ellipsis(&os, vw)),
+            ("THEME CLI", ver),
         ] {
             println!("  {l}");
             println!("    {v}");
@@ -299,17 +314,20 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
 "
         ),
         "set" => print!(
-            "theme set <image | url> [--rotate left|right] [--extend[=RRGGBB]]
+            "theme set <image | link> [--rotate left|right] [--extend[=RRGGBB]]
 
-  Apply a specific wallpaper: desktop + palette + kitty. <image> is a
-  path or a name under {wdir} (extension optional). set also
-  understands actionable links: an unsplash.com/photos/… page routes
-  through 'theme unsplash', any other URL through 'theme url'.
+  Apply a wallpaper: desktop + palette + kitty. <image> is a path or a
+  name under {wdir} (extension optional). A link is downloaded first —
+  an unsplash.com/photos/… page, a direct image URL, or an og:image
+  page (Pinterest pins), whose i.pinimg.com /NNNx/ downscales upgrade
+  to the full-resolution /originals/. The desktop is set in fill mode
+  (crop to cover, never letterbox bars); --rotate turns a portrait pin
+  90° into a landscape, --extend centres flat art on a matching canvas.
 
   Examples:
     theme set spain-city-mountains
     theme set nebulosa-red.png --extend
-    theme set https://unsplash.com/photos/a-computer-screen-with-a-wave-on-it-mOpfECCgeC4
+    theme set https://www.pinterest.com/pin/300685712645323833/
 "
         ),
         "unsplash" => print!(
@@ -340,22 +358,16 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
     theme unsplash auth
 "
         ),
-        "url" => print!(
-            "theme url <link> [--rotate left|right]
+        "get" => print!(
+            "theme get <link> [--mkdir <folder>] [--rotate left|right]
 
-  Download an image from a direct URL or a Pinterest pin page, save it
-  into {wdir}, then apply it (desktop + palette + kitty).
-
-  Sharpness: direct i.pinimg.com /NNNx/ downscales are auto-upgraded to
-  the full-resolution /originals/ variant when it exists, and the desktop
-  is set in fill mode (crop to cover — never letterbox bars).
-  --rotate turns a portrait pin 90° into a landscape before applying.
-  --extend centres flat-background art on a matching-color canvas instead.
+  Download a link into {wdir} and preview what landed — no desktop, no
+  palette, no terminal change. Same links as 'theme set'. --mkdir files
+  the download under a library subfolder of your own, created if missing.
 
   Examples:
-    theme url https://www.pinterest.com/pin/300685712645323833/
-    theme url https://i.pinimg.com/1200x/39/76/d8/3976d….jpg --rotate right
-    theme url https://i.pinimg.com/736x/cc/a1/35/cca13….jpg --extend
+    theme get https://unsplash.com/photos/winged-person…-coy_MhYMLHs --mkdir studies
+    theme get https://i.pinimg.com/1200x/39/76/d8/3976d….jpg --rotate right
 "
         ),
         "list" | "ls" => print!(
@@ -393,6 +405,23 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
     theme preview
     theme preview neon-pink-and-purple-light-particles
     theme preview -w trees-on-forest…
+"
+        ),
+        "search" => print!(
+            "theme search <term…> [-n <count> | --all]
+
+  Rank the wallpapers in {wdir} by how well they answer your terms
+  and show what matched. Every fact a file has is searched — title,
+  folder, format, size, shape (landscape/portrait/4k), bytes, date
+  added, source, artist, published, camera, place, license, palette
+  colors (red, blue, dark…) — exactly, at a word start, anywhere
+  inside, or as scattered letters. EVERY term must land somewhere,
+  so terms narrow; a #rrggbb term matches a palette that close.
+  Newest 10 by default; -n <count> or --all widens it.
+
+  Examples:
+    theme search neon blue
+    theme search unsplash portrait 2026-08
 "
         ),
         "status" => print!(
@@ -446,13 +475,25 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
   versions may be unsupported or break (a downgrade says so before it
   proceeds), through the same verified pipeline.
 
-  The bare `theme` screen notes when a newer release exists (checked
-  at most once a day, silently); THEME_NO_UPDATE_CHECK=1 disables the
-  check. `theme update` itself always runs when you ask.
+  `theme version` (and the bare screen) says when a newer release
+  exists; `theme update` itself always runs when you ask.
 
   Examples:
     theme update
     theme update --version v0.1.0
+"
+        ),
+        "version" | "--version" | "-V" => print!(
+            "theme version        (aliases: theme --version, theme -V)
+
+  Print this build's version, the repository and the maintainer — and
+  whether it is the latest release. That answer comes from the same
+  check the bare screen uses: one bounded (2s) lookup a day at most,
+  cached; THEME_NO_UPDATE_CHECK=1 disables it. When the latest cannot
+  be reached the three plain lines print alone, never a guess.
+
+  Example:
+    theme version
 "
         ),
         "help" | "" => usage(cfg),

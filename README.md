@@ -36,17 +36,44 @@ mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 - `~/.local/bin` must be on your `PATH`.
 - Or build from source: `cargo build --release`.
 
+### Compatibility
+
+| Platform | glibc | Prebuilt binary | From source |
+| --- | --- | --- | --- |
+| macOS (Apple Silicon, Intel) | — | yes | yes |
+| Ubuntu 24.04 | 2.39 | yes | yes |
+| Fedora 44 | 2.43 | yes | yes |
+| Arch | 2.44 | yes | yes |
+| Debian 12 | 2.36 | no | yes |
+| Ubuntu 22.04 | 2.35 | no | yes |
+| Alpine 3 (musl) | — | no | yes |
+
+The prebuilt Linux binaries inherit the glibc floor of the runner that
+builds them — 2.39 today — so a distribution below that line builds from
+source, as musl systems do. Every Linux row was checked on 2026-09-03 in a
+container on x86_64 and arm64 (Arch on x86_64, the only architecture it
+publishes an image for): the release tarball for the prebuilt column, a
+source build and the whole `tests/boundary.sh` fixture for the other.
+`tests/linux-matrix.sh` re-runs the prebuilt half against the current
+release.
+
 ## Use
 
 `theme help` is the reference. In brief:
 
 ```
-theme random | set <name> | unsplash [query|page-url] | url <link>
-theme list | preview [-w] <name> | status | update | version | rename | rm
+theme random | set <name|link> | unsplash [query|page-url] | get <link>
+theme list | search <terms> | preview [-w] <name> | status | update | version | rename | rm
 ```
 
 `--rotate left|right`, `--extend[=hex]`, and `--desktop-only` (wallpaper
-without recoloring the terminal) are accepted anywhere.
+without recoloring the terminal) are accepted anywhere; `--mkdir <folder>`
+files a `get` download under a library subfolder of your own.
+
+macOS 14 and later keep a wallpaper per Mission Control Space, and the system
+tools change only the Space you are looking at. `theme` applies the image to
+every Space on every display and seeds the all-Spaces fallback, so Spaces you
+create later inherit it too. Your screensaver choices are left alone.
 
 ## Terminals
 

@@ -209,26 +209,27 @@ fn fetch_release(url: &str, max_time: &str) -> Option<Json> {
     String::from_utf8(body).ok().and_then(|s| Json::parse(&s))
 }
 
-/// The update-available footer on the bare `theme` screen. Silent on every
-/// failure mode — offline, rate-limited, bad JSON, malformed cache — and
-/// printed ONLY when the cached latest is strictly newer than this build.
-/// THEME_NO_UPDATE_CHECK (non-empty) disables the check and the note.
+/// The latest published release, as a strict triple — or None whenever it
+/// cannot be KNOWN: the kill-switch (THEME_NO_UPDATE_CHECK, non-empty) is
+/// set, custody refuses the cache dir, no trusted transport exists, the
+/// fetch failed, or the cache is malformed. Callers render silence on
+/// None; none of them may guess.
 ///
-/// Speed contract: the note reads one small cache file. At most one
-/// bounded refresh (2s hard cap) runs per [`CHECK_TTL`] window, and the
-/// attempt is stamped even on failure so an offline machine pays it once
-/// per window, not per run. Every cache touch — read and stamp alike —
-/// goes through [`check_dir`]'s fail-closed custody.
-pub fn maybe_note(cfg: &Config) {
+/// Speed contract: one small cache file is read, and at most one bounded
+/// refresh (2s hard cap) runs per [`CHECK_TTL`] window — stamped even on
+/// failure, so an offline machine pays it once per window, not per run.
+/// Every cache touch — read and stamp alike — goes through [`check_dir`]'s
+/// fail-closed custody.
+pub fn latest_tag(cfg: &Config) -> Option<(u64, u64, u64)> {
     let off = std::env::var("THEME_NO_UPDATE_CHECK")
         .map(|v| !v.is_empty())
         .unwrap_or(false);
     if off {
-        return;
+        return None;
     }
     // Custody first: a cache dir that fails the fail-closed audit gets no
-    // read, no stamp, no note — and no network attempt either.
-    let Some(dirfd) = check_dir(cfg) else { return };
+    // read, no stamp, no answer — and no network attempt either.
+    let dirfd = check_dir(cfg)?;
     let (fresh, mut cached) = read_check(&dirfd);
     if !fresh {
         // No trusted transport ⇒ no network AND no stamp (decided, round
@@ -237,9 +238,7 @@ pub fn maybe_note(cfg: &Config) {
         // there is nothing to throttle and a masked window would only hide
         // a transport that recovers a minute later. A still-fresh cache
         // above renders fine without any transport at all.
-        if crate::net::trusted_curl().is_none() {
-            return;
-        }
+        crate::net::trusted_curl()?;
         let tag = fetch_release(&format!("{RELEASES_API}/latest"), "2")
             .and_then(|j| {
                 j.str_field("tag_name")
@@ -250,15 +249,53 @@ pub fn maybe_note(cfg: &Config) {
         write_check_at(&dirfd, &tag);
         cached = tag;
     }
-    // The cached tag is REMOTE data headed for a terminal: it renders only
-    // if it parses as a strict numeric semver triple, and both printed
-    // values are RECONSTRUCTED from the parsed numbers — a remote-supplied
-    // string or URL is never echoed.
-    if let Some((a, b, c)) = newer_than(cached.trim(), env!("CARGO_PKG_VERSION")) {
+    // The cached tag is REMOTE data: it survives only as a strict numeric
+    // semver triple, so nothing a caller prints is ever the cached string.
+    parse_v3(cached.trim())
+}
+
+/// This build's own version. `CARGO_PKG_VERSION` is a compile-time constant
+/// this crate controls, so None means a broken build, not remote data — and
+/// the comparisons below then stay silent rather than guess.
+fn current_v3() -> Option<(u64, u64, u64)> {
+    parse_v3(&format!("v{}", env!("CARGO_PKG_VERSION")))
+}
+
+/// The update-available footer on the bare `theme` screen. Silent on every
+/// failure mode — offline, rate-limited, bad JSON, malformed cache — and
+/// printed ONLY when the latest is strictly newer than this build. Both
+/// printed values are RECONSTRUCTED from the parsed numbers, so a
+/// remote-supplied string or URL is never echoed.
+pub fn maybe_note(cfg: &Config) {
+    let Some(cur) = current_v3() else { return };
+    if let Some((a, b, c)) = latest_tag(cfg).filter(|l| *l > cur) {
         println!(
             "\nupdate to the latest theme version: v{a}.{b}.{c} -> https://github.com/snaraj/theme/releases/tag/v{a}.{b}.{c}"
         );
         println!("to update run: theme update");
+    }
+}
+
+/// `theme version` — the release ledger's other question, which is why it
+/// lives beside `update`: the owner wants it to answer "am I current?", so
+/// it reads the SAME cached check the footer note uses. When the latest
+/// cannot be known, or this build runs ahead of it, the plain three lines
+/// print alone — a claim nothing can back is never made. The latest is
+/// reconstructed from its parsed triple, never echoed from the cache.
+pub fn cmd_version(cfg: &Config) {
+    const FACTS: &str = "github: https://github.com/snaraj/theme\nmaintainer: Samuel Naranjo";
+    let cur = env!("CARGO_PKG_VERSION");
+    match current_v3().zip(latest_tag(cfg)) {
+        Some((c, l)) if l > c => {
+            println!("update to the latest version by running 'theme update'");
+            println!("current version: v{}.{}.{}", c.0, c.1, c.2);
+            println!("latest version: v{}.{}.{}", l.0, l.1, l.2);
+            println!("{FACTS}");
+        }
+        Some((c, l)) if l == c => {
+            println!("you're currently on the latest version.\nversion: v{cur}\n{FACTS}")
+        }
+        _ => println!("version: v{cur}\n{FACTS}"),
     }
 }
 
@@ -346,7 +383,7 @@ fn check_dir(cfg: &Config) -> Option<rustix::fd::OwnedFd> {
 /// Root-down openat walk of an absolute, canonical path: every component
 /// opens O_NOFOLLOW|O_DIRECTORY relative to the previous fd, so a symlink
 /// racing in anywhere along the chain refuses instead of being followed.
-fn open_chain_nofollow(path: &Path) -> Option<rustix::fd::OwnedFd> {
+pub(crate) fn open_chain_nofollow(path: &Path) -> Option<rustix::fd::OwnedFd> {
     use std::path::Component;
     let mut comps = path.components();
     if comps.next() != Some(Component::RootDir) {
@@ -371,7 +408,7 @@ fn open_chain_nofollow(path: &Path) -> Option<rustix::fd::OwnedFd> {
 /// The fd-level custody predicate, pure over the stat so the foreign-owner
 /// arm is testable without root — the same trick own_socket's test uses
 /// for its unforgeable-uid branch.
-fn fd_custody_ok(st: &rustix::fs::Stat, my_uid: u32) -> bool {
+pub(crate) fn fd_custody_ok(st: &rustix::fs::Stat, my_uid: u32) -> bool {
     rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory
         && st.st_uid == my_uid
         && st.st_mode & 0o022 == 0
@@ -469,14 +506,6 @@ fn parse_v3(s: &str) -> Option<(u64, u64, u64)> {
     };
     let v = (next()?, next()?, next()?);
     parts.next().is_none().then_some(v)
-}
-
-/// The remote triple, if it is strictly newer than the running build —
-/// equal and older (dev build) both answer None, so no note renders.
-fn newer_than(cached: &str, current: &str) -> Option<(u64, u64, u64)> {
-    let r = parse_v3(cached)?;
-    let c = parse_v3(&format!("v{current}"))?;
-    (r > c).then_some(r)
 }
 
 /// A user-supplied `--version` value: `vX.Y.Z` or `X.Y.Z`, normalized to
@@ -957,14 +986,20 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
         assert!(parse_v3("v99999999999999999999.0.0").is_none()); // overflow
     }
 
+    /// The footer and `theme version` gate on ONE decision — the parsed
+    /// remote triple against this build's own — so it is pinned directly:
+    /// strictly newer offers the update, equal says "current", and nothing
+    /// unparseable ever reaches a comparison.
     #[test]
-    fn the_note_gate_fires_only_on_strictly_newer() {
-        assert_eq!(newer_than("v9.9.9", "0.0.1"), Some((9, 9, 9)));
-        assert_eq!(newer_than("v0.0.1", "0.0.1"), None); // equal
-        assert_eq!(newer_than("v0.0.0", "0.0.1"), None); // dev build newer
-        assert_eq!(newer_than("", "0.0.1"), None); // no data
-        assert_eq!(newer_than("v9.9.9junk", "0.0.1"), None); // malformed
-        assert_eq!(newer_than("v0.10.0", "0.9.9"), Some((0, 10, 0))); // numeric, not lexical
+    fn the_release_comparison_is_numeric_and_strict() {
+        let cur = Some((0, 0, 1));
+        assert!(parse_v3("v9.9.9") > cur);
+        assert_eq!(parse_v3("v0.0.1"), cur); // equal
+        assert!(parse_v3("v0.0.0") < cur); // dev build newer
+        assert_eq!(parse_v3(""), None); // no data
+        assert_eq!(parse_v3("v9.9.9junk"), None); // malformed
+        assert!(parse_v3("v0.10.0") > parse_v3("v0.9.9")); // numeric, not lexical
+        assert!(current_v3().is_some()); // this build's own version parses
     }
 
     #[test]
