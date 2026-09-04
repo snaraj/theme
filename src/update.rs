@@ -92,19 +92,15 @@ enum Install {
 /// Canonicalized to compare against a canonicalized exe; a directory that
 /// does not exist is simply not a candidate.
 fn cargo_bins() -> Vec<PathBuf> {
-    let mut cand: Vec<PathBuf> = Vec::new();
-    if let Ok(r) = std::env::var("CARGO_INSTALL_ROOT") {
-        cand.push(Path::new(&r).join("bin"));
-    }
-    if let Ok(h) = std::env::var("CARGO_HOME") {
-        cand.push(Path::new(&h).join("bin"));
-    }
-    if let Ok(h) = std::env::var("HOME") {
-        cand.push(Path::new(&h).join(".cargo").join("bin"));
-    }
-    cand.into_iter()
-        .filter_map(|p| std::fs::canonicalize(p).ok())
-        .collect()
+    [
+        ("CARGO_INSTALL_ROOT", "bin"),
+        ("CARGO_HOME", "bin"),
+        ("HOME", ".cargo/bin"),
+    ]
+    .iter()
+    .filter_map(|(var, sub)| std::env::var_os(var).map(|v| Path::new(&v).join(sub)))
+    .filter_map(|p| std::fs::canonicalize(p).ok())
+    .collect()
 }
 
 /// Pure over its inputs — the filesystem questions are the caller's — so
@@ -1166,62 +1162,35 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
     /// The route table: exe path, whether the cargo bins below are known,
     /// the two package-database answers, and the install this must be.
     #[test]
+    #[rustfmt::skip]
     fn the_install_route_reads_only_where_the_binary_lives() {
         use Install::{Cargo, Deb, File, Homebrew, Package, Rpm};
         // CARGO_INSTALL_ROOT/bin, CARGO_HOME/bin, HOME/.cargo/bin.
-        let cargo = [
-            PathBuf::from("/ci/root/bin"),
-            PathBuf::from("/home/u/.cargohome/bin"),
-            PathBuf::from("/home/u/.cargo/bin"),
-        ];
+        let cargo = ["/ci/root/bin", "/home/u/.cargohome/bin", "/home/u/.cargo/bin"].map(PathBuf::from);
         let cases: &[(&str, bool, bool, bool, Install)] = &[
             // Every Homebrew prefix, matched on COMPONENTS — so `Cellarium`
             // is not a keg, and another formula's keg shipping a `theme` is
             // not ours. A keg outranks both package databases.
-            (
-                "/opt/homebrew/Cellar/theme/0.3.0/bin/theme",
-                true,
-                true,
-                true,
-                Homebrew,
-            ),
-            (
-                "/usr/local/Cellar/theme/0.3.0/bin/theme",
-                false,
-                false,
-                false,
-                Homebrew,
-            ),
-            (
-                "/home/linuxbrew/.linuxbrew/Cellar/theme/1.0/bin/theme",
-                false,
-                false,
-                false,
-                Homebrew,
-            ),
-            ("/opt/Cellarium/theme/bin/theme", false, false, false, File),
-            (
-                "/opt/homebrew/Cellar/other/1.0/bin/theme",
-                false,
-                false,
-                false,
-                File,
-            ),
+            ("/opt/homebrew/Cellar/theme/0.3.0/bin/theme",            true,  true,  true,  Homebrew),
+            ("/usr/local/Cellar/theme/0.3.0/bin/theme",               false, false, false, Homebrew),
+            ("/home/linuxbrew/.linuxbrew/Cellar/theme/1.0/bin/theme", false, false, false, Homebrew),
+            ("/opt/Cellarium/theme/bin/theme",                        false, false, false, File),
+            ("/opt/homebrew/Cellar/other/1.0/bin/theme",              false, false, false, File),
             // Each cargo bin — and each one ONLY while it is on the list.
-            ("/ci/root/bin/theme", true, false, false, Cargo),
-            ("/ci/root/bin/theme", false, false, false, File),
-            ("/home/u/.cargohome/bin/theme", true, false, false, Cargo),
-            ("/home/u/.cargohome/bin/theme", false, false, false, File),
-            ("/home/u/.cargo/bin/theme", true, false, false, Cargo),
-            ("/home/u/.cargo/bin/theme", false, false, false, File),
+            ("/ci/root/bin/theme",                                    true,  false, false, Cargo),
+            ("/ci/root/bin/theme",                                    false, false, false, File),
+            ("/home/u/.cargohome/bin/theme",                          true,  false, false, Cargo),
+            ("/home/u/.cargohome/bin/theme",                          false, false, false, File),
+            ("/home/u/.cargo/bin/theme",                              true,  false, false, Cargo),
+            ("/home/u/.cargo/bin/theme",                              false, false, false, File),
             // A distro bin directory, named by whichever database exists.
-            ("/usr/bin/theme", false, true, false, Deb),
-            ("/usr/bin/theme", false, false, true, Rpm),
-            ("/usr/bin/theme", false, true, true, Deb),
-            ("/usr/bin/theme", false, false, false, Package),
+            ("/usr/bin/theme",                                        false, true,  false, Deb),
+            ("/usr/bin/theme",                                        false, false, true,  Rpm),
+            ("/usr/bin/theme",                                        false, true,  true,  Deb),
+            ("/usr/bin/theme",                                        false, false, false, Package),
             // Anything a person put somewhere themselves updates in place.
-            ("/usr/local/bin/theme", false, true, true, File),
-            ("/home/u/.local/bin/theme", false, true, true, File),
+            ("/usr/local/bin/theme",                                  false, true,  true,  File),
+            ("/home/u/.local/bin/theme",                              false, true,  true,  File),
         ];
         for (exe, known, deb, rpm, want) in cases {
             let bins: &[PathBuf] = if *known { &cargo } else { &[] };
