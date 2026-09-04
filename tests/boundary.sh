@@ -559,6 +559,111 @@ if run_nokitty "$lib" list 2>/dev/null | grep -q 'newest 10 of [0-9]* — more:'
 else fail "default list bound or footer missing"; fi
 rm -f "$lib"/bulk-*.jpg
 
+# --- ADDED and the newest-first order are a SYSCALL, not a spawn ------------
+# The sort key is a birth time in SECONDS, so the three files have to be born
+# in different seconds for their order to be a fact rather than a coincidence
+# — that is what the two sleeps buy. `stat` is shadowed by a counting stub:
+# the plain listing used to spend ~2·n·log₂n spawns of it on a key it never
+# printed, and must now spend none. The verbose listing keeps exactly one per
+# PRINTED date on macOS, where the date is spelled in LOCAL time.
+birthlib="$fixture/birthlib"; birthcache="$fixture/birthcache"
+statbin="$fixture/statbin"; statlog="$fixture/stat-spawns"
+mkdir -p "$birthlib" "$birthcache" "$statbin"
+png1x1 "$birthlib/born-first.png" 10 10 10
+sleep 1
+png1x1 "$birthlib/born-second.png" 20 20 20
+sleep 1
+png1x1 "$birthlib/born-third.png" 30 30 30
+cat >"$statbin/stat" <<EOS
+#!/bin/sh
+printf '%s\n' "\$*" >>"$statlog"
+exec /usr/bin/stat "\$@"
+EOS
+chmod +x "$statbin/stat"
+birth_run() { COLUMNS=200 THEME_WALLPAPER_DIR="$birthlib" THEME_CACHE_DIR="$birthcache" \
+    KITTY_WINDOW_ID='' THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
+    PATH="$statbin:$PATH" "$THEME" "$@"; }
+: >"$statlog"
+birth_order=$(birth_run list --all 2>/dev/null | grep -o 'born-[a-z]*')
+if [ "$birth_order" = "$(printf 'born-third\nborn-second\nborn-first')" ]; then
+    pass "the listing is newest-birth-first"
+else fail "birth order wrong: $(printf '%s' "$birth_order" | tr '\n' ' ')"; fi
+statn=$(wc -l <"$statlog" | tr -d ' ')
+if [ "$statn" = 0 ]; then pass "a plain listing spawns stat zero times"
+else fail "a plain listing spawned stat $statn times"; fi
+case "$(uname -s)" in
+    Darwin) want_added=$(/usr/bin/stat -f '%SB' -t '%Y-%m-%d' "$birthlib/born-third.png") ;;
+    *) want_added=$(date -u +%F) ;;
+esac
+: >"$statlog"
+got_added=$(birth_run list -v --all 2>/dev/null | grep 'born-third' | awk '{print $NF}')
+if [ "$got_added" = "$want_added" ]; then
+    pass "ADDED is the file's own birth date ($want_added)"
+else fail "ADDED said '$got_added', the birth date is '$want_added'"; fi
+statn=$(wc -l <"$statlog" | tr -d ' ')
+case "$(uname -s)" in
+    Darwin)
+        if [ "$statn" = 3 ]; then pass "a verbose listing spawns stat once per printed date"
+        else fail "a verbose listing spawned stat $statn times, not once per row"; fi ;;
+    *)
+        if [ "$statn" = 0 ]; then pass "a verbose listing spawns stat zero times"
+        else fail "a verbose listing spawned stat $statn times"; fi ;;
+esac
+
+# --- the desktop fact is asked ONCE per desktop change ---------------------
+# macOS keeps every Space's choice in ONE store file under HOME, so a fixture
+# HOME with a planted store is a whole desktop world. The helper's answer is
+# recorded against that file's IDENTITY: while it holds, `wallpaper get` (57
+# ms, the whole cost of the bare screen) must not run; when it moves, it must.
+if [ "$(uname -s)" = Darwin ]; then
+    dhome="$fixture/deskhome"; dcache="$fixture/deskcache"; dbin="$fixture/deskbin"
+    dstore="$dhome/Library/Application Support/com.apple.wallpaper/Store"
+    dran="$fixture/wallpaper-ran"
+    mkdir -p "$dstore" "$dcache" "$dbin"
+    printf 'store\n' >"$dstore/Index.plist"
+    cat >"$dbin/wallpaper" <<EOS
+#!/bin/sh
+: >"$dran"
+printf '%s\n' "$lib/tiny.png"
+EOS
+    chmod +x "$dbin/wallpaper"
+    desk_run() { HOME="$dhome" PATH="$dbin:$PATH" COLUMNS=400 KITTY_WINDOW_ID='' \
+        THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$dcache" THEME_NO_APPLY=1 \
+        TMPDIR="$fixture/tmpdir" "$THEME" "$@"; }
+    rm -f "$dran" "$dcache/desktop"
+    desk_cold=$(desk_run 2>&1)
+    if [ -e "$dran" ] && printf '%s' "$desk_cold" | grep -q '^  tiny$'; then
+        pass "with no record the helper is asked, and its answer opens the screen"
+    else fail "the first bare screen did not ask the helper"; fi
+    rm -f "$dran"
+    desk_warm=$(desk_run 2>&1)
+    if [ ! -e "$dran" ] && [ "$desk_warm" = "$desk_cold" ]; then
+        pass "an unchanged store answers from the record: no spawn, same screen"
+    else fail "the record was not used, or it changed the screen"; fi
+    rm -f "$dran"
+    if desk_run status 2>/dev/null | grep -q "current theme:   $lib/tiny.png" &&
+        [ ! -e "$dran" ]; then
+        pass "status reads the same record, and says the same thing"
+    else fail "status asked the helper again, or disagreed with the bare screen"; fi
+    # Whatever changes the desktop moves the store; the record expires with
+    # it — on the file's identity, never on a clock we keep ourselves.
+    printf 'store-has-moved\n' >"$dstore/Index.plist"
+    rm -f "$dran"
+    desk_moved=$(desk_run 2>&1)
+    if [ -e "$dran" ] && [ "$desk_moved" = "$desk_cold" ]; then
+        pass "a moved store re-asks the helper"
+    else fail "a moved store did not re-ask the helper"; fi
+    # A cache that cannot be written costs speed, never correctness.
+    rm -f "$dcache/desktop"
+    chmod 500 "$dcache"
+    rm -f "$dran"
+    desk_ro=$(desk_run 2>&1)
+    chmod 700 "$dcache"
+    if [ -e "$dran" ] && [ "$desk_ro" = "$desk_cold" ]; then
+        pass "an unwritable cache falls back to asking, with the same screen"
+    else fail "an unwritable cache broke the bare screen"; fi
+fi
+
 # --- the save path's trust chain, end-to-end through the binary -------------
 # (The check/use race windows and the forced-posix ACL predicate are driven
 # natively in src/save_tests.rs; these are the end-to-end shapes.)
@@ -896,11 +1001,6 @@ else fail "sanitizing removed the whole name, not just its control bytes"; fi
 # --- VALID HELP PATHS print ENVIRONMENT data safely ------------------------
 helpcache="$fixture/helpcache"
 mkdir -p "$helpcache"
-cat >"$sweepbin/uname" <<STUB
-#!/bin/bash
-printf '%s' "LinuxSAFE$oscpay"
-STUB
-chmod +x "$sweepbin/uname"
 help_bad=""
 help_all="$fixture/help.out"; : >"$help_all"
 help_run() { # $1 label, $2 TERM_PROGRAM, $3 TERM, $4… theme arguments
@@ -923,7 +1023,7 @@ if [ -n "$help_bad" ]; then
     fail "OSC reached the terminal from help:$help_bad"
 else pass "no help path emits environment data as terminal protocol"; fi
 help_missing=""
-for marker in 'hlibSAFE' 'TermSAFE' 'xtermSAFE' 'LinuxSAFE' \
+for marker in 'hlibSAFE' 'TermSAFE' 'xtermSAFE' \
     'Apply Commands' 'theme random' 'theme unsplash' 'theme rm' 'never elevates'; do
     grep -qF -- "$marker" "$help_all" || help_missing="$help_missing [$marker]"
 done
@@ -936,7 +1036,31 @@ kittyout=$(THEME_WALLPAPER_DIR="$sweeplib" THEME_CACHE_DIR="$helpcache" CONFIG_D
 if printf '%s' "$kittyout" | grep -qF -- "$(printf '\033]8;;https://sw.kovidgoyal.net/kitty/')"; then
     pass "the intentional kitty hyperlink survives sanitizing"
 else fail "sanitizing stripped the kitty hyperlink it was supposed to keep"; fi
-rm -f "$sweepbin/uname"
+
+# --- the OS row comes from the KERNEL, not from PATH -----------------------
+# `uname` ×2 and `sw_vers` were three of the bare screen's four spawns. The
+# row is uname(2) and a root-owned system plist now, so a planted pair on
+# PATH may not run and may not be printed — and the row must still answer.
+osbin="$fixture/osbin"
+mkdir -p "$osbin"
+for tool in uname sw_vers; do
+    cat >"$osbin/$tool" <<EOS
+#!/bin/sh
+: >"$fixture/os-tool-ran"
+printf 'PLANTED\n'
+EOS
+    chmod +x "$osbin/$tool"
+done
+rm -f "$fixture/os-tool-ran"
+os_out=$(THEME_WALLPAPER_DIR="$sweeplib" THEME_CACHE_DIR="$helpcache" COLUMNS=120 \
+    KITTY_WINDOW_ID='' THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
+    PATH="$osbin:$sweepbin:$PATH" "$THEME" help 2>&1)
+if [ ! -e "$fixture/os-tool-ran" ] && ! printf '%s' "$os_out" | grep -q PLANTED; then
+    pass "the OS row spawns neither uname nor sw_vers, and prints neither"
+else fail "the header still reads its OS facts through PATH"; fi
+if printf '%s' "$os_out" | grep -qE 'OS {2,}[A-Za-z]'; then
+    pass "the OS row still names this system"
+else fail "the OS row lost its value"; fi
 
 # --- a CONTRIBUTOR name is remote free text under the same threat model -----
 STUB_WHO=$(printf 'Contributor\033]52;c;UkVNT1RF\007')
@@ -1765,6 +1889,10 @@ narrow_out="$fixture/narrow.out"
 narrow_run() { # $1 COLUMNS, rest: theme args
     local c="$1"
     shift
+    # These cases ARE their own desktop world: the stub below is the helper
+    # whose answer they check, so no earlier case's recorded answer may
+    # stand in for it.
+    rm -f "$fixture/cache/desktop"
     env COLUMNS="$c" KITTY_WINDOW_ID=1 PATH="$narrowbin:$sweepbin:$PATH" \
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \

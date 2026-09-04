@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
-const STORE: &str = "Library/Application Support/com.apple.wallpaper/Store/Index.plist";
+pub(crate) const STORE: &str = "Library/Application Support/com.apple.wallpaper/Store/Index.plist";
 const PLUTIL: &str = "/usr/bin/plutil";
 const LAUNCHCTL: &str = "/bin/launchctl";
 const LS: &str = "/bin/ls";
@@ -313,6 +313,31 @@ fn same_file(a: &rustix::fs::Stat, b: &rustix::fs::Stat) -> bool {
         b.st_ctime,
         b.st_ctime_nsec,
     )
+}
+
+/// One top-level string from a SYSTEM property list that is already XML —
+/// `/System/Library/CoreServices/SystemVersion.plist`, whose `ProductVersion`
+/// is what `sw_vers` was spawned to read. Root-owned, read-only, and parsed
+/// by the same reader the store uses: no new parser, no new trust, no
+/// `plutil` (this file needs no conversion), and a ceiling orders of
+/// magnitude above the few hundred bytes it really holds.
+pub(crate) fn system_plist_string(path: &Path, key: &str) -> Option<String> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(64 * 1024)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    match parse_xml(std::str::from_utf8(&bytes).ok()?).ok()? {
+        Plist::Dict(entries) => entries
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| match v {
+                Plist::String(s) => Some(s),
+                _ => None,
+            }),
+        _ => None,
+    }
 }
 
 /// The store's bytes as a tree: Apple's converter, then our own parser.
