@@ -17,28 +17,28 @@
 class Theme < Formula
   desc "Wallpaper and terminal palette driven by one command"
   homepage "https://github.com/snaraj/theme"
-  version "0.3.0"
+  version "0.3.1"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/snaraj/theme/releases/download/v0.3.0/theme-aarch64-apple-darwin.tar.gz"
-      sha256 "cdd6aef3f3e9cd479e68ee9e05537a78078f5cf5738f77023e798dbfe7137ce2" # aarch64-apple-darwin
+      url "https://github.com/snaraj/theme/releases/download/v0.3.1/theme-aarch64-apple-darwin.tar.gz"
+      sha256 "1aee2a42f7ca66565f76167a4fb7f1ecb9198cc55392598306bba87405d5e704" # aarch64-apple-darwin
     end
     on_intel do
-      url "https://github.com/snaraj/theme/releases/download/v0.3.0/theme-x86_64-apple-darwin.tar.gz"
-      sha256 "23869698516dbd75f4f2834dd48d0e2f67d7d5290d99f5dd7e2182d3f051c9a6" # x86_64-apple-darwin
+      url "https://github.com/snaraj/theme/releases/download/v0.3.1/theme-x86_64-apple-darwin.tar.gz"
+      sha256 "d664d30caffd406171443d99a5714d7069f647d38324134360bd590f7d0beaaa" # x86_64-apple-darwin
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/snaraj/theme/releases/download/v0.3.0/theme-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "28b7fc3100e190fb9b73e883a625e7931d4ffd91618520c30798851d9d91230c" # aarch64-unknown-linux-gnu
+      url "https://github.com/snaraj/theme/releases/download/v0.3.1/theme-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "0b5429ae7662b6cac07a578d69edb0ac9e9b9c0e8fe2dce20c25fea087aae6a2" # aarch64-unknown-linux-gnu
     end
     on_intel do
-      url "https://github.com/snaraj/theme/releases/download/v0.3.0/theme-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "bee4dbe9f33074710e588168fa7696eacb94acac6a62395c43ae5262275693cd" # x86_64-unknown-linux-gnu
+      url "https://github.com/snaraj/theme/releases/download/v0.3.1/theme-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "e2c7346d9c6343eb2329c6fabf054e9ba45f6557d5cd8390041fefdeb138c209" # x86_64-unknown-linux-gnu
     end
   end
 
