@@ -487,10 +487,10 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
             "theme version        (aliases: theme --version, theme -V)
 
   Print this build's version, the repository and the maintainer — and
-  whether it is the latest release. That answer comes from the same
-  check the bare screen uses: one bounded (2s) lookup a day at most,
-  cached; THEME_NO_UPDATE_CHECK=1 disables it. When the latest cannot
-  be reached the three plain lines print alone, never a guess.
+  whether it is the latest release. That answer is asked LIVE on every
+  call (one bounded 5s lookup; THEME_NO_UPDATE_CHECK=1 disables it),
+  never read from the bare screen's day-old cache. When the latest
+  cannot be reached the three plain lines print alone, never a guess.
 
   Example:
     theme version

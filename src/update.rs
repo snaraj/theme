@@ -332,18 +332,30 @@ fn fetch_release(url: &str, max_time: &str) -> Option<Json> {
     String::from_utf8(body).ok().and_then(|s| Json::parse(&s))
 }
 
+/// The CACHED answer, the footer note's contract: one small cache file is
+/// read, and at most one bounded refresh (2s hard cap) runs per
+/// [`CHECK_TTL`] window — stamped even on failure, so an offline machine
+/// pays it once per window, not per run.
+pub fn latest_tag(cfg: &Config) -> Option<(u64, u64, u64)> {
+    latest_tag_with(cfg, false)
+}
+
 /// The latest published release, as a strict triple — or None whenever it
 /// cannot be KNOWN: the kill-switch (THEME_NO_UPDATE_CHECK, non-empty) is
 /// set, custody refuses the cache dir, no trusted transport exists, the
 /// fetch failed, or the cache is malformed. Callers render silence on
-/// None; none of them may guess.
+/// None; none of them may guess. Every cache touch — read and stamp alike
+/// — goes through [`check_dir`]'s fail-closed custody.
 ///
-/// Speed contract: one small cache file is read, and at most one bounded
-/// refresh (2s hard cap) runs per [`CHECK_TTL`] window — stamped even on
-/// failure, so an offline machine pays it once per window, not per run.
-/// Every cache touch — read and stamp alike — goes through [`check_dir`]'s
-/// fail-closed custody.
-pub fn latest_tag(cfg: &Config) -> Option<(u64, u64, u64)> {
+/// `live` is the deliberate question's mode (`theme version`, issue #42):
+/// the cache's freshness is never consulted, the trusted transport is
+/// required, and one bounded request runs on EVERY call — 5s, because a
+/// typed command may wait a moment where the bare screen may not.
+/// A usable tag stamps the shared cache so the footer benefits from the
+/// ask; a failed one stamps NOTHING — overwriting a good stamp with a
+/// failure would silence the footer for a whole TTL window — and returns
+/// None, so the caller makes no claim it cannot back.
+fn latest_tag_with(cfg: &Config, live: bool) -> Option<(u64, u64, u64)> {
     let off = std::env::var("THEME_NO_UPDATE_CHECK")
         .map(|v| !v.is_empty())
         .unwrap_or(false);
@@ -353,6 +365,16 @@ pub fn latest_tag(cfg: &Config) -> Option<(u64, u64, u64)> {
     // Custody first: a cache dir that fails the fail-closed audit gets no
     // read, no stamp, no answer — and no network attempt either.
     let dirfd = check_dir(cfg)?;
+    if live {
+        crate::net::trusted_curl()?;
+        let tag = fetch_release(&format!("{RELEASES_API}/latest"), "5").and_then(|j| {
+            j.str_field("tag_name")
+                .filter(|t| tag_shape_ok(t))
+                .map(str::to_string)
+        })?;
+        write_check_at(&dirfd, &tag);
+        return parse_v3(&tag);
+    }
     let (fresh, mut cached) = read_check(&dirfd);
     if !fresh {
         // No trusted transport ⇒ no network AND no stamp (decided, round
@@ -400,15 +422,18 @@ pub fn maybe_note(cfg: &Config) {
 }
 
 /// `theme version` — the release ledger's other question, which is why it
-/// lives beside `update`: the owner wants it to answer "am I current?", so
-/// it reads the SAME cached check the footer note uses. When the latest
-/// cannot be known, or this build runs ahead of it, the plain three lines
-/// print alone — a claim nothing can back is never made. The latest is
-/// reconstructed from its parsed triple, never echoed from the cache.
+/// lives beside `update`: the owner wants it to answer "am I current?", and
+/// a deliberate question gets a LIVE answer (issue #42 — a day-old stamp
+/// once said "latest" a minute after the next release). The shared cache is
+/// only WRITTEN here, never trusted: an unreachable API prints the plain
+/// three lines rather than repeating what the footer last heard. When the
+/// latest cannot be known, or this build runs ahead of it, the plain three
+/// lines print alone — a claim nothing can back is never made. The latest
+/// is reconstructed from its parsed triple, never echoed from the answer.
 pub fn cmd_version(cfg: &Config) {
     const FACTS: &str = "github: https://github.com/snaraj/theme\nmaintainer: Samuel Naranjo";
     let cur = env!("CARGO_PKG_VERSION");
-    match current_v3().zip(latest_tag(cfg)) {
+    match current_v3().zip(latest_tag_with(cfg, true)) {
         Some((c, l)) if l > c => {
             println!("update to the latest version by running 'theme update'");
             println!("current version: v{}.{}.{}", c.0, c.1, c.2);
