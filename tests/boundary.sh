@@ -645,6 +645,13 @@ EOS
         [ ! -e "$dran" ]; then
         pass "status reads the same record, and says the same thing"
     else fail "status asked the helper again, or disagreed with the bare screen"; fi
+    # PRINT-ONLY: `preview` with no name OPENS the file it is handed and
+    # renders its bytes, so it asks the helper every time — behind the very
+    # record the bare screen just answered from.
+    rm -f "$dran"
+    if desk_run preview >/dev/null 2>&1 && [ -e "$dran" ]; then
+        pass "preview with no name asks the helper, record or no record"
+    else fail "preview with no name read the recorded path"; fi
     # Whatever changes the desktop moves the store; the record expires with
     # it — on the file's identity, never on a clock we keep ourselves.
     printf 'store-has-moved\n' >"$dstore/Index.plist"
