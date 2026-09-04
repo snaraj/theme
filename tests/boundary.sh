@@ -151,6 +151,15 @@ check  "-n takes the largest count there is"   0 run "$lib" list -n 184467440737
 check  "-n refuses a count past usize"         1 run "$lib" list -n 18446744073709551616
 check  "-n refuses a wildly overflowing count" 1 run "$lib" list -n 184467440737095516160
 
+# A reader that has already gone must not leave a panic behind (#59): the
+# runtime's SIGPIPE default is restored, so EPIPE ends theme silently. The
+# reader exits at once; theme starts 200 ms later and writes into a pipe
+# nobody reads (before the fix: exit 101 + "failed printing to stdout").
+( sleep 0.2; run "$lib" list 2>"$fixture/pipe.err"; echo "$?" >"$fixture/pipe.rc" ) | true
+if [ ! -s "$fixture/pipe.err" ] && [ "$(cat "$fixture/pipe.rc")" != 101 ]; then
+    pass "list into a closed pipe ends silently"
+else fail "list into a closed pipe: rc=$(cat "$fixture/pipe.rc") $(tr '\n' ' ' <"$fixture/pipe.err" | cut -c1-120)"; fi
+
 # --- truncated/stem resolution: exactly ONE candidate or refuse ------------
 printf 'x' >"$lib/same-title.jpg"
 printf 'x' >"$lib/same-title.png"

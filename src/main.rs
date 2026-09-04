@@ -46,6 +46,14 @@ pub fn timestamp() -> String {
 }
 
 fn main() {
+    // Rust ignores SIGPIPE before main, so a reader that stops early
+    // (`theme list | head`) turned the next write into a println! panic
+    // (#59). The default disposition ends the process silently instead, as
+    // ls, grep and rg do; std's Command resets SIGPIPE in every child, so
+    // the tools theme spawns see no change. The one signal(2) call comes
+    // from the sigpipe crate: rustix has no safe binding for dispositions
+    // and this crate keeps deny(unsafe_code).
+    sigpipe::reset();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cfg = Config::from_env();
     // `update` owns its argv end-to-end: its grammar parses the RAW argv,
