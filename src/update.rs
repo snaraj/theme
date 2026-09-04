@@ -471,7 +471,8 @@ pub fn latest_tag(cfg: &Config) -> Option<(u64, u64, u64)> {
 ///
 /// Err carries the REASON, so the closing line can name it instead of
 /// leaving the reader to guess which of five things happened (#51). Two
-/// of those reasons never make a request, and say so.
+/// of those reasons never make a request, and say so. The kill switch is
+/// the CALLER's check — `cmd_version` returns before reaching here.
 fn latest_live(cfg: &Config) -> Result<(u64, u64, u64), String> {
     let dirfd = check_dir(cfg).ok_or("could not check")?;
     let tag = latest_tag_remote("2")?;
@@ -487,8 +488,8 @@ fn current_v3() -> Option<(u64, u64, u64)> {
 }
 
 /// The update-available footer on the bare `theme` screen. Silent on every
-/// failure mode — offline, rate-limited, bad JSON, malformed cache — and
-/// printed ONLY when the latest is strictly newer than this build. Both
+/// failure mode — offline, rate-limited, refused custody, malformed cache —
+/// and printed ONLY when the latest is strictly newer than this build. Both
 /// printed values are RECONSTRUCTED from the parsed numbers, so a
 /// remote-supplied string or URL is never echoed.
 pub fn maybe_note(cfg: &Config) {
@@ -785,8 +786,8 @@ fn parse_ver_arg(s: &str) -> Option<((u64, u64, u64), String)> {
     Some((v, format!("v{}.{}.{}", v.0, v.1, v.2)))
 }
 
-/// Release tags are API data: `v` + a short run of version characters,
-/// nothing else reaches a message or a comparison.
+/// Release tags are REMOTE data: `v` + a short run of version characters,
+/// nothing else reaches a message, a URL or a comparison.
 fn tag_shape_ok(t: &str) -> bool {
     t.len() <= 64
         && t.starts_with('v')
