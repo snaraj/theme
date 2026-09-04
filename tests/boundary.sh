@@ -1539,7 +1539,7 @@ else fail "the fresh-cache render needed a transport: $(tail -3 "$note_out")"; f
 # stamp: the owner's v0.3.0 binary said "you're on the latest" one minute
 # after v0.3.1 published, because `theme update` had stamped the shared
 # cache an hour earlier. Every call of the WORD asks now, and the cache is
-# only WRITTEN here; the three plain lines are flushed BEFORE the request,
+# only WRITTEN here; the three plain lines are written BEFORE the request,
 # so the facts never wait on GitHub, and one closing line follows. The
 # FLAG forms (-V, --version) are the banner scripts call and ask nothing at
 # all. Its own cache dir, stub, request log and ordering witness leave the
@@ -1609,7 +1609,7 @@ closes() { # the same three lines, then $1 as the fourth, and nothing after
 newer="latest release: v9.9.9 — update with 'theme update'"
 equal="you're on the latest release."
 ahead="latest release: v0.0.0"
-unknown="latest release: unknown (could not reach github.com)"
+unknown="latest release: unknown (could not check)"
 
 # THE SCREENSHOT (#42): a stamp fresh inside the TTL and naming this very
 # build, against a release published since. The cached answer is "latest";
@@ -1631,7 +1631,7 @@ else fail "version did not refresh the shared stamp: $(vercached)"; fi
 # The three lines must ALREADY be there — the facts never wait on GitHub.
 if [ "$(wc -l <"$verwit" | tr -d ' ')" = 3 ] \
    && [ "$(sed -n 1p "$verwit")" = "version: v$cur_ver" ]; then
-    pass "the three plain lines are flushed BEFORE the request is made"
+    pass "the three plain lines are written BEFORE the request is made"
 else fail "version withheld its output until the answer: $(cat "$verwit")"; fi
 # The FLAG forms are what scripts and other tools call: they print the
 # build and stop — no request, no witness, no stamp — and byte-for-byte

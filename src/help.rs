@@ -490,7 +490,7 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
   two flag forms print those three lines alone — no network, ever.
   `theme version` prints them first, then asks GitHub for the latest
   release (one bounded 2s lookup; THEME_NO_UPDATE_CHECK=1 disables it)
-  and closes with one line saying it, or that it could not be reached.
+  and closes with one line saying it, or that it could not check.
 
   Example:
     theme version

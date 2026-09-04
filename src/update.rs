@@ -452,20 +452,28 @@ pub fn cmd_version_plain() {
 /// stamp once said "latest" a minute after the next release). The shared
 /// cache is only WRITTEN here, never trusted.
 ///
-/// It STREAMS: the three lines `-V` would print land and flush FIRST, so
-/// the facts never wait on the network, and exactly one closing line
-/// follows when the ask resolves — including when it fails, which says so
-/// rather than leaving the reader to guess. The kill switch removes that
-/// line entirely. The latest is reconstructed from its parsed triple,
-/// never echoed from the answer.
+/// It STREAMS: the three lines `-V` would print are WRITTEN first, so the
+/// facts never wait on the network, and exactly one closing line follows
+/// when the ask resolves — including when it fails, which says so rather
+/// than leaving the reader to guess. The kill switch removes that line
+/// entirely. The latest is reconstructed from its parsed triple, never
+/// echoed from the answer.
 pub fn cmd_version(cfg: &Config) {
     print_facts();
+    // Insurance, not the mechanism: std's stdout is a LineWriter, so the
+    // three lines are already out at the newline for every sink this has —
+    // the explicit flush is what keeps that true if the sink ever stops
+    // being line-buffered.
     let _ = std::io::stdout().flush();
     if check_off() {
         return;
     }
     match (current_v3(), latest_tag_with(cfg, true)) {
-        (_, None) => println!("latest release: unknown (could not reach github.com)"),
+        // "could not check", not "could not reach": two of the three
+        // causes — refused custody, no trusted curl — never make a
+        // request, so naming the network would be a lie about what
+        // happened.
+        (_, None) => println!("latest release: unknown (could not check)"),
         (Some(c), Some(l)) if l > c => println!(
             "latest release: v{}.{}.{} — update with 'theme update'",
             l.0, l.1, l.2
