@@ -59,9 +59,9 @@ money, never trade away security.
   update, no delete, no force-push). One release slot, anchored by the tag
   ledger itself: a Draft claims the next unpublished `vX.Y.Z`; parallel
   Drafts each claim base+1, and declared merge order resolves who re-cuts.
-- A merge to main that moves the version in `Cargo.toml` publishes that
-  version; a dispatch on main or a pushed tag does the same by hand; a
-  dispatch on any other ref is a dry run.
+- A merge to main that moves `Cargo.toml` publishes after its Linux and macOS
+  CI jobs succeed. A dispatch on main requires the same exact-source CI
+  proof; other branch dispatches are dry runs. Tags never trigger publication.
 
 ## Code rules
 
