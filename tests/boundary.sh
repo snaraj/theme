@@ -1300,7 +1300,7 @@ upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
         PATH="$updd/stubbin:$PATH" \
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
-        "${envs[@]}" "$bin" update "$@" >"$upd_out" 2>&1
+        "${envs[@]}" "$bin" "${UPD_COMMAND:-update}" "$@" >"$upd_out" 2>&1
     upd_rc=$?
 }
 upd_intact() { # target still byte-identical to the run binary, no temp left
@@ -1632,6 +1632,9 @@ else fail "the environment channel leaked (rc=$upd_rc): $(cat "$upd_out")"; fi
 # stays empty and the binary byte-identical. (Copies of the debug build
 # stand in for the real installs; only the path decides.)
 UPD_BIN="$updd/Cellar/theme/0.0.0/bin/theme"
+tap_formula="$updd/Library/Taps/snaraj/homebrew-theme/Formula/theme.rb"
+mkdir -p "${tap_formula%/*}"
+printf '  version "9.9.9"\n' >"$tap_formula"
 upd_run UPD_TAG=v9.9.9
 if [ "$upd_rc" = 0 ] && grep -qF 'brew upgrade snaraj/theme/theme' "$upd_out"; then
     pass "a Homebrew keg is routed to brew"
@@ -1644,6 +1647,35 @@ if [ "$upd_rc" = 0 ] && grep -qF 'brew upgrade snaraj/theme/theme' "$upd_out" \
    && [ ! -s "$updlog" ] && upd_intact; then
     pass "--version cannot route around a keg"
 else fail "--version bypassed the keg route (rc=$upd_rc): $(cat "$upd_out")"; fi
+printf '  version "%s"\n' "$cur_ver" >"$tap_formula"
+upd_run
+if [ "$upd_rc" = 0 ] && grep -qF 'no Homebrew upgrade is available' "$upd_out" \
+   && ! grep -qF 'brew upgrade snaraj/theme/theme' "$upd_out" && [ ! -s "$updlog" ] && upd_intact; then
+    pass "a current local formula reports the unavailable Homebrew upgrade"
+else fail "stale formula still offers a no-op upgrade: $(cat "$upd_out")"; fi
+mkdir -p "$updd/standalone"
+UPD_COMMAND=upgrade
+upd_run UPD_TAG="v$cur_ver" -- --binary "$updd/standalone/theme"
+if [ "$upd_rc" = 0 ] && cmp -s "$updd/standalone/theme" "$inner" && upd_intact \
+   && grep -qF 'first in PATH' "$upd_out"; then
+    pass "upgrade --binary installs even the current version separately and preserves the keg"
+else fail "separate binary installation failed: $(cat "$upd_out")"; fi
+upd_run -- --binary "$updd/standalone/theme"
+if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ] && cmp -s "$updd/standalone/theme" "$inner" && upd_intact; then
+    pass "an occupied binary destination is refused before any transfer"
+else fail "binary destination was replaced: $(cat "$upd_out")"; fi
+for args in '--binary' '--binary relative/theme' '--binary /one/theme --binary /two/theme'; do
+    # These are fixed fixture arguments, intentionally word-split.
+    upd_run -- $args
+    if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ] && upd_intact; then
+        pass "upgrade rejects invalid binary arguments: $args"
+    else fail "invalid binary arguments were accepted: $args"; fi
+done
+upd_run -- --binary "$updd/Cellar/theme/0.0.0/bin/theme"
+if [ "$upd_rc" != 0 ] && [ ! -s "$updlog" ] && upd_intact; then
+    pass "--binary cannot overwrite a package-managed copy"
+else fail "--binary accepted a keg destination: $(cat "$upd_out")"; fi
+UPD_COMMAND=
 UPD_BIN="$updd/cargo/bin/theme"
 upd_run UPD_TAG=v9.9.9 CARGO_HOME="$updd/cargo"
 if [ "$upd_rc" = 0 ] \

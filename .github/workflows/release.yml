@@ -41,6 +41,7 @@ jobs:
       version: ${{ steps.slot.outputs.version }}
       publish: ${{ steps.slot.outputs.publish }}
       source_sha: ${{ steps.authorize.outputs.source_sha }}
+      authorized: ${{ steps.authorize.outputs.authorized }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -271,3 +272,33 @@ jobs:
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY"
           --verify-tag --title "theme $TAG"
           --generate-notes theme-*.tar.gz theme_*.deb theme-*.rpm SHA256SUMS
+
+  # Runs after publication AND on a formula-only merge. A released binary
+  # with a stale tap is an incomplete delivery and keeps this workflow red.
+  distribution:
+    needs: [slot, publish]
+    if: >-
+      always() && needs.slot.result == 'success' && needs.slot.outputs.authorized == 'true' &&
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    runs-on: macos-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.slot.outputs.source_sha }}
+          persist-credentials: false
+      - name: Verify delivery through GitHub and Homebrew
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.slot.outputs.version }}
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        run: |
+          python3 -I -B .github/scripts/verify_distribution.py --tag "$TAG"
+          brew trust --formula snaraj/theme/theme
+          brew tap snaraj/theme "$GITHUB_WORKSPACE"
+          brew install snaraj/theme/theme
+          brew test snaraj/theme/theme
+          echo "PUBLISHED_DELIVERY=PASS $TAG" >> "$GITHUB_STEP_SUMMARY"
