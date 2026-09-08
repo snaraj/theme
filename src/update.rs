@@ -158,6 +158,39 @@ fn classify(exe: &Path, cargo_bins: &[PathBuf], deb_installed: bool, rpm_db: boo
     Install::File
 }
 
+/// Read only this tap's fixed formula path; never execute Ruby or Homebrew.
+fn tap_version(exe: &Path) -> Option<(u64, u64, u64)> {
+    let prefix = exe
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == "Cellar"))?
+        .parent()?;
+    for library in ["Library", "Homebrew/Library"] {
+        let path = prefix
+            .join(library)
+            .join("Taps/snaraj/homebrew-theme/Formula/theme.rb");
+        let Ok(fd) = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) else {
+            continue;
+        };
+        let file = File::from(fd);
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut text = String::new();
+        file.take(SUMS_CAP).read_to_string(&mut text).ok()?;
+        let mut versions = text.lines().filter_map(|line| {
+            let v = line.trim().strip_prefix("version \"")?.strip_suffix('"')?;
+            parse_v3(&format!("v{v}"))
+        });
+        let version = versions.next()?;
+        return versions.next().is_none().then_some(version);
+    }
+    None
+}
+
 /// The managed-install answer, printed in the manager's own terms; true
 /// when it was given, false for a plain file install that falls through to
 /// the self-updater. Reads the exe path and two well-known package
@@ -173,11 +206,26 @@ fn route(exe: &Path) -> bool {
     match kind {
         Install::File => return false,
         Install::Homebrew => {
-            println!("theme here is a Homebrew keg ({p}) — Homebrew updates it:");
-            println!("  brew upgrade snaraj/theme/theme");
-            println!(
-                "(the tap's formula can trail a release until its bump merges; every build is at https://github.com/snaraj/theme/releases)"
-            );
+            println!("theme here is a Homebrew keg ({p}).");
+            match (tap_version(exe), current_v3()) {
+                (Some((a, b, c)), Some(current)) if (a, b, c) <= current => {
+                    println!(
+                        "The local tap offers v{a}.{b}.{c}; no Homebrew upgrade is available in this checkout."
+                    );
+                    println!(
+                        "A newer GitHub release needs a formula bump and a refreshed tap before Homebrew can install it."
+                    );
+                }
+                (Some((a, b, c)), _) => {
+                    println!("The local tap offers v{a}.{b}.{c} — install it with:");
+                    println!("  brew upgrade snaraj/theme/theme");
+                }
+                _ => {
+                    println!("Could not read this tap's version; Homebrew availability is unknown.")
+                }
+            }
+            println!("For the latest verified binary in a separate, new location:");
+            println!("  theme update --binary /absolute/path/to/theme");
         }
         // One sentence, one place to keep true; only the extension and the
         // manager's own install line differ.
@@ -207,7 +255,7 @@ fn route(exe: &Path) -> bool {
     true
 }
 
-pub fn cmd_update(cfg: &Config, want: &str) {
+pub fn cmd_update(cfg: &Config, want: &str, binary: Option<&str>) {
     // WHO OWNS THESE BYTES comes first — before the platform check, before
     // the transport check, before any network. A keg or a distro package
     // belongs to its manager (that route would otherwise fetch a whole
@@ -216,12 +264,16 @@ pub fn cmd_update(cfg: &Config, want: &str) {
     // binary can run there (musl), where the glibc tarball would install a
     // binary that cannot start. `theme version` and the bare screen still
     // say "run theme update": this is the one entry point, dispatching.
-    let target = std::env::current_exe()
+    let running = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .unwrap_or_else(|_| die("cannot resolve the running binary's path"));
-    if route(&target) {
+    if binary.is_none() && route(&running) {
         return;
     }
+    let target = match binary {
+        Some(path) => binary_target(Path::new(path)).unwrap_or_else(|e| die(&e)),
+        None => running,
+    };
     if TARGET.is_empty() {
         die("no published release build for this platform — build from source");
     }
@@ -263,7 +315,7 @@ pub fn cmd_update(cfg: &Config, want: &str) {
         // of truth shared with the update-available check. A --version fetch
         // must not: stamping an older tag would hide the real latest.
         write_check(cfg, &tag);
-        if tag.trim_start_matches('v') == current {
+        if binary.is_none() && tag.trim_start_matches('v') == current {
             println!("already up to date (v{current})");
             return;
         }
@@ -307,10 +359,34 @@ pub fn cmd_update(cfg: &Config, want: &str) {
     }
 
     verify_file(&staged, &expect_hex).unwrap_or_else(|e| die(&e));
-    install_over(&target, &staged).unwrap_or_else(|e| die(&e));
+    install_over(&target, &staged, binary.is_none()).unwrap_or_else(|e| die(&e));
     scratch::done(&staged);
     println!("theme v{current} → {tag}");
     println!("updated: {}", display_text(&target.display().to_string()));
+    if binary.is_some() {
+        println!(
+            "Run this path directly, or place its directory first in PATH. Other installations stay separate."
+        );
+    }
+}
+
+fn binary_target(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() || path.file_name().is_none_or(|n| n != "theme") {
+        return Err("--binary takes an absolute destination path ending in /theme".into());
+    }
+    let parent = std::fs::canonicalize(path.parent().ok_or("no destination directory")?)
+        .map_err(|_| "create the destination directory before using --binary")?;
+    crate::save::audit_chain(&parent, &crate::save::AclAudit::native())?;
+    let target = parent.join("theme");
+    if classify(&target, &cargo_bins(), false, false) != Install::File {
+        return Err(
+            "--binary destination belongs to a package manager; choose a separate directory".into(),
+        );
+    }
+    match std::fs::symlink_metadata(&target) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(target),
+        _ => Err("--binary requires a new path; to update an existing copy, run that copy's update command".into()),
+    }
 }
 
 /// The latest published tag, resolved from ONE request whose redirect is
@@ -1118,7 +1194,7 @@ fn unpack_single_member<R: Read>(r: &mut R, out: &mut impl Write, cap: u64) -> R
 /// fsync + the atomic rename(2) over the target. Any failure unlinks the
 /// temp and the target is untouched — there is no window where it is
 /// partial or unverified.
-fn install_over(target: &Path, tarball: &Path) -> Result<(), String> {
+fn install_over(target: &Path, tarball: &Path, replace: bool) -> Result<(), String> {
     let dir = target.parent().ok_or("install target has no directory")?;
     let name = target
         .file_name()
@@ -1126,6 +1202,15 @@ fn install_over(target: &Path, tarball: &Path) -> Result<(), String> {
         .ok_or("install target has no name")?;
     let dirfd = rustix::fs::open(dir, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .map_err(|e| format!("cannot open {}: {e}", dir.display()))?;
+    if !replace {
+        let st = rustix::fs::fstat(&dirfd).map_err(|e| e.to_string())?;
+        if !fd_custody_ok(&st, rustix::process::getuid().as_raw()) {
+            return Err(
+                "--binary needs a directory you own without group or world write access".into(),
+            );
+        }
+        crate::save::audit_dir(dir, &crate::save::AclAudit::native())?;
+    }
     let tmp_name = format!(".{name}.update.{}", std::process::id());
     let tmp = rustix::fs::openat(
         &dirfd,
@@ -1172,6 +1257,25 @@ fn install_over(target: &Path, tarball: &Path) -> Result<(), String> {
         return Err(format!("fsync failed: {e}"));
     }
     drop(tmp);
+    if !replace {
+        // Atomic no-clobber publication: an entry created during the download
+        // is refused too. Neither an existing file nor a symlink is replaced.
+        let result = rustix::fs::linkat(
+            &dirfd,
+            tmp_name.as_str(),
+            &dirfd,
+            name,
+            rustix::fs::AtFlags::empty(),
+        )
+        .map_err(|e| {
+            format!(
+                "cannot create {} ({e}); --binary never replaces an existing path",
+                target.display()
+            )
+        });
+        sweep();
+        return result;
+    }
     // rename(2), NEVER an in-place copy: macOS caches code-signing state by
     // vnode, and overwriting a previously-executed binary's inode poisons
     // it — the next exec dies SIGKILL. The rename swaps the directory entry
@@ -1496,7 +1600,7 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
         let target = d.join("theme");
         std::fs::write(&target, b"OLD").unwrap();
         let tb = tarball(&d, "theme", b"NEW-BINARY-BYTES");
-        install_over(&target, &tb).unwrap();
+        install_over(&target, &tb, true).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"NEW-BINARY-BYTES");
         #[cfg(unix)]
         {
@@ -1509,12 +1613,50 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
     }
 
     #[test]
+    fn a_separate_install_never_clobbers_an_existing_entry() {
+        let d = tempdir();
+        let target = d.join("theme");
+        let tb = tarball(&d, "theme", b"VERIFIED-NEW-COPY");
+        assert_eq!(binary_target(&target).unwrap(), target);
+        install_over(&target, &tb, false).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"VERIFIED-NEW-COPY");
+        assert!(binary_target(&target).is_err());
+        std::fs::write(&target, b"EXISTING-COPY").unwrap();
+        assert!(install_over(&target, &tb, false).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"EXISTING-COPY");
+        std::fs::remove_file(&target).unwrap();
+        let separate = d.join("separate");
+        std::fs::write(&separate, b"PRESERVED").unwrap();
+        std::os::unix::fs::symlink(&separate, &target).unwrap();
+        assert!(binary_target(&target).is_err());
+        assert!(install_over(&target, &tb, false).is_err());
+        assert_eq!(std::fs::read(&separate).unwrap(), b"PRESERVED");
+        assert!(std::fs::symlink_metadata(&target).unwrap().is_symlink());
+        assert_eq!(dotfiles_beside(&d), 0);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_separate_install_requires_an_unmanaged_theme_path() {
+        let d = tempdir();
+        assert!(binary_target(&d.join("different-name")).is_err());
+        let keg = d.join("Cellar/theme/next/bin");
+        std::fs::create_dir_all(&keg).unwrap();
+        assert!(
+            binary_target(&keg.join("theme"))
+                .unwrap_err()
+                .contains("package manager")
+        );
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
     fn an_archive_without_the_binary_is_refused() {
         let d = tempdir();
         let target = d.join("theme");
         std::fs::write(&target, b"OLD").unwrap();
         let tb = tarball(&d, "not-theme", b"WRONG-MEMBER");
-        let err = install_over(&target, &tb).unwrap_err();
+        let err = install_over(&target, &tb, true).unwrap_err();
         assert!(err.contains("not a single 'theme' binary"), "got: {err}");
         assert_eq!(std::fs::read(&target).unwrap(), b"OLD");
         assert_eq!(dotfiles_beside(&d), 0, "the temp was swept");
@@ -1646,7 +1788,7 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
         let target = d.join("theme");
         std::fs::write(&target, b"OLD").unwrap();
         let tb = tarball(&d, "theme", b"");
-        let err = install_over(&target, &tb).unwrap_err();
+        let err = install_over(&target, &tb, true).unwrap_err();
         assert!(err.contains("empty member"), "got: {err}");
         assert_eq!(std::fs::read(&target).unwrap(), b"OLD");
         let _ = std::fs::remove_dir_all(&d);
@@ -1662,7 +1804,7 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
         std::fs::write(&target, b"OLD").unwrap();
         let tb = tarball(&d, "theme", b"NEW");
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let err = install_over(&target, &tb).unwrap_err();
+        let err = install_over(&target, &tb, true).unwrap_err();
         assert!(err.contains("never elevates"), "got: {err}");
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"OLD");

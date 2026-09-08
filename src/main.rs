@@ -82,14 +82,14 @@ fn main() {
     // BEFORE the global flag pass could swallow anything, and --version
     // exists for no other command — every other verb refuses it like any
     // unknown flag, pre-mutation, in the dispatch validation below.
-    if argv.first().map(String::as_str) == Some("update") {
-        let (want_help, version_sel) = main_flags::parse_update(&argv[1..]);
+    if matches!(argv.first().map(String::as_str), Some("update" | "upgrade")) {
+        let (want_help, version_sel, binary) = main_flags::parse_update(&argv[1..]);
         if want_help {
             let code = help::usage_cmd(&cfg, "update");
             scratch::cleanup();
             std::process::exit(code);
         }
-        update::cmd_update(&cfg, &version_sel);
+        update::cmd_update(&cfg, &version_sel, binary.as_deref());
         scratch::cleanup();
         return;
     }

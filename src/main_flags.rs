@@ -23,16 +23,31 @@ pub struct Flags {
 /// refusal, and `--version` exists for NO other command (a destructive verb
 /// handed `--version` refuses it like any unknown flag, before any side
 /// effect — Codex round 3). Accepted: zero or one `--version <v>` /
-/// `--version=<v>`, `-h`/`--help`. Anything else — positional or flag —
-/// refuses HERE, before any network call. Returns (want_help, version_sel).
-pub fn parse_update(rest: &[String]) -> (bool, String) {
+/// `--version=<v>`, `--binary <path>`, `-h`/`--help`. Everything else refuses
+/// before any network call. Returns (want_help, version_sel, binary_path).
+pub fn parse_update(rest: &[String]) -> (bool, String, Option<String>) {
     let mut help = false;
     let mut version = String::new();
+    let mut binary = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         let value = match a.as_str() {
             "-h" | "--help" => {
                 help = true;
+                continue;
+            }
+            "--binary" => {
+                if binary.is_some() {
+                    die("theme update takes one --binary at most");
+                }
+                binary = Some(
+                    it.next()
+                        .filter(|v| v.starts_with('/'))
+                        .unwrap_or_else(|| {
+                            die("--binary takes an absolute destination path ending in /theme")
+                        })
+                        .clone(),
+                );
                 continue;
             }
             "--version" => match it.next().filter(|v| !v.starts_with('-')) {
@@ -53,7 +68,7 @@ pub fn parse_update(rest: &[String]) -> (bool, String) {
         }
         version = value;
     }
-    (help, version)
+    (help, version, binary)
 }
 
 pub fn parse(argv: &[String]) -> Flags {

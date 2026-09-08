@@ -17,16 +17,16 @@ same four tarballs. The Linux builds need glibc 2.34 or newer, and are
 verified on Ubuntu 22.04 and 24.04, Debian 12, Fedora 44 and Arch.
 
 **Homebrew** — macOS and Linux. Homebrew 6 requires a third-party tap to be
-trusted; the middle line grants that to this one formula and nothing else:
+trusted; grant trust to this one formula before adding the tap:
 
 ```sh
-brew tap snaraj/theme https://github.com/snaraj/theme
 brew trust --formula snaraj/theme/theme
+brew tap snaraj/theme https://github.com/snaraj/theme
 brew install snaraj/theme/theme
 ```
 
-The formula is bumped by a pull request after each release, so `brew` can
-be one release behind until that merges; the tarballs below never are.
+The release workflow verifies published downloads and tests the Homebrew
+installation. Delivery stays incomplete until the matching formula PR merges.
 
 **Debian, Ubuntu, Fedora, RHEL** — take the `.deb` or `.rpm` for your
 architecture from the
@@ -52,13 +52,20 @@ mkdir -p ~/.local/bin && mv theme ~/.local/bin/
 - No Snap or Flatpak build: their sandboxes cut off the kitty socket, the
   wallpaper store and `/dev/tty`, which is the entire job. No Windows build.
 
-**Update** — `theme update` knows how it was installed. A tarball copy is
-replaced in place with the latest release, verified against `SHA256SUMS`
-before a byte of it is written. A Homebrew keg, a `.deb`/`.rpm` or a
-`cargo install` build is left to its manager, and the command is printed
-instead (`brew upgrade snaraj/theme/theme`, the next package, the same
-`cargo install`); `theme update` never elevates. `theme version` and the
-bare `theme` screen say when a release is out.
+**Update** — `theme update` (alias `theme upgrade`) replaces a standalone
+copy with the latest release after verifying `SHA256SUMS`. Managed installs
+print their update options; Homebrew reports the local tap's available version.
+To install the latest verified binary separately:
+
+```sh
+mkdir -p ~/.local/bin
+theme upgrade --binary ~/.local/bin/theme
+```
+
+The destination must be new; existing files and symlinks are refused. Run that
+path directly or place its directory first in `PATH`. For subsequent updates,
+run `~/.local/bin/theme update`. `--version vX.Y.Z` selects a specific release.
+Updates never elevate, and package-managed files remain owned by their manager.
 
 ### Compatibility
 

@@ -21,6 +21,7 @@ jobs:
         with:
           persist-credentials: false
       - run: python3 -I -B tests/release_policy_test.py
+      - run: python3 -I -B tests/distribution_test.py
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -42,4 +43,16 @@ jobs:
       # load-bearing: the tap IS this repository, and styling it whole turns
       # Homebrew's shell and workflow linters loose on our fixture. Nothing
       # is installed; `brew audit` stays out (see Formula/theme.rb).
-      - run: brew tap snaraj/theme "$GITHUB_WORKSPACE" && brew style --formula snaraj/theme/theme
+      - run: |
+          brew trust --formula snaraj/theme/theme
+          brew tap snaraj/theme "$GITHUB_WORKSPACE"
+          brew style --formula snaraj/theme/theme
+      - name: Verify published downloads and install the reviewed formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        run: |
+          python3 -I -B .github/scripts/verify_distribution.py
+          brew install snaraj/theme/theme
+          brew test snaraj/theme/theme

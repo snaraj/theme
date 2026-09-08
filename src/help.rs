@@ -77,8 +77,8 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("status", "current theme, color-scheme swatches, variables"),
             (
-                "update",
-                "replace this binary (verified), or say how this install updates",
+                "update, upgrade",
+                "verified binary update or package-manager options",
             ),
             (
                 "version, -V",
@@ -471,8 +471,8 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
     theme rm old-one.jpg other-old-one
 "
         ),
-        "update" => print!(
-            "theme update [--version <vX.Y.Z>]
+        "update" | "upgrade" => print!(
+            "theme update (alias: upgrade) [--version <vX.Y.Z>] [--binary <path>]
 
   A Homebrew keg, a .deb/.rpm or a cargo install belongs to whoever
   installed it: theme prints that manager's own update command and
@@ -486,12 +486,19 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
   versions may be unsupported or break (a downgrade says so before it
   proceeds), through the same verified pipeline.
 
+  --binary installs a verified release at a NEW absolute path ending in
+  /theme. Create its parent directory first. Existing files, symlinks and
+  package-managed destinations are refused. Run that path directly or put
+  its directory first in PATH; the managed copy is left intact. To update
+  the new copy later, run its own update command without --binary.
+
   `theme version` (and the bare screen) says when a newer release
   exists; `theme update` itself always runs when you ask.
 
   Examples:
     theme update
     theme update --version v0.1.0
+    theme upgrade --binary ~/.local/bin/theme
 "
         ),
         "version" | "--version" | "-V" => print!(
