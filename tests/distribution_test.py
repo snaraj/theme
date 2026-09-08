@@ -134,7 +134,7 @@ class Distribution(unittest.TestCase):
     def test_bad_formula_version_refuses_before_network(self):
         root = self.directory / "bad-formula"
         (root / "Formula").mkdir(parents=True)
-        for formula in ('version "not-a-version"', self.formula + self.formula):
+        for formula in ('version "not-a-version"', self.formula + '\n' + self.formula):
             (root / "Formula/theme.rb").write_text(formula)
             with patch.object(distribution, "ROOT", root), patch("sys.argv", ["verify_distribution.py"]), \
                  patch.object(distribution, "api", side_effect=AssertionError("must not query")):
