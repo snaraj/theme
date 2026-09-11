@@ -49,15 +49,21 @@ impl Rgb {
 
     /// Parse `RRGGBB` or `#RRGGBB`.
     pub fn parse(s: &str) -> Option<Rgb> {
-        let s = s.strip_prefix('#').unwrap_or(s);
-        if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
+        fn nibble(byte: u8) -> Option<u8> {
+            match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            }
         }
-        let v = u32::from_str_radix(s, 16).ok()?;
+        let &[r0, r1, g0, g1, b0, b1] = s.strip_prefix('#').unwrap_or(s).as_bytes() else {
+            return None;
+        };
         Some(Rgb {
-            r: (v >> 16) as u8,
-            g: (v >> 8) as u8,
-            b: v as u8,
+            r: nibble(r0)? << 4 | nibble(r1)?,
+            g: nibble(g0)? << 4 | nibble(g1)?,
+            b: nibble(b0)? << 4 | nibble(b1)?,
         })
     }
 
@@ -206,6 +212,44 @@ mod tests {
         assert_eq!(Rgb::parse("12ab9f"), Rgb::parse("#12ab9f"));
         assert!(Rgb::parse("#12ab9").is_none());
         assert!(Rgb::parse("#12ab9x").is_none());
+    }
+
+    #[test]
+    fn hex_parser_matches_reference_for_all_single_byte_changes() {
+        let reference = |s: &str| {
+            let s = s.strip_prefix('#').unwrap_or(s);
+            if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            let value = u32::from_str_radix(s, 16).ok()?;
+            Some(Rgb {
+                r: (value >> 16) as u8,
+                g: (value >> 8) as u8,
+                b: value as u8,
+            })
+        };
+        for original in ["123456", "#ABCdef"] {
+            for position in 0..original.len() {
+                for byte in 0..=127u8 {
+                    let mut changed = original.as_bytes().to_vec();
+                    changed[position] = byte;
+                    let text = std::str::from_utf8(&changed).unwrap();
+                    assert_eq!(Rgb::parse(text), reference(text), "{text:?}");
+                }
+            }
+        }
+        for text in [
+            "",
+            "#",
+            "##123456",
+            "#1234567",
+            "ééé",
+            "éabcd",
+            "１２３",
+            "123456\n",
+        ] {
+            assert_eq!(Rgb::parse(text), reference(text), "{text:?}");
+        }
     }
 
     #[test]

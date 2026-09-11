@@ -34,16 +34,16 @@ pub fn effective_background(palette_bg: Rgb, opacity: f64, wallpaper_avg: Rgb) -
     }
 }
 
-/// Smallest mix toward `target` that reaches `floor` against `eff`, or None
+/// Smallest mix toward `target` that reaches `floor` against fixed background luminance, or None
 /// when even the endpoint itself cannot.
-fn solve(c: Rgb, target: Rgb, eff: Rgb, floor: f64) -> Option<(f64, Rgb)> {
-    if target.contrast(eff) < floor {
+fn solve(c: Rgb, target: Rgb, background: f64, floor: f64) -> Option<(f64, Rgb)> {
+    if contrast(target, background) < floor {
         return None;
     }
     let (mut lo, mut hi) = (0.0f64, 1.0f64);
     for _ in 0..ITERATIONS {
         let m = (lo + hi) / 2.0;
-        if c.mix(target, m).contrast(eff) >= floor {
+        if contrast(c.mix(target, m), background) >= floor {
             hi = m;
         } else {
             lo = m;
@@ -53,17 +53,33 @@ fn solve(c: Rgb, target: Rgb, eff: Rgb, floor: f64) -> Option<(f64, Rgb)> {
 }
 
 pub(crate) fn floor_color(c: Rgb, eff: Rgb, floor: f64) -> Rgb {
-    if c.contrast(eff) >= floor {
+    floor_luminance(c, eff.luminance(), floor)
+}
+
+// The background stays fixed throughout every binary search. Compute its
+// luminance once; retain the original operations and comparison order.
+fn contrast(color: Rgb, background: f64) -> f64 {
+    let foreground = color.luminance();
+    let (hi, lo) = if foreground >= background {
+        (foreground, background)
+    } else {
+        (background, foreground)
+    };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+fn floor_luminance(c: Rgb, background: f64, floor: f64) -> Rgb {
+    if contrast(c, background) >= floor {
         return c;
     }
     let best = [Rgb::WHITE, Rgb::BLACK]
         .into_iter()
-        .filter_map(|t| solve(c, t, eff, floor))
+        .filter_map(|t| solve(c, t, background, floor))
         .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     match best {
         Some((_, mixed)) => mixed,
         None => {
-            if Rgb::WHITE.contrast(eff) >= Rgb::BLACK.contrast(eff) {
+            if contrast(Rgb::WHITE, background) >= contrast(Rgb::BLACK, background) {
                 Rgb::WHITE
             } else {
                 Rgb::BLACK
@@ -156,11 +172,12 @@ impl Palette {
     /// [`effective_background`]`(self.background(), opacity, self.wallpaper_average)`
     /// — and return the proof-of-floor wrapper the emitters require.
     pub fn floor_against(mut self, eff: Rgb, floor: f64) -> Floored {
+        let background = eff.luminance();
         for i in 1..16 {
-            self.colors[i] = floor_color(self.colors[i], eff, floor);
+            self.colors[i] = floor_luminance(self.colors[i], background, floor);
         }
-        self.foreground = floor_color(self.foreground, eff, floor);
-        self.cursor = floor_color(self.cursor, eff, floor);
+        self.foreground = floor_luminance(self.foreground, background, floor);
+        self.cursor = floor_luminance(self.cursor, background, floor);
         Floored {
             palette: self,
             target: floor,
@@ -182,6 +199,64 @@ mod tests {
             r: (v >> 16) as u8,
             g: (v >> 32) as u8,
             b: (v >> 48) as u8,
+        }
+    }
+
+    #[test]
+    fn cached_background_matches_scalar_floor_exactly() {
+        let mut state = 53;
+        for target in [1.0, 1.5, 3.0, 4.5, 7.0, 15.0, 21.0] {
+            for _ in 0..256 {
+                let color = prng_color(&mut state);
+                let background = prng_color(&mut state);
+                assert_eq!(
+                    floor_color(color, background, target),
+                    reference_floor(color, background, target)
+                );
+                let boundary = color.contrast(background);
+                for target in [boundary.next_down(), boundary, boundary.next_up()] {
+                    assert_eq!(
+                        floor_color(color, background, target),
+                        reference_floor(color, background, target)
+                    );
+                }
+            }
+        }
+    }
+
+    fn reference_solve(c: Rgb, target: Rgb, eff: Rgb, floor: f64) -> Option<(f64, Rgb)> {
+        if target.contrast(eff) < floor {
+            return None;
+        }
+        let (mut lo, mut hi) = (0.0f64, 1.0f64);
+        for _ in 0..ITERATIONS {
+            let m = (lo + hi) / 2.0;
+            if c.mix(target, m).contrast(eff) >= floor {
+                hi = m;
+            } else {
+                lo = m;
+            }
+        }
+        Some((hi, c.mix(target, hi)))
+    }
+
+    fn reference_floor(c: Rgb, eff: Rgb, floor: f64) -> Rgb {
+        if c.contrast(eff) >= floor {
+            return c;
+        }
+        let best = [Rgb::WHITE, Rgb::BLACK]
+            .into_iter()
+            .filter_map(|t| reference_solve(c, t, eff, floor))
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        match best {
+            Some((_, mixed)) => mixed,
+            None => {
+                if Rgb::WHITE.contrast(eff) >= Rgb::BLACK.contrast(eff) {
+                    Rgb::WHITE
+                } else {
+                    Rgb::BLACK
+                }
+            }
         }
     }
 

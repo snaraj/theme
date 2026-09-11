@@ -26,6 +26,10 @@ fn fnv1a(s: &str) -> u64 {
 /// The cache filename stem for `path` + `opts` — stable across runs, unique
 /// per (image identity, parameters, engine version).
 pub fn cache_key(path: &Path, opts: &Options) -> Result<String, Error> {
+    Ok(cache_snapshot(path, opts)?.0)
+}
+
+fn cache_snapshot(path: &Path, opts: &Options) -> Result<(String, fs::Metadata), Error> {
     let canon =
         fs::canonicalize(path).map_err(|e| Error::Cache(format!("{}: {e}", path.display())))?;
     let meta =
@@ -59,10 +63,40 @@ pub fn cache_key(path: &Path, opts: &Options) -> Result<String, Error> {
             meta.ctime_nsec()
         ));
     }
-    Ok(format!("{:016x}", fnv1a(&id)))
+    Ok((format!("{:016x}", fnv1a(&id)), meta))
 }
 
-fn read_entry(path: &Path) -> Option<CacheRecord> {
+fn unchanged(path: &Path, opts: &Options, key: &str, before: &fs::Metadata) -> Result<bool, Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = (opts, key);
+        let after =
+            fs::metadata(path).map_err(|e| Error::Cache(format!("{}: {e}", path.display())))?;
+        let stamp = |m: &fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        // Follow the current source path: a changed symlink target or an
+        // atomic replacement must not validate against the old canonical path.
+        // A different hard link to the same unchanged inode is the same image.
+        Ok(stamp(before) == stamp(&after))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = before;
+        Ok(cache_key(path, opts)? == key)
+    }
+}
+
+fn read_entry<T>(path: &Path, parse: impl FnOnce(&str) -> Option<T>) -> Option<T> {
     let descriptor = rustix::fs::open(
         path,
         rustix::fs::OFlags::RDONLY
@@ -77,28 +111,29 @@ fn read_entry(path: &Path) -> Option<CacheRecord> {
     if !metadata.is_file() || metadata.len() > MAX_CACHE_BYTES {
         return None;
     }
-    let mut text = String::new();
+    let mut text = String::with_capacity(metadata.len() as usize + 1);
     file.take(MAX_CACHE_BYTES + 1)
         .read_to_string(&mut text)
         .ok()?;
     if text.len() as u64 > MAX_CACHE_BYTES {
         return None;
     }
-    CacheRecord::parse(&text)
+    parse(&text)
 }
 
-fn read_cached_entry(
+fn read_cached_entry<T>(
     path: &Path,
     opts: &Options,
     cache_dir: &Path,
-) -> Result<Option<CacheRecord>, Error> {
-    let key = cache_key(path, opts)?;
-    let Some(palette) = read_entry(&cache_dir.join(format!("{key}.palette"))) else {
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Result<Option<T>, Error> {
+    let (key, before) = cache_snapshot(path, opts)?;
+    let Some(palette) = read_entry(&cache_dir.join(format!("{key}.palette")), parse) else {
         // Nothing was accepted on a miss, so there is no cached identity to
         // revalidate. Derivation performs its own before/after identity check.
         return Ok(None);
     };
-    if cache_key(path, opts)? != key {
+    if !unchanged(path, opts, &key, &before)? {
         return Ok(None);
     }
     Ok(Some(palette))
@@ -110,7 +145,10 @@ pub fn read_cached(
     opts: &Options,
     cache_dir: &Path,
 ) -> Result<Option<Palette>, Error> {
-    Ok(read_cached_entry(path, opts, cache_dir)?.and_then(CacheRecord::into_palette))
+    Ok(
+        read_cached_entry(path, opts, cache_dir, CacheRecord::parse)?
+            .and_then(CacheRecord::into_palette),
+    )
 }
 
 /// Read the 16 cached colors without computing image-profile features. The
@@ -121,22 +159,22 @@ pub fn read_cached_colors(
     opts: &Options,
     cache_dir: &Path,
 ) -> Result<Option<[Rgb; 16]>, Error> {
-    Ok(read_cached_entry(path, opts, cache_dir)?.map(|record| record.colors))
+    read_cached_entry(path, opts, cache_dir, CacheRecord::parse_colors)
 }
 
 /// Derive with a read-through cache in `cache_dir` (created if missing).
 /// A hit is a file read and parse — no image decode.
 pub fn cached_derive(path: &Path, opts: &Options, cache_dir: &Path) -> Result<Palette, Error> {
-    let key = cache_key(path, opts)?;
+    let (key, before) = cache_snapshot(path, opts)?;
     let file = cache_dir.join(format!("{key}.palette"));
     // An unparseable cache entry is stale format, not an error: re-derive.
-    if let Some(p) = read_entry(&file).and_then(CacheRecord::into_palette)
-        && cache_key(path, opts)? == key
+    if let Some(p) = read_entry(&file, CacheRecord::parse).and_then(CacheRecord::into_palette)
+        && unchanged(path, opts, &key, &before)?
     {
         return Ok(p);
     }
     let palette = derive(path, opts)?;
-    if cache_key(path, opts)? != key {
+    if !unchanged(path, opts, &key, &before)? {
         return Err(Error::Cache(
             "image changed during derivation; retry".into(),
         ));
@@ -238,6 +276,66 @@ mod tests {
         let err = cached_derive(&img, &Options::default(), &dir);
         assert!(err.is_err());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_rechecks_current_target_replacements_and_restored_mtime() {
+        use std::os::unix::fs::symlink;
+        let (img, dir) = test_dirs("snapshot");
+        fs::write(&img, b"first").unwrap();
+        let other = dir.join("other");
+        fs::write(&other, b"other").unwrap();
+        let hard = dir.join("hard");
+        fs::hard_link(&img, &hard).unwrap();
+        let link = dir.join("link");
+        symlink(&img, &link).unwrap();
+        let opts = Options::default();
+        let (key, before) = cache_snapshot(&link, &opts).unwrap();
+        assert!(unchanged(&link, &opts, &key, &before).unwrap());
+        fs::remove_file(&link).unwrap();
+        symlink(&other, &link).unwrap();
+        assert!(!unchanged(&link, &opts, &key, &before).unwrap());
+        fs::remove_file(&link).unwrap();
+        symlink(&hard, &link).unwrap();
+        assert!(unchanged(&link, &opts, &key, &before).unwrap());
+        fs::rename(&other, &img).unwrap();
+        assert!(!unchanged(&img, &opts, &key, &before).unwrap());
+        let (key, before) = cache_snapshot(&img, &opts).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::write(&img, b"again").unwrap();
+        fs::File::open(&img)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        assert_eq!(fs::metadata(&img).unwrap().len(), before.len());
+        assert_eq!(
+            fs::metadata(&img).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        assert!(!unchanged(&img, &opts, &key, &before).unwrap());
+        fs::remove_file(&img).unwrap();
+        assert!(unchanged(&img, &opts, &key, &before).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cache_read_rejects_replacement_after_record_parsing() {
+        let (img, dir) = test_dirs("read-replacement");
+        let opts = Options::default();
+        write_img(&img, [30, 60, 90]);
+        cached_derive(&img, &opts, &dir).unwrap();
+        let replacement = dir.join("replacement.png");
+        write_img(&replacement, [90, 60, 30]);
+        let result = read_cached_entry(&img, &opts, &dir, |text| {
+            let colors = CacheRecord::parse_colors(text);
+            assert!(colors.is_some());
+            fs::rename(&replacement, &img).unwrap();
+            colors
+        })
+        .unwrap();
+        assert!(result.is_none());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

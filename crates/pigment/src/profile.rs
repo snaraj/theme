@@ -163,16 +163,30 @@ impl ImageProfile {
             result.worst = 1.0;
             return result;
         }
-        let text_luminance: Vec<_> = palette.colors[1..]
-            .iter()
-            .chain([&palette.foreground])
-            .map(Rgb::luminance)
-            .collect();
+        let mut text_luminance: [f64; 16] = std::array::from_fn(|i| {
+            if i == 0 {
+                palette.foreground.luminance()
+            } else {
+                palette.colors[i].luminance()
+            }
+        });
+        text_luminance.sort_unstable_by(f64::total_cmp);
+        // At full opacity every region has the same effective background.
+        // Keep the reported sample count while evaluating that background once.
+        let regions = if opacity == 1.0 {
+            &self.colors[..self.colors.len().min(1)]
+        } else {
+            &self.colors
+        };
         let mut passing = 0;
-        for &region in &self.colors {
+        for &region in regions {
             let background =
                 effective_background(palette.background(), opacity, region).luminance();
-            let worst = text_luminance
+            // Contrast increases away from the background on either side.
+            // Only the adjacent lower/upper text luminances can be the minimum.
+            let split = text_luminance.partition_point(|&text| text < background);
+            let nearest = &text_luminance[split.saturating_sub(1)..(split + 1).min(16)];
+            let worst = nearest
                 .iter()
                 .map(|&foreground| {
                     (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
@@ -181,7 +195,7 @@ impl ImageProfile {
             result.worst = result.worst.min(worst);
             passing += usize::from(worst >= target);
         }
-        result.coverage = passing as f64 / result.samples as f64;
+        result.coverage = passing as f64 / regions.len() as f64;
         result
     }
 }
@@ -190,6 +204,109 @@ impl ImageProfile {
 mod tests {
     use super::*;
     use crate::{ModePref, derive::palette};
+
+    fn reference_readability(
+        profile: &ImageProfile,
+        palette: &Floored,
+        opacity: f64,
+        target: f64,
+    ) -> Readability {
+        let mut result = Readability {
+            worst: 21.0,
+            coverage: 0.0,
+            samples: profile.colors.len(),
+        };
+        if !opacity.is_finite()
+            || !(0.0..=1.0).contains(&opacity)
+            || !target.is_finite()
+            || !(1.0..=21.0).contains(&target)
+        {
+            result.worst = 1.0;
+            return result;
+        }
+        let mut passing = 0;
+        for &region in &profile.colors {
+            let background = effective_background(palette.background(), opacity, region);
+            let mut worst: f64 = 21.0;
+            // Independent scalar oracle: every original region/text pair,
+            // without sorting, nearest-neighbor selection or opacity shortcuts.
+            for text in palette.colors[1..].iter().chain([&palette.foreground]) {
+                worst = worst.min(text.contrast(background));
+            }
+            result.worst = result.worst.min(worst);
+            passing += usize::from(worst >= target);
+        }
+        result.coverage = passing as f64 / result.samples as f64;
+        result
+    }
+
+    #[test]
+    fn readability_matches_every_region_and_text_pair_bit_for_bit() {
+        for seed in 0..16 {
+            let color = |i: usize| Rgb {
+                r: ((i * 73 + seed * 31) % 256) as u8,
+                g: ((i * 29 + seed * 101) % 256) as u8,
+                b: ((i * 131 + seed * 7) % 256) as u8,
+            };
+            let mut raw = palette(&[], color(19), ModePref::Dark);
+            raw.colors = std::array::from_fn(color);
+            raw.foreground = color(27);
+            if seed < 2 {
+                raw.colors = [if seed == 0 { Rgb::WHITE } else { Rgb::BLACK }; 16];
+                raw.foreground = raw.colors[1];
+                raw.colors[0] = if seed == 0 { Rgb::BLACK } else { Rgb::WHITE };
+            } else if seed == 2 {
+                raw.foreground = raw.background();
+            }
+            let palette = raw.floor_against(Rgb::BLACK, 1.0);
+            for (columns, rows) in [(1, 1), (3, 1), (4, 4), (16, 16)] {
+                let profile = ImageProfile::new(
+                    columns as u32,
+                    rows as u32,
+                    columns,
+                    rows,
+                    (0..columns * rows).map(color).collect(),
+                )
+                .unwrap();
+                for opacity in [
+                    -0.0,
+                    0.01,
+                    0.35,
+                    0.7,
+                    f64::from_bits(1.0f64.to_bits() - 1),
+                    1.0,
+                    -0.1,
+                    1.1,
+                    f64::NAN,
+                    f64::INFINITY,
+                ] {
+                    let boundary = reference_readability(&profile, &palette, opacity, 4.5).worst;
+                    for target in [
+                        1.0,
+                        3.0,
+                        4.5,
+                        7.0,
+                        21.0,
+                        boundary,
+                        f64::from_bits(boundary.to_bits() - 1),
+                        f64::from_bits(boundary.to_bits() + 1),
+                        f64::NAN,
+                        f64::INFINITY,
+                    ] {
+                        let expected = reference_readability(&profile, &palette, opacity, target);
+                        let actual = profile.readability(&palette, opacity, target);
+                        let bits =
+                            |r: Readability| (r.worst.to_bits(), r.coverage.to_bits(), r.samples);
+                        assert_eq!(
+                            bits(actual),
+                            bits(expected),
+                            "seed {seed}, {columns}x{rows}, opacity {opacity}, target {target}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn dark_and_light_regions_are_not_hidden_by_the_average() {

@@ -132,6 +132,14 @@ pub(crate) struct CacheRecord {
 
 impl CacheRecord {
     pub(crate) fn parse(s: &str) -> Option<Self> {
+        Self::parse_samples::<true>(s)
+    }
+
+    pub(crate) fn parse_colors(s: &str) -> Option<[Rgb; 16]> {
+        Self::parse_samples::<false>(s).map(|record| record.colors)
+    }
+
+    fn parse_samples<const KEEP: bool>(s: &str) -> Option<Self> {
         let mut lines = s.lines();
         if lines.next()? != "pigment2" {
             return None;
@@ -159,9 +167,12 @@ impl CacheRecord {
         if shape.next().is_some() || !ImageProfile::valid_shape(width, height, columns, rows) {
             return None;
         }
-        let mut samples = Vec::with_capacity(columns * rows);
+        let mut samples = Vec::with_capacity(if KEEP { columns * rows } else { 0 });
         for _ in 0..columns * rows {
-            samples.push(Rgb::parse(lines.next()?)?);
+            let sample = Rgb::parse(lines.next()?)?;
+            if KEEP {
+                samples.push(sample);
+            }
         }
         if lines.next().is_some() {
             return None;
@@ -292,6 +303,64 @@ mod tests {
     fn cache_roundtrip_is_lossless() {
         let p = sample();
         assert_eq!(Palette::from_cache_format(&p.to_cache_format()).unwrap(), p);
+    }
+
+    #[test]
+    fn colors_only_preserves_full_record_acceptance() {
+        let mut palette = sample();
+        palette.profile = ImageProfile::new(
+            512,
+            384,
+            16,
+            16,
+            (0..256)
+                .map(|r| Rgb {
+                    r: r as u8,
+                    g: 40,
+                    b: 190,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let valid = palette.to_cache_format();
+        let check = |text: &str, expected| {
+            assert_eq!(CacheRecord::parse_colors(text), expected);
+            assert_eq!(Palette::from_cache_format(text).map(|p| p.colors), expected);
+        };
+        for text in [
+            valid.clone(),
+            valid.trim_end().into(),
+            valid.replace('\n', "\r\n"),
+            valid.replace('#', ""),
+            valid.replace("profile 512 384 16 16", "profile\t+512\u{2003}0384 +16 016"),
+        ] {
+            check(&text, Some(palette.colors));
+        }
+        for end in 0..valid.len() - 1 {
+            check(&valid[..end], None);
+        }
+        let lines: Vec<_> = valid.lines().collect();
+        for i in 0..lines.len() {
+            let mut changed = lines.clone();
+            changed[i] = "invalid";
+            check(&changed.join("\n"), None);
+        }
+        for shape in [
+            "profile 0 384 16 16",
+            "profile 512 0 16 16",
+            "profile 512 384 0 16",
+            "profile 512 384 17 16",
+            "profile 512 384 16 17",
+            "profile 15 384 16 16",
+            "profile 512 15 16 16",
+            "profile 4294967296 384 16 16",
+            "profile 512 384 16 16 extra",
+        ] {
+            check(&valid.replace("profile 512 384 16 16", shape), None);
+        }
+        for suffix in ["\n", "extra\n", "#123456\n", "\r"] {
+            check(&(valid.clone() + suffix), None);
+        }
     }
 
     #[test]

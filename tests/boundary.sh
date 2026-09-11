@@ -61,6 +61,9 @@ exists() { # $1 description, $2 yes|no, $3 path
 # ever touch the real network; the footer-note section re-enables it per run
 # against a stubbed/failing curl.
 export THEME_NO_UPDATE_CHECK=1
+# Headless by default even when invoked from Kitty. Graphics-specific cases
+# set their own window id and deterministic kitten stub below.
+export KITTY_WINDOW_ID=''
 
 # The self-update/footer transport never consults PATH (round 8): those
 # sections drive a DEBUG build, whose THEME_CURL test seam (compiled OUT of
