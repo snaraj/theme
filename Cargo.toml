@@ -14,7 +14,7 @@ unsafe_code = "deny"
 
 [package]
 name = "theme"
-version = "0.3.8"
+version = "0.3.9"
 description = "One command that owns the desktop wallpaper and the terminal palette together"
 edition.workspace = true
 license.workspace = true
@@ -24,6 +24,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# Terminal cells and grapheme boundaries keep wide glyphs and icons inside panes.
+unicode-width = { version = "0.2.2", default-features = false }
+unicode-segmentation = "1.13.3"
 pigment = { path = "crates/pigment" }
 # Same crate and feature set pigment already pins — transforms, dimension
 # reads and content decodes reuse it rather than shelling to sips/magick.
@@ -51,3 +54,7 @@ sha2 = { version = "0.10", default-features = false, features = ["std"] }
 # in-house) so no PATH-resolved tar can sit between the verified bytes and
 # the installed binary.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Parse the system timezone in-process instead of spawning stat per date.
+tz-rs = "0.7.3"

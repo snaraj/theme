@@ -96,7 +96,8 @@ release.
 
 ```
 theme random | set <name|link> | unsplash [query|page-url] | get <link>
-theme list | search <terms> | preview [-w] <name> | status | update | version | rename | rm
+theme list | search <terms> | browse [terms] | index | preview [-w] <name>
+theme status | update | version | rename | rm
 ```
 
 `--rotate left|right`, `--extend[=hex]`, and `--desktop-only` (wallpaper
@@ -107,6 +108,53 @@ macOS 14 and later keep a wallpaper per Mission Control Space, and the system
 tools change only the Space you are looking at. `theme` applies the image to
 every Space on every display and seeds the all-Spaces fallback, so Spaces you
 create later inherit it too. Your screensaver choices are left alone.
+
+## Browse wallpapers
+
+```sh
+theme browse                         # resume the saved query
+theme surf ocean --color blue         # a palette filter in addition to text search
+theme browse --all --coverage 0.9 --min-width 2560 --aspect 16:9
+theme index                          # prepare palettes and cache searchable metadata
+```
+
+The browser shows six larger thumbnails per page in Kitty. Type `select 3`
+for the picture's final terminal palette and a text specimen, then `next` or
+`prev` to move through the results. Only `apply` changes the wallpaper and
+terminal colors. `page 2` shows another sheet; `shuffle` makes a queue that
+visits each result once. Existing shell and terminal shortcuts keep their
+meaning: browser commands are ordinary lines followed by Return.
+
+`favorite` saves the selection; `favorites` shows that collection. `history`
+shows recently previewed IDs, and `query mountains` changes the search.
+`calmer` ranks images by sampled texture; `similar` and `different` rank by
+mean Oklab color distance from the selection. These are measured image
+properties, not subject or style recognition. `--all` clears the saved query.
+Non-interactive use prints one deterministic page and never consumes commands
+or applies a wallpaper.
+
+Previews use the same contrast-adjusted colors as apply, including all 16 ANSI
+colors and Kitty's selection, border, and tab accents. Readability samples a
+16-by-16 image grid at the configured opacity; it reports worst text contrast
+and the fraction meeting `THEME_CONTRAST`. `--min-contrast 4.5` and
+`--coverage 0.9` filter those measurements. Sampling models the wallpaper behind
+the terminal; cropping, another window behind it, live opacity changes, and
+unsampled detail can affect the real result. It is not an every-pixel guarantee.
+
+Search facts are cached by configured roots, timezone files, image identity,
+and palette. Changed images or timezone files refresh automatically. Opening
+an unfiltered browser does not prepare the entire metadata index. The first index pass still
+reads images and metadata; warm searches reuse those records. The metadata
+index is capped at 16 MiB and retains a useful subset for larger libraries.
+On macOS, missing source metadata is queried in bounded batches; incomplete
+answers fall back to individual lookups. Warm index entries skip those queries.
+`theme index` reports inspected images, available palettes, and persisted
+metadata separately. Favorites, query, and history stay local in the cache.
+
+For a repeatable editor/shell/output layout, copy
+[`examples/kitty-workspace.conf`](examples/kitty-workspace.conf) into your
+project and run `kitty --session ./kitty-workspace.conf`. It uses directional
+splits without adding or replacing key mappings.
 
 ## Terminals
 
@@ -123,18 +171,18 @@ create later inherit it too. Your screensaver choices are left alone.
 - `THEME_WALLPAPER_DIR` — the wallpaper library; a colon-separated list is
   allowed (every directory searched, downloads land in the first).
 - `THEME_CACHE_DIR` — palette cache root (default `~/.cache/theme`).
-- `THEME_CONTRAST` — minimum text-to-background contrast floor.
+- `THEME_CONTRAST` — text contrast target from 1 to 21 (default 4.5).
+- `THEME_OPACITY` — explicit preview/apply opacity from 0 to 1. Otherwise,
+  literal local Kitty includes are read in order. Dynamic or expanded includes
+  require this override; no generated configuration is executed. Live window
+  opacity is not queried.
 - `THEME_NO_APPLY` — dry-run: announce what would happen, touch nothing.
-- `THEME_NO_UPDATE_CHECK` — disable the update-available note on the bare
-  `theme` screen. The check asks GitHub for the latest release tag at most
-  once every 24 hours (2-second cap, silent on failure, nothing sent but
-  the request itself), cached under `THEME_CACHE_DIR`; the explicit
-  `theme update` installs it and is never disabled by this. `theme version`
-  asks live on every call (2-second cap) and says so when it cannot
-  check; `-V` and `--version` print the build alone. The cache is only used
-  while every directory on its path is owned by you and free of
-  write-granting ACLs — a cache you have deliberately ACL'd open is out of
-  contract and the check silently stands down.
+- `THEME_NO_UPDATE_CHECK` — hide the cached update-available note. Ordinary
+  `theme`/`theme help` never make release-network requests: their footer uses
+  only a trusted cache entry less than 24 hours old. `theme version` checks
+  live (2-second cap), and an explicit latest-release `theme update` refreshes
+  the cache too. `-V` and `--version` print the build alone. Cache integrity
+  requires trusted directory ownership and no foreign write grants.
 - `UNSPLASH_ACCESS_KEY` / `UNSPLASH_SECRET_KEY` / `UNSPLASH_USER_TOKEN` —
   Unsplash credentials (the macOS Keychain is consulted when unset; no
   credential ever appears on an argv).
@@ -145,4 +193,39 @@ create later inherit it too. Your screensaver choices are left alone.
 cargo build --release            # target/release/theme
 cargo test                       # unit + trust-boundary tests
 tests/boundary.sh                # the acceptance fixture (headless)
+```
+
+CI builds the PR base and candidate with the same Rust toolchain and release
+profile on Linux and macOS. It checks bare/help/version, list/verbose list,
+preview, metadata/color search, browse/filter, and index. Each existing command
+gets 63 alternating warm pairs and nine pairs with fresh application caches.
+Cold here does not mean a flushed OS filesystem cache. New commands have no
+historical speed comparison until the base supports them; generated-fixture
+stall budgets are 500 ms warm and 3 s cold.
+
+The gate checks median and p95 changes against zero, with 99.9% paired bootstrap
+confidence and repetition across interleaved sample blocks. Supported shifts
+trigger a fresh confirmation batch with the same sample count. Confirmed
+regressions and inconclusive confirmations both block CI. There is no fixed
+millisecond or percentage slowdown allowance. A pass means no repeatable
+regression was detected in this matrix; it cannot prove identical performance
+on every machine or under every workload. The harness tests its own rejection
+of tiny consistent slowdowns, tail-only regressions, and missing output.
+
+Every measured capture must still contain the expected rows, metadata, and
+colors. Rendering checks compare 25-, 80-, and 120-column output, while separate
+PTY tests cover navigation and wide Unicode filenames. CI publishes timing
+summaries and downloadable `command-performance-<OS>-<architecture>` artifacts,
+including `results.json`, all stdout/stderr captures, and `rendering.html` with
+the actual ANSI colors. These are headless renderings; native Kitty graphics,
+font shaping, desktop application, and network latency are outside this gate.
+The existing release workflow requires both exact-source CI jobs to pass.
+
+Reproduce from a feature branch (the output directory must be empty):
+
+```sh
+THEME_PERF_BASE="$(git rev-parse origin/main)" tests/performance-ci.sh
+# Or compare already-built binaries, optionally using a read-only real library:
+python3 -I -B tests/performance.py --before /path/to/theme-before \
+  --after target/release/theme --output target/performance-local
 ```

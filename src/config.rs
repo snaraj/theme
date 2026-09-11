@@ -77,7 +77,10 @@ impl Config {
                 "THEME_CONTRAST must be a number (got: {contrast_raw})"
             ));
         }
-        let contrast: f64 = contrast_raw.parse().unwrap_or(4.5);
+        let contrast: f64 = contrast_raw.parse().unwrap_or(f64::NAN);
+        if !contrast.is_finite() || !(1.0..=21.0).contains(&contrast) {
+            die("THEME_CONTRAST must be a finite number from 1 to 21");
+        }
 
         let inc = env::var("THEME_FORMATS").unwrap_or_else(|_| FORMATS_ALL.into());
         let exc = env::var("THEME_EXCLUDE_FORMATS").unwrap_or_default();

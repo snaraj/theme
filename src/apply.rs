@@ -7,7 +7,7 @@
 use crate::config::Config;
 use crate::imaging::img_size;
 use crate::ui::{die, note, parse_hex6};
-use pigment::{Options, Palette, effective_background};
+use pigment::{Options, Palette};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -45,8 +45,8 @@ pub fn wallpaper_get() -> Option<PathBuf> {
 /// names a real file: the spawn is paid once after a real change instead of
 /// on every screen, and a stale name can never reach the header. A cache
 /// that cannot be written just means asking the helper every time, which is
-/// what used to happen anyway; and this records a READ, so `THEME_NO_APPLY`
-/// — which is about the desktop and the terminal — does not gate it.
+/// what used to happen anyway. `THEME_NO_APPLY` can read an existing record
+/// but never writes one.
 ///
 /// The record is a plain file in the cache dir and carries none of the
 /// custody the update stamp gets, so the rule that keeps it honest is who
@@ -76,7 +76,9 @@ pub fn wallpaper_to_print(cfg: &Config) -> Option<PathBuf> {
         }
     }
     let got = wallpaper_get()?;
-    if let Some(s) = &stamp {
+    if !cfg.no_apply
+        && let Some(s) = &stamp
+    {
         let _ = fs::write(&record, format!("{s}\n{}\n", got.display()));
     }
     Some(got)
@@ -177,22 +179,6 @@ pub fn settle(desktop: Result<(), String>) {
     if let Err(e) = desktop {
         die(&format!("desktop set on the active Space only: {e}"));
     }
-}
-
-/// kitty's configured background opacity — the LAST `background_opacity`
-/// line wins, exactly like the shell's awk read; unreadable means opaque.
-fn kitty_opacity(cfg: &Config) -> f64 {
-    let conf = fs::read_to_string(cfg.kitty_dir.join("kitty.conf")).unwrap_or_default();
-    let mut op = 1.0f64;
-    for line in conf.lines() {
-        if let Some(rest) = line.strip_prefix("background_opacity")
-            && rest.starts_with([' ', '\t'])
-            && let Ok(v) = rest.trim().parse::<f64>()
-        {
-            op = v;
-        }
-    }
-    op
 }
 
 /// One terminal emitter. The palette files are already on disk when these
@@ -375,12 +361,11 @@ pub fn set_palette(cfg: &Config, img: &Path) {
             img.display()
         )),
     };
-    // wal's floor was measured against the OPAQUE background; a translucent
-    // kitty draws over the background BLENDED with the wallpaper. Re-floor
-    // every text color against that blend — hue kept, moved just far enough.
-    // The emitters only exist on the Floored proof type.
-    let eff = effective_background(pal.background(), kitty_opacity(cfg), pal.wallpaper_average);
-    let pal = pal.floor_against(eff, cfg.contrast);
+    // The identical preparation path powers preview and apply. Metrics remain
+    // sampled estimates; emitters accept only the contrast-adjusted palette.
+    let pal = crate::presentation::from_palette(cfg, pal)
+        .unwrap_or_else(|error| die(&error))
+        .palette;
 
     if fs::create_dir_all(&cfg.cache_dir).is_err() {
         die(&format!("cannot write {}", cfg.cache_dir.display()));
@@ -419,6 +404,11 @@ pub fn set_palette(cfg: &Config, img: &Path) {
 
 /// Apply `img` everywhere (or desktop-only), then say what is now current.
 pub fn use_image(cfg: &Config, img: &Path, desktop_only: bool) {
+    // Refuse unresolved opacity before changing the desktop. A desktop-only
+    // request does not depend on terminal palette configuration.
+    if !desktop_only {
+        crate::presentation::opacity(cfg).unwrap_or_else(|error| die(&error));
+    }
     let desktop = set_desktop(cfg, img);
     if !desktop_only {
         set_palette(cfg, img);
@@ -557,6 +547,7 @@ mod tests {
             foreground: accent,
             cursor: accent,
             wallpaper_average: bg,
+            profile: pigment::ImageProfile::uniform(bg),
             mode: Mode::Dark,
         };
         pal.colors[0] = bg;

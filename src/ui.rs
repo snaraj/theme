@@ -6,6 +6,8 @@
 //! stays byte-exact for everything we open, copy, move or delete.
 
 use std::process::exit;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Strip control bytes (0x00-0x1f, 0x7f) from a display copy. Byte-level,
 /// exactly like `tr -d '[:cntrl:]'` in the C locale: UTF-8 continuation
@@ -111,36 +113,98 @@ pub fn term_cols() -> usize {
         .unwrap_or(60)
 }
 
+/// Terminal cells occupied by plain, sanitized text. ASCII filenames and
+/// labels do not need the Unicode tables. Ambiguous/private-use glyphs occupy
+/// one cell, matching normal terminal mode rather than the CJK-width variant.
+pub fn display_width(s: &str) -> usize {
+    if s.is_ascii() {
+        s.len()
+    } else {
+        UnicodeWidthStr::width(s)
+    }
+}
+
+/// Byte boundary after the complete graphemes fitting in `cells` columns.
+fn cell_prefix(s: &str, cells: usize) -> usize {
+    if s.is_ascii() {
+        return s.len().min(cells);
+    }
+    let (mut end, mut used) = (0, 0);
+    for (start, grapheme) in s.grapheme_indices(true) {
+        let width = display_width(grapheme);
+        if used + width > cells {
+            break;
+        }
+        used += width;
+        end = start + grapheme.len();
+    }
+    end
+}
+
+/// Hard-wrap without a minimum width, preserving graphemes and whitespace.
+/// A grapheme wider than the whole row becomes an ellipsis, so a one-cell
+/// terminal cannot overflow or stall on a two-cell image title.
+pub fn cell_chunks(mut s: &str, cells: usize) -> Vec<String> {
+    let cells = cells.max(1);
+    let mut out = Vec::new();
+    while !s.is_empty() {
+        let end = cell_prefix(s, cells);
+        if end > 0 {
+            out.push(s[..end].to_owned());
+            s = &s[end..];
+        } else {
+            let grapheme = s.graphemes(true).next().unwrap();
+            out.push("…".into());
+            s = &s[grapheme.len()..];
+        }
+    }
+    out
+}
+
+/// A plain-text table cell whose width is measured in terminal columns.
+pub fn pad_cells(s: &str, cells: usize) -> String {
+    let mut out = truncate_ellipsis(s, cells);
+    out.push_str(&" ".repeat(cells.saturating_sub(display_width(&out))));
+    out
+}
+
 /// Word-wrap PLAIN text (no escapes) so no emitted line exceeds `cols`
 /// where geometry allows: the first line starts with `first`, every
 /// continuation with `cont` — a continuation never lands at column 0. A
 /// word wider than the window hard-splits. The window floors at 12
-/// characters: below `prefix + 12` a line may exceed a hopeless terminal
+/// cells: below `prefix + 12` a line may exceed a hopeless terminal
 /// instead of shredding into one-character columns (issue #19).
 pub fn wrap_prefixed(text: &str, cols: usize, first: &str, cont: &str) -> Vec<String> {
-    let win = |p: &str| cols.saturating_sub(p.chars().count()).max(12);
+    let win = |p: &str| cols.saturating_sub(display_width(p)).max(12);
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
-    for word in text.split_whitespace() {
-        let mut chars: Vec<char> = word.chars().collect();
+    for mut word in text.split_whitespace() {
         loop {
             let w = if out.is_empty() {
                 win(first)
             } else {
                 win(cont)
             };
-            let used = cur.chars().count();
+            let used = display_width(&cur);
             let sep = if cur.is_empty() { 0 } else { 1 };
-            if used + sep + chars.len() <= w {
+            if used + sep + display_width(word) <= w {
                 if sep == 1 {
                     cur.push(' ');
                 }
-                cur.extend(chars.iter());
+                cur.push_str(word);
                 break;
             }
             if cur.is_empty() {
-                let take = w.min(chars.len());
-                cur.extend(chars.drain(..take));
+                let take = cell_prefix(word, w);
+                // The established 12-cell floor accommodates ordinary glyphs;
+                // retain progress for any future wider grapheme as well.
+                if take == 0 {
+                    cur.push('…');
+                    word = &word[word.graphemes(true).next().unwrap().len()..];
+                } else {
+                    cur.push_str(&word[..take]);
+                    word = &word[take..];
+                }
             }
             let pfx = if out.is_empty() { first } else { cont };
             out.push(format!("{pfx}{cur}"));
@@ -164,12 +228,14 @@ pub fn parse_hex6(s: &str) -> Option<(u8, u8, u8)> {
     ))
 }
 
-/// Truncate a display string to `max` characters, appending `…` when cut —
-/// the shell's `printf '%.*s…'` shape (character-based, like bash ${#s}).
+/// Truncate to terminal cells, reserving one cell for the ellipsis. Combining
+/// marks, emoji modifiers, and joined emoji stay with their whole grapheme.
 pub fn truncate_ellipsis(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() > max {
-        let mut t: String = chars[..max.saturating_sub(1)].iter().collect();
+    if max == 0 {
+        return String::new();
+    }
+    if display_width(s) > max {
+        let mut t = s[..cell_prefix(s, max - 1)].to_owned();
         t.push('…');
         t
     } else {
@@ -210,8 +276,60 @@ mod tests {
     }
 
     #[test]
-    fn truncation_is_character_based() {
+    fn truncation_reserves_one_cell_and_preserves_graphemes() {
         assert_eq!(truncate_ellipsis("abcdef", 4), "abc…");
         assert_eq!(truncate_ellipsis("abc", 4), "abc");
+        assert_eq!(truncate_ellipsis("中国山", 5), "中国…");
+        assert_eq!(truncate_ellipsis("中国", 1), "…");
+        assert_eq!(truncate_ellipsis("中国", 0), "");
+        assert_eq!(truncate_ellipsis("e\u{301}xy", 2), "e\u{301}…");
+        assert_eq!(truncate_ellipsis("👩‍💻xy", 3), "👩‍💻…");
+        assert_eq!(truncate_ellipsis("👍🏽xy", 3), "👍🏽…");
+        assert_eq!(truncate_ellipsis("🇺🇸xy", 3), "🇺🇸…");
+    }
+
+    #[test]
+    fn widths_and_padding_match_terminal_cells() {
+        for (text, expected) in [
+            ("plain", 5),
+            ("中国", 4),
+            ("e\u{301}", 1),
+            ("👩‍💻", 2),
+            ("👍🏽", 2),
+            ("🇺🇸", 2),
+            ("\u{f120}", 1),
+        ] {
+            assert_eq!(display_width(text), expected, "{text:?}");
+        }
+        assert_eq!(pad_cells("中国", 7), "中国   ");
+        assert_eq!(pad_cells("e\u{301}", 3), "e\u{301}  ");
+        assert_eq!(pad_cells("\u{f120}", 3), "\u{f120}  ");
+        assert_eq!(pad_cells("👩‍💻", 1), "…");
+    }
+
+    #[test]
+    fn narrow_chunks_never_split_or_overflow_wide_graphemes() {
+        assert_eq!(cell_chunks("中国", 1), ["…", "…"]);
+        assert_eq!(cell_chunks("e\u{301}👩‍💻x", 2), ["e\u{301}", "👩‍💻", "x"]);
+        assert_eq!(cell_chunks("🇺🇸👍🏽", 2), ["🇺🇸", "👍🏽"]);
+        assert_eq!(cell_chunks("abcdef", 3), ["abc", "def"]);
+        for cols in [1, 8, 13, 25] {
+            let text = "中国山水 e\u{301}toile 👩‍💻 👍🏽 🇺🇸 \u{f120}";
+            assert!(
+                cell_chunks(text, cols)
+                    .iter()
+                    .all(|s| display_width(s) <= cols)
+            );
+        }
+    }
+
+    #[test]
+    fn word_wrap_counts_wide_prefixes_and_unbroken_names() {
+        assert_eq!(
+            wrap_prefixed("中国中国中国中国中国中国中国", 15, "界 ", "界 "),
+            ["界 中国中国中国", "界 中国中国中国", "界 中国"]
+        );
+        let lines = wrap_prefixed("中国山水中国山水中国山水中国山水中国山水.png", 25, "", "  ");
+        assert!(lines.iter().all(|s| display_width(s) <= 25));
     }
 }

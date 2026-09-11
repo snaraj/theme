@@ -9,6 +9,7 @@ use crate::imaging::img_size;
 use crate::library::{all_images, resolve_local};
 use crate::net::{host_label, url_host};
 use crate::ui::{die, display_text, note, truncate_ellipsis};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -40,26 +41,46 @@ fn have(cmd: &str) -> bool {
 /// Unknown is an honest "-", never a guess; the label is decided by the
 /// PARSED hostname, never a substring.
 pub fn wall_source(path: &Path) -> String {
+    wall_source_with_mdls(path, || {
+        #[cfg(target_os = "macos")]
+        {
+            true
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            !mdls_absent(std::env::var_os("PATH").as_deref())
+        }
+    })
+}
+
+fn wall_source_with_mdls(path: &Path, mdls: impl FnOnce() -> bool) -> String {
     let xattr = xattr_value(path, "theme.source");
-    let src = if xattr.is_empty() {
+    let src = if xattr.is_empty() && mdls() {
         Command::new("mdls")
             .args(["-raw", "-name", "kMDItemWhereFroms"])
             .arg(path)
             .output()
             .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .and_then(|out| {
-                out.lines().find_map(|l| {
-                    let t = l.trim();
-                    let t = t.strip_prefix('"')?;
-                    Some(t.split('"').next().unwrap_or("").to_string())
-                })
-            })
+            .map(|o| mdls_source(&o.stdout))
             .unwrap_or_default()
     } else {
         xattr
     };
-    let src = display_text(&src);
+    source_label(&src)
+}
+
+fn mdls_source(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .find_map(|line| {
+            let text = line.trim().strip_prefix('"')?;
+            Some(text.split('"').next().unwrap_or("").to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn source_label(src: &str) -> String {
+    let src = display_text(src);
     if src.is_empty() || src == "(null)" {
         return "-".into();
     }
@@ -72,6 +93,148 @@ pub fn wall_source(path: &Path) -> String {
     let s = src.split_once("://").map(|(_, r)| r).unwrap_or(&src);
     let s = s.strip_prefix("www.").unwrap_or(s);
     s.split(['/', ':']).next().unwrap_or("").to_string()
+}
+
+/// Amortize macOS metadata startup while retaining xattr precedence and the
+/// existing per-file fallback. Results belong only to this requested snapshot.
+pub(crate) fn wall_sources(paths: &[&Path]) -> BTreeMap<PathBuf, String> {
+    if paths.is_empty() {
+        return BTreeMap::new();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux normally has no Spotlight helper. Establish absence once for
+        // this batch, rather than attempting one failed spawn per file. An
+        // unset PATH, existing candidate, or ambiguous stat error retains the
+        // original per-file helper behavior and its xattr precedence.
+        let mdls = std::cell::OnceCell::new();
+        paths
+            .iter()
+            .map(|path| {
+                let source = wall_source_with_mdls(path, || {
+                    *mdls.get_or_init(|| !mdls_absent(std::env::var_os("PATH").as_deref()))
+                });
+                (path.to_path_buf(), source)
+            })
+            .collect()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        const ARG_BYTES: usize = 64 * 1024;
+        if paths.len() < 2 {
+            return paths
+                .iter()
+                .map(|path| (path.to_path_buf(), wall_source(path)))
+                .collect();
+        }
+        let mut sources = BTreeMap::new();
+        let mut batch = Vec::new();
+        let mut bytes = 0;
+        for &path in paths {
+            let source = xattr_value(path, "theme.source");
+            if !source.is_empty() {
+                sources.insert(path.to_path_buf(), source_label(&source));
+                continue;
+            }
+            let size = path.as_os_str().len().saturating_add(1);
+            if batch.len() == 32 || size > ARG_BYTES.saturating_sub(bytes) {
+                source_batch(&batch, &mut sources);
+                batch.clear();
+                bytes = 0;
+            }
+            if size > ARG_BYTES {
+                sources.insert(path.to_path_buf(), wall_source(path));
+            } else {
+                batch.push(path);
+                bytes += size;
+            }
+        }
+        source_batch(&batch, &mut sources);
+        sources
+    }
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn mdls_absent(path: Option<&std::ffi::OsStr>) -> bool {
+    path.is_some_and(|path| {
+        std::env::split_paths(path).all(|dir| {
+            fs::symlink_metadata(dir.join("mdls")).is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                )
+            })
+        })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn source_batch(paths: &[&Path], sources: &mut BTreeMap<PathBuf, String>) {
+    if paths.len() < 2 {
+        sources.extend(
+            paths
+                .iter()
+                .map(|path| (path.to_path_buf(), wall_source(path))),
+        );
+        return;
+    }
+    let before: Vec<_> = paths
+        .iter()
+        .map(|path| crate::index::file_identity(path))
+        .collect();
+    let labels = mdls_batch(paths);
+    for (i, &path) in paths.iter().enumerate() {
+        let label = labels
+            .as_ref()
+            .filter(|_| before[i].is_some() && before[i] == crate::index::file_identity(path))
+            .map(|labels| labels[i].clone())
+            .unwrap_or_else(|| wall_source(path));
+        sources.insert(path.to_path_buf(), label);
+    }
+}
+
+#[cfg(target_os = "macos")]
+const MDLS_BYTES: usize = 256 * 1024;
+
+#[cfg(target_os = "macos")]
+fn mdls_batch(paths: &[&Path]) -> Option<Vec<String>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = Command::new("mdls")
+        .args(["-raw", "-name", "kMDItemWhereFroms"])
+        .args(paths)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut bytes = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .expect("piped mdls stdout")
+        .take(MDLS_BYTES as u64 + 1)
+        .read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() > MDLS_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    parse_mdls_batch(&bytes, paths.len(), child.wait().ok()?.success())
+}
+
+#[cfg(target_os = "macos")]
+fn parse_mdls_batch(bytes: &[u8], count: usize, success: bool) -> Option<Vec<String>> {
+    if !success || bytes.len() > MDLS_BYTES || count == 0 || count > 32 {
+        return None;
+    }
+    let fields: Vec<_> = bytes.split(|&byte| byte == 0).collect();
+    (fields.len() == count).then(|| {
+        fields
+            .iter()
+            .map(|field| source_label(&mdls_source(field)))
+            .collect()
+    })
 }
 
 /// One extended attribute, read IN-PROCESS — no `xattr` subprocess, because
@@ -99,11 +262,9 @@ pub(crate) fn wall_meta(path: &Path, key: &str) -> String {
 /// cache — a cache read, never an image reprocess. No cached entry (or a
 /// corrupt one) is a silent None: the caller renders a dash.
 pub fn wall_scheme(cfg: &Config, path: &Path) -> Option<Vec<String>> {
-    let key = pigment::cache_key(path, &derive_options()).ok()?;
-    let raw = fs::read_to_string(schemes_dir(cfg).join(format!("{key}.palette"))).ok()?;
-    let pal = pigment::Palette::from_cache_format(&raw)?;
+    let colors = pigment::read_cached_colors(path, &derive_options(), &schemes_dir(cfg)).ok()??;
     Some(
-        pal.colors
+        colors
             .iter()
             .take(8)
             .map(|c| c.hex().trim_start_matches('#').to_string())
@@ -114,24 +275,38 @@ pub fn wall_scheme(cfg: &Config, path: &Path) -> Option<Vec<String>> {
 /// Wallpapers named on the iterator get a scheme derived if missing — the
 /// caller bounds the work by bounding the list. Skipped under THEME_NO_APPLY
 /// (it mutates the cache).
-pub fn backfill_schemes<'a, I: IntoIterator<Item = &'a PathBuf>>(cfg: &Config, paths: I) {
-    if cfg.no_apply {
-        return;
+pub fn backfill_schemes<'a, I: IntoIterator<Item = &'a PathBuf>>(
+    cfg: &Config,
+    paths: I,
+) -> std::collections::BTreeMap<PathBuf, Vec<String>> {
+    let mut schemes = std::collections::BTreeMap::new();
+    let mut missing = Vec::new();
+    for path in paths {
+        if let Some(scheme) = wall_scheme(cfg, path) {
+            schemes.insert(path.clone(), scheme);
+        } else if path.is_file() {
+            missing.push(path);
+        }
     }
-    let missing: Vec<&PathBuf> = paths
-        .into_iter()
-        .filter(|p| p.is_file() && wall_scheme(cfg, p).is_none())
-        .collect();
-    if missing.is_empty() {
-        return;
+    if cfg.no_apply || missing.is_empty() {
+        return schemes;
     }
     note(&format!(
         "deriving {} missing colorscheme(s)…",
         missing.len()
     ));
-    let mut derived = 0usize;
-    for p in &missing {
-        if pigment::cached_derive(p, &derive_options(), &schemes_dir(cfg)).is_ok() {
+    let mut derived = 0;
+    for path in &missing {
+        if let Ok(palette) = pigment::cached_derive(path, &derive_options(), &schemes_dir(cfg)) {
+            schemes.insert(
+                (*path).clone(),
+                palette
+                    .colors
+                    .iter()
+                    .take(8)
+                    .map(|c| c.hex().trim_start_matches('#').to_string())
+                    .collect(),
+            );
             derived += 1;
         }
     }
@@ -141,6 +316,7 @@ pub fn backfill_schemes<'a, I: IntoIterator<Item = &'a PathBuf>>(cfg: &Config, p
             missing.len() - derived
         ));
     }
+    schemes
 }
 
 /// An inline picture via kitty's graphics protocol in unicode-placeholder
@@ -301,24 +477,44 @@ fn birth_secs(path: &Path) -> Option<i64> {
     rustix::fs::stat(path).ok().map(|st| st.st_mtime)
 }
 
-/// The ADDED column, spelled the way this machine spells a date. On macOS
-/// that means LOCAL time — `stat -f %SB` runs the birth time through
-/// `localtime`, and the civil arithmetic below is UTC, which is a different
-/// DAY for anything created after 17:00 in this timezone — so that one
-/// spawn stays until a reviewed reader for the zone database can retire it.
-/// It is now paid once per PRINTED date — one per verbose row, where the
-/// sort key alone used to cost ~1 700 for the same library. Everywhere else
-/// the date is computed here, from the same birth time the ordering uses.
+/// macOS spells ADDED in local time; other platforms retain their UTC date.
+/// Reuse the parsed macOS zone while its source fingerprint remains unchanged.
+/// Unsupported TZ syntax retains the BSD stat path; rejected files fail closed.
 pub(crate) fn added_date(path: &Path) -> String {
     #[cfg(target_os = "macos")]
-    if let Some(out) = Command::new("stat")
-        .args(["-f", "%SB", "-t", "%Y-%m-%d"])
-        .arg(path)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    let timezone = std::env::var_os("TZ");
+    #[cfg(target_os = "macos")]
+    {
+        static ZONE: std::sync::Mutex<DateZoneCache> = std::sync::Mutex::new(DateZoneCache {
+            fingerprint: String::new(),
+            zone: None,
+        });
+        // BSD stat reports the link's own birthtime unless -L is requested.
+        if let Some(date) = rustix::fs::lstat(path).ok().and_then(|st| {
+            ZONE.lock()
+                .unwrap_or_else(|_| die("timezone cache unavailable"))
+                .get(timezone.as_deref())
+                .and_then(|zone| date_in_zone(st.st_birthtime, zone))
+        }) {
+            return date;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(out) = {
+        let mut command = Command::new("stat");
+        command.env_remove("TZ");
+        if let Some(value) = &timezone {
+            command.env("TZ", value);
+        }
+        command
+            .args(["-f", "%SB", "-t", "%Y-%m-%d"])
+            .arg(path)
+            .output()
+            .ok()
+    }
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .filter(|s| !s.is_empty())
     {
         return out;
     }
@@ -337,6 +533,112 @@ pub(crate) fn added_date(path: &Path) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d2:02}")
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct DateZoneCache {
+    fingerprint: String,
+    zone: Option<tz::TimeZone>,
+}
+
+#[cfg(target_os = "macos")]
+impl DateZoneCache {
+    fn get(&mut self, value: Option<&std::ffi::OsStr>) -> Option<&tz::TimeZone> {
+        let before = crate::index::timezone_fingerprint(value);
+        if self.fingerprint != before {
+            let zone = date_zone(value);
+            if before != crate::index::timezone_fingerprint(value) {
+                die("timezone files changed while loading; retry the command");
+            }
+            self.fingerprint = before;
+            self.zone = zone;
+        }
+        self.zone.as_ref()
+    }
+}
+
+/// Follow the system's timezone symlinks, but read only a stable regular file.
+#[cfg(target_os = "macos")]
+fn read_zone_file(path: &str) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind, Read};
+    use std::os::unix::fs::MetadataExt;
+    const MAX: u64 = 1024 * 1024;
+    let descriptor = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )?;
+    let mut file = std::fs::File::from(descriptor);
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() > MAX {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "timezone must be a regular file of at most 1 MiB",
+        ));
+    }
+    let stamp = |m: &std::fs::Metadata| {
+        (
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    };
+    let mut bytes = Vec::new();
+    (&mut file).take(MAX + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX || stamp(&before) != stamp(&file.metadata()?) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "timezone file changed while reading",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn zone_file(path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    match read_zone_file(path) {
+        Ok(bytes) => Ok(bytes),
+        // A missing candidate is normal when parsing a textual POSIX TZ rule.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Err(error.into())
+        }
+        // tz-rs may discard lookup errors; never let a rejected file reach the
+        // legacy stat fallback, whose timezone reader has no such bounds.
+        Err(error) => die(&format!("cannot read timezone file: {error}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn date_zone(value: Option<&std::ffi::OsStr>) -> Option<tz::TimeZone> {
+    let settings = tz::TimeZoneSettings::new(tz::TimeZoneSettings::DEFAULT_DIRECTORIES, zone_file);
+    match value {
+        None => settings.parse_local().ok(),
+        Some(value) if value.is_empty() => Some(tz::TimeZone::utc()),
+        Some(value) => settings.parse_posix_tz(value.to_str()?).ok(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn date_in_zone(secs: i64, zone: &tz::TimeZone) -> Option<String> {
+    let date = tz::DateTime::from_timespec(secs, 0, zone.as_ref()).ok()?;
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        date.month(),
+        date.month_day()
+    ))
 }
 
 pub(crate) fn birth_key(path: &Path) -> i64 {
@@ -369,7 +671,9 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
         total
     };
     let rows: Vec<PathBuf> = files.into_iter().take(shown).collect();
-    backfill_schemes(cfg, rows.iter());
+    let schemes = backfill_schemes(cfg, rows.iter());
+    let sources =
+        verbose.then(|| wall_sources(&rows.iter().map(PathBuf::as_path).collect::<Vec<_>>()));
 
     let cols = columns();
     let pv_ok = verbose && in_kitty() && have("kitten");
@@ -416,9 +720,7 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
             }
         }
         print!("  {name:<namew$}  ");
-        let (sw, n) = wall_scheme(cfg, f)
-            .map(|s| swatch_cells(&s))
-            .unwrap_or_default();
+        let (sw, n) = schemes.get(f).map(|s| swatch_cells(s)).unwrap_or_default();
         print!("{sw}");
         if n == 0 {
             print!("{:<24}", "-");
@@ -428,7 +730,11 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
             }
         }
         if verbose {
-            let src = wall_source(f);
+            let src = sources
+                .as_ref()
+                .and_then(|sources| sources.get(f))
+                .cloned()
+                .unwrap_or_else(|| "-".into());
             let src = if src.chars().count() > 10 {
                 truncate_ellipsis(&src, 10)
             } else {
@@ -451,7 +757,20 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
     }
 }
 
+fn preview_dimensions(
+    path: &Path,
+    prepared: Result<&crate::presentation::PreparedPalette, &String>,
+) -> String {
+    match prepared {
+        // Use the same validated source snapshot as the displayed palette.
+        // Content-sniffed dimensions also work for mislabeled image files.
+        Ok(p) => format!("{}x{}", p.profile.width, p.profile.height),
+        Err(_) => img_size(path),
+    }
+}
+
 pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
+    use std::fmt::Write as _;
     let img: PathBuf = match arg {
         Some(a) => resolve_local(cfg, a).unwrap_or_else(|| {
             die(&format!(
@@ -466,7 +785,7 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
             None => die("no current wallpaper to preview — name one: theme preview <wallpaper>"),
         },
     };
-    backfill_schemes(cfg, std::iter::once(&img));
+    let prepared = crate::presentation::cached_preview(cfg, &img);
     let name = display_text(img.file_stem().and_then(|s| s.to_str()).unwrap_or(""));
     let mut loc = img.display().to_string();
     if let Ok(home) = std::env::var("HOME")
@@ -477,13 +796,22 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
     }
     let loc = display_text(&loc);
     let src = wall_source(&img);
-    let dims = img_size(&img);
+    let dims = preview_dimensions(&img, prepared.as_ref());
     let bytes = human_bytes(&img);
     // Swatch geometry is width-aware (issue #19): 5 visible cells per
     // swatch beside the label when the full row fits, else as many as fit
     // on their own line under the label — truncated, never torn.
     let cols = columns();
-    let scheme = wall_scheme(cfg, &img).unwrap_or_default();
+    let scheme: Vec<String> = prepared
+        .as_ref()
+        .map(|p| {
+            p.palette
+                .colors
+                .iter()
+                .map(|c| c.hex().trim_start_matches('#').to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     let sw_fit = |n: usize| {
         let mut s = String::new();
         for c in scheme.iter().take(n) {
@@ -522,6 +850,10 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
     };
     fields.push(("SIZE", format!("{dims_disp} ({bytes})")));
 
+    // Assemble this display before the stdout write, retaining the shared
+    // broken-pipe handling while avoiding a flush for every rendered line.
+    let mut frame = String::with_capacity(4096);
+
     // Thumbnail above, fields below — stacked, so a long value can never
     // interleave with the image rows; values wrap with a hanging indent.
     // The thumb clamps to the terminal (issue #19): narrower than its 24
@@ -531,28 +863,57 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
     if pw >= 8
         && let Some(p) = render_preview(&img, pw, 10)
     {
-        print!("{}", p.apc);
+        write!(frame, "{}", p.apc).unwrap();
         for r in &p.rows {
-            println!("  {r}");
+            writeln!(frame, "  {r}").unwrap();
         }
-        println!();
+        writeln!(frame).unwrap();
     }
     for (label, value) in &fields {
         for line in wrap_field(label, value, cols) {
-            println!("{line}");
+            writeln!(frame, "{line}").unwrap();
         }
     }
     if scheme.is_empty() {
-        println!("  {:<12} -", "COLORSCHEME");
+        writeln!(frame, "  {:<12} -", "COLORSCHEME").unwrap();
     } else if cols >= 15 + 8 * 5 {
-        println!("  {:<12} {}", "COLORSCHEME", sw_fit(8));
+        writeln!(frame, "  {:<12} {}", "COLORSCHEME", sw_fit(8)).unwrap();
     } else {
-        println!("  COLORSCHEME");
-        println!("    {}", sw_fit((cols.saturating_sub(4) / 5).max(1)));
+        writeln!(frame, "  COLORSCHEME").unwrap();
+        writeln!(frame, "    {}", sw_fit((cols.saturating_sub(4) / 5).max(1))).unwrap();
     }
     for line in wrap_field("LOCATION", &loc, cols) {
-        println!("{line}");
+        writeln!(frame, "{line}").unwrap();
     }
+    match prepared {
+        Ok(p) => {
+            let value = format!(
+                "{:.2}:1 worst; {:.0}% of {} regions meet {:.1}:1; opacity {:.2}",
+                p.readability.worst,
+                p.readability.coverage * 100.0,
+                p.readability.samples,
+                p.contrast,
+                p.opacity
+            );
+            for line in wrap_field("READABILITY", &value, cols) {
+                writeln!(frame, "{line}").unwrap();
+            }
+            writeln!(frame).unwrap();
+            for line in p.specimen(cols.saturating_sub(2)).lines() {
+                writeln!(frame, "  {line}").unwrap();
+            }
+        }
+        Err(e) => {
+            for line in wrap_field(
+                "PALETTE",
+                &format!("unavailable: {}", display_text(&e)),
+                cols,
+            ) {
+                writeln!(frame, "{line}").unwrap();
+            }
+        }
+    }
+    print!("{frame}");
 }
 
 /// One metadata line, wrapped at the terminal edge with a hanging indent to
@@ -731,4 +1092,414 @@ pub fn cmd_status(cfg: &Config) {
         "  THEME_CACHE_DIR       ",
         &display_text(&cfg.cache_dir.display().to_string()),
     );
+}
+
+#[cfg(test)]
+mod preview_dimension_tests {
+    use super::*;
+    use crate::presentation::prepare;
+
+    fn fixture(name: &str) -> PathBuf {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("preview-dimensions-{}-{name}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_image(path: &Path, format: image::ImageFormat, width: u32, height: u32) {
+        image::save_buffer_with_format(
+            path,
+            &[45, 90, 140].repeat((width * height) as usize),
+            width,
+            height,
+            image::ColorType::Rgb8,
+            format,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn prepared_dimensions_match_original_headers_and_keep_error_fallback() {
+        let root = fixture("formats");
+        for (format, extension, width, height) in [
+            (image::ImageFormat::Png, "png", 37, 19),
+            (image::ImageFormat::Jpeg, "jpg", 259, 131),
+            (image::ImageFormat::WebP, "webp", 131, 257),
+        ] {
+            let path = root.join(format!("sample.{extension}"));
+            write_image(&path, format, width, height);
+            let opts = pigment::Options::default();
+            pigment::cached_derive(&path, &opts, &root.join("cache")).unwrap();
+            let raw = pigment::read_cached(&path, &opts, &root.join("cache"))
+                .unwrap()
+                .unwrap();
+            let failed = prepare(raw.clone(), f64::NAN, 4.5);
+            let prepared = prepare(raw, 1.0, 4.5);
+            let expected = format!("{width}x{height}");
+            assert_eq!(img_size(&path), expected);
+            assert_eq!(preview_dimensions(&path, prepared.as_ref()), expected);
+            assert!(failed.is_err());
+            assert_eq!(preview_dimensions(&path, failed.as_ref()), expected);
+            // A valid prepared snapshot does not reopen the image. The error
+            // path still probes it and retains the existing unknown result.
+            fs::remove_file(&path).unwrap();
+            assert_eq!(preview_dimensions(&path, prepared.as_ref()), expected);
+            assert_eq!(preview_dimensions(&path, failed.as_ref()), "");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_dimensions_follow_content_for_mislabeled_and_extensionless_files() {
+        let root = fixture("content");
+        for (format, name) in [
+            (image::ImageFormat::Png, "png-bytes.jpg"),
+            (image::ImageFormat::Jpeg, "jpeg-bytes.png"),
+            (image::ImageFormat::WebP, "webp-bytes.jpg"),
+            (image::ImageFormat::Png, "extensionless"),
+        ] {
+            let path = root.join(name);
+            write_image(&path, format, 139, 73);
+            let prepared = prepare(
+                pigment::derive(&path, &pigment::Options::default()).unwrap(),
+                1.0,
+                4.5,
+            );
+            assert_eq!(img_size(&path), "");
+            assert_eq!(preview_dimensions(&path, prepared.as_ref()), "139x73");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_source_gets_new_dimensions_without_changing_the_old_snapshot() {
+        let root = fixture("changed");
+        let path = root.join("sample.png");
+        let cache = root.join("cache");
+        let opts = pigment::Options::default();
+        write_image(&path, image::ImageFormat::Png, 37, 19);
+        let first = prepare(
+            pigment::cached_derive(&path, &opts, &cache).unwrap(),
+            1.0,
+            4.5,
+        );
+        write_image(&path, image::ImageFormat::Png, 71, 43);
+        let second = prepare(
+            pigment::cached_derive(&path, &opts, &cache).unwrap(),
+            1.0,
+            4.5,
+        );
+        assert_eq!(img_size(&path), "71x43");
+        assert_eq!(preview_dimensions(&path, first.as_ref()), "37x19");
+        assert_eq!(preview_dimensions(&path, second.as_ref()), "71x43");
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod date_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn local_dates_match_bsd_across_zones_dst_and_midnight() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("date-parity-{}", std::process::id()));
+        std::fs::write(&path, b"date parity fixture").unwrap();
+        let birth = birth_secs(&path).unwrap();
+        // Epoch, local New Year, both 2024 DST transitions, and summer midnight.
+        let timestamps = [
+            -1,
+            0,
+            1_704_085_199,
+            1_704_085_200,
+            1_710_053_999,
+            1_710_054_000,
+            1_730_613_599,
+            1_730_613_600,
+            1_719_806_399,
+            1_719_806_400,
+        ];
+        for value in [
+            None,
+            Some(""),
+            Some("UTC"),
+            Some("America/New_York"),
+            Some(":America/New_York"),
+            Some("/usr/share/zoneinfo/America/New_York"),
+            Some(":/usr/share/zoneinfo/America/New_York"),
+            Some("EST5EDT,M3.2.0,M11.1.0"),
+        ] {
+            let zone = date_zone(value.map(OsStr::new)).unwrap();
+            let command = |program: &str| {
+                let mut command = Command::new(program);
+                command.env_remove("TZ");
+                if let Some(value) = value {
+                    command.env("TZ", value);
+                }
+                command
+            };
+            for secs in timestamps {
+                let expected = command("/bin/date")
+                    .args(["-r", &secs.to_string(), "+%Y-%m-%d"])
+                    .output()
+                    .unwrap();
+                assert!(expected.status.success());
+                assert_eq!(
+                    date_in_zone(secs, &zone).unwrap(),
+                    String::from_utf8(expected.stdout).unwrap().trim(),
+                    "TZ={value:?}, timestamp={secs}"
+                );
+            }
+            let expected = command("/usr/bin/stat")
+                .args(["-f", "%SB", "-t", "%Y-%m-%d"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(expected.status.success());
+            assert_eq!(
+                date_in_zone(birth, &zone).unwrap(),
+                String::from_utf8(expected.stdout).unwrap().trim(),
+                "TZ={value:?}"
+            );
+        }
+        let expected = Command::new("/usr/bin/stat")
+            .args(["-f", "%SB", "-t", "%Y-%m-%d"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            added_date(&path),
+            String::from_utf8(expected.stdout).unwrap().trim()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unsupported_zone_selects_existing_stat_fallback() {
+        assert!(date_zone(Some(OsStr::new("not-a-timezone"))).is_none());
+        use std::os::unix::ffi::OsStrExt;
+        assert!(date_zone(Some(OsStr::from_bytes(b"\xff"))).is_none());
+    }
+
+    #[test]
+    fn changed_private_timezone_refreshes_cached_date() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("date-zone-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zone");
+        std::fs::write(
+            &path,
+            read_zone_file("/usr/share/zoneinfo/America/New_York").unwrap(),
+        )
+        .unwrap();
+        let mut cache = DateZoneCache::default();
+        assert_eq!(
+            date_in_zone(0, cache.get(Some(path.as_os_str())).unwrap()).unwrap(),
+            "1969-12-31"
+        );
+        let before = cache.fingerprint.clone();
+        std::fs::write(&path, read_zone_file("/usr/share/zoneinfo/UTC").unwrap()).unwrap();
+        assert_eq!(
+            date_in_zone(0, cache.get(Some(path.as_os_str())).unwrap()).unwrap(),
+            "1970-01-01"
+        );
+        assert_ne!(before, cache.fingerprint);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn timezone_reader_is_bounded_and_requires_a_regular_file() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("date-zone-reader-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zone");
+        std::fs::write(&path, b"small ordinary file").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(
+            read_zone_file(link.to_str().unwrap()).unwrap(),
+            b"small ordinary file"
+        );
+        assert_eq!(
+            read_zone_file(dir.to_str().unwrap()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+        assert_eq!(
+            read_zone_file(path.to_str().unwrap()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn source_helper_child() {
+        let Some(image) = std::env::var_os("THEME_TEST_SOURCE_IMAGE") else {
+            return;
+        };
+        let path = std::env::var_os("PATH");
+        let absent = mdls_absent(path.as_deref());
+        assert_eq!(
+            absent,
+            std::env::var("THEME_TEST_MDLS_ABSENT").unwrap() == "1"
+        );
+        let original = wall_source_with_mdls(Path::new(&image), || true);
+        let optimized = wall_source_with_mdls(Path::new(&image), || !absent);
+        assert_eq!(optimized, original);
+        assert_eq!(optimized, std::env::var("THEME_TEST_SOURCE_LABEL").unwrap());
+    }
+
+    #[test]
+    fn helper_absence_preserves_present_ambiguous_and_empty_path_behavior() {
+        assert!(!mdls_absent(None)); // exec's default PATH is not absence.
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("source-helper-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("image.png");
+        fs::write(&image, b"source fixture").unwrap();
+        for name in ["missing", "present", "directory", "dangling", "loop"] {
+            fs::create_dir(dir.join(name)).unwrap();
+        }
+        let helper = dir.join("present/mdls");
+        fs::write(
+            &helper,
+            b"#!/bin/sh\nprintf '(\\n    \"https://images.unsplash.com/fixture\"\\n)\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(dir.join("directory/mdls")).unwrap();
+        std::os::unix::fs::symlink("absent", dir.join("dangling/mdls")).unwrap();
+        std::os::unix::fs::symlink("mdls", dir.join("loop/mdls")).unwrap();
+        std::os::unix::fs::symlink("ancestor-loop", dir.join("ancestor-loop")).unwrap();
+        assert!(fs::symlink_metadata(dir.join("ancestor-loop/mdls")).is_err());
+        let missing = dir.join("missing");
+        let present = dir.join("present");
+        for (path, cwd, absent, label) in [
+            (missing.as_os_str().to_owned(), &dir, true, "-"),
+            (image.as_os_str().to_owned(), &dir, true, "-"),
+            (
+                std::env::join_paths([&missing, &present]).unwrap(),
+                &dir,
+                false,
+                "unsplash",
+            ),
+            (std::ffi::OsString::new(), &present, false, "unsplash"),
+            (dir.join("directory").into_os_string(), &dir, false, "-"),
+            (dir.join("dangling").into_os_string(), &dir, false, "-"),
+            (dir.join("loop").into_os_string(), &dir, false, "-"),
+            (dir.join("ancestor-loop").into_os_string(), &dir, false, "-"),
+        ] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "report::helper_tests::source_helper_child",
+                    "--nocapture",
+                ])
+                .current_dir(cwd)
+                .env("PATH", path)
+                .env("THEME_TEST_SOURCE_IMAGE", &image)
+                .env("THEME_TEST_MDLS_ABSENT", if absent { "1" } else { "0" })
+                .env("THEME_TEST_SOURCE_LABEL", label)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn batch_preserves_record_order_and_first_url_semantics() {
+        let first = b"(\n    \"https://images.unsplash.com/a.jpg\",\n    \"https://example.org/ignored\"\n)";
+        let second = b"(null)";
+        let third = b"(\n    \"https://www.example.org/a%20picture.png\"\n)";
+        let raw = [first.as_slice(), second.as_slice(), third.as_slice()].join(&0);
+        assert_eq!(
+            parse_mdls_batch(&raw, 3, true).unwrap(),
+            ["unsplash", "-", "example.org"]
+        );
+        assert_eq!(mdls_source(first), "https://images.unsplash.com/a.jpg");
+        assert_eq!(
+            parse_mdls_batch(&raw, 3, true).unwrap(),
+            [first.as_slice(), second.as_slice(), third.as_slice()]
+                .map(|field| source_label(&mdls_source(field)))
+        );
+    }
+
+    #[test]
+    fn failed_incomplete_extra_and_oversized_batches_select_fallback() {
+        let raw = b"(null)\0(null)";
+        assert!(parse_mdls_batch(raw, 2, false).is_none());
+        assert!(parse_mdls_batch(raw, 3, true).is_none());
+        assert!(parse_mdls_batch(raw, 1, true).is_none());
+        assert!(parse_mdls_batch(b"", 0, true).is_none());
+        assert!(parse_mdls_batch(&vec![b'x'; MDLS_BYTES + 1], 1, true).is_none());
+        assert!(parse_mdls_batch(&[b"x".as_slice(); 33].join(&0), 33, true).is_none());
+    }
+
+    #[test]
+    fn batch_keeps_xattr_sources_and_filenames_with_spaces() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("source-batch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = [dir.join("one image.png"), dir.join("two # image.png")];
+        for (path, source) in paths.iter().zip([
+            "https://images.unsplash.com/one",
+            "https://www.example.org/two",
+        ]) {
+            std::fs::write(path, b"source fixture").unwrap();
+            rustix::fs::setxattr(
+                path,
+                "theme.source",
+                source.as_bytes(),
+                rustix::fs::XattrFlags::empty(),
+            )
+            .unwrap();
+        }
+        let got = wall_sources(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
+        assert_eq!(got[&paths[0]], "unsplash");
+        assert_eq!(got[&paths[1]], "example.org");
+        for path in &paths {
+            assert_eq!(
+                wall_source_with_mdls(path, || panic!("xattr source probed helper availability")),
+                got[path]
+            );
+        }
+        assert_eq!(got.len(), 2);
+        assert!(wall_sources(&[]).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -17,7 +17,7 @@
 //! Nothing here talks to api.github.com (issue #51). Unauthenticated API
 //! calls share one 60-per-hour budget per address with everything else on
 //! the machine, so ordinary use — a prompt segment asking `theme version`,
-//! a script, the footer's daily refresh — could spend it and make
+//! a script — could spend it and make
 //! `theme update` report a network that was never down. The web endpoint
 //! `github.com/snaraj/theme/releases/latest` answers 302 with the tag in
 //! its `Location` and is not API-metered; every asset path below it is
@@ -60,9 +60,8 @@ const TAG_PREFIX: &str = "https://github.com/snaraj/theme/releases/tag/";
 /// asset URLs are BUILT from a shape-checked tag — never read out of a
 /// document that could name somewhere else.
 const DOWNLOAD_BASE: &str = "https://github.com/snaraj/theme/releases/download";
-/// How long a footer-note check result stays fresh. One bounded, silent
-/// refresh attempt per window, shared with `theme update` through the same
-/// cache file.
+/// How long the footer may display an answer earned by an explicit
+/// `theme version` or `theme update`. Help never refreshes this cache.
 const CHECK_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Every host an asset download may touch: the release-download URL itself
 /// plus GitHub's asset CDN (current, and the previous one it may still
@@ -392,8 +391,7 @@ fn binary_target(path: &Path) -> Result<PathBuf, String> {
 /// The latest published tag, resolved from ONE request whose redirect is
 /// read but never followed. `budget` is the caller's latency cap in
 /// seconds — 30 for the explicit `theme update`, 2 for `theme version`'s
-/// live ask and the footer's silent refresh, both of which wait behind a
-/// person.
+/// live ask.
 ///
 /// The transport is the TRUSTED curl only — resolved and re-validated per
 /// call, never PATH (round 8: one planted curl would control metadata,
@@ -501,36 +499,23 @@ fn check_off() -> bool {
         .unwrap_or(false)
 }
 
-/// The CACHED answer, the footer note's contract: one small cache file is
-/// read, and at most one bounded refresh (2s hard cap) runs per
-/// [`CHECK_TTL`] window — stamped even on failure, so an offline machine
-/// pays it once per window, not per run.
+/// The footer's cached answer: read one trusted file, never request a
+/// release or stamp an attempt. Missing or stale data stays silent, so
+/// opening help cannot wait on the network.
 ///
 /// None whenever the latest cannot be KNOWN: the kill-switch
 /// (THEME_NO_UPDATE_CHECK, non-empty) is set, custody refuses the cache
-/// dir, no trusted transport exists, the refresh failed, or the cache is
-/// malformed. The footer renders silence on None and may never guess.
-/// Every cache touch — read and stamp alike — goes through [`check_dir`]'s
-/// fail-closed custody.
+/// dir, or the cache is stale or malformed. Only an explicit version/update
+/// request refreshes it. Reads retain [`check_dir`]'s fail-closed custody.
 pub fn latest_tag(cfg: &Config) -> Option<(u64, u64, u64)> {
     if check_off() {
         return None;
     }
-    // Custody first: a cache dir that fails the fail-closed audit gets no
-    // read, no stamp, no answer — and no network attempt either.
+    // Custody first: a refused directory gets no read and no answer.
     let dirfd = check_dir(cfg)?;
-    let (fresh, mut cached) = read_check(&dirfd);
+    let (fresh, cached) = read_check(&dirfd);
     if !fresh {
-        // No trusted transport ⇒ no network AND no stamp (decided, round
-        // 8): the TTL stamp exists to rate-limit NETWORK attempts, and no
-        // attempt happened — validating a candidate is one local stat, so
-        // there is nothing to throttle and a masked window would only hide
-        // a transport that recovers a minute later. A still-fresh cache
-        // above renders fine without any transport at all.
-        crate::net::trusted_curl()?;
-        let tag = latest_tag_remote("2").unwrap_or_default();
-        write_check_at(&dirfd, &tag);
-        cached = tag;
+        return None;
     }
     // The cached tag is REMOTE data: it survives only as a strict numeric
     // semver triple, so nothing a caller prints is ever the cached string.
@@ -539,9 +524,8 @@ pub fn latest_tag(cfg: &Config) -> Option<(u64, u64, u64)> {
 
 /// The deliberate question's answer (`theme version`, issue #42): the
 /// cache's freshness is never consulted and one bounded request runs on
-/// EVERY call — under the same 2s cap the footer has always lived on,
-/// because the caller is waiting. A usable tag stamps the shared cache so
-/// the footer benefits from the ask; a failed one stamps NOTHING —
+/// EVERY call — under a 2s cap because the caller is waiting. A usable tag
+/// stamps the shared cache so the footer benefits; a failed one stamps NOTHING —
 /// overwriting a good stamp with a failure would silence the footer for a
 /// whole TTL window.
 ///
@@ -564,7 +548,7 @@ fn current_v3() -> Option<(u64, u64, u64)> {
 }
 
 /// The update-available footer on the bare `theme` screen. Silent on every
-/// failure mode — offline, rate-limited, refused custody, malformed cache —
+/// cache failure — missing, stale, refused custody, malformed content —
 /// and printed ONLY when the latest is strictly newer than this build. Both
 /// printed values are RECONSTRUCTED from the parsed numbers, so a
 /// remote-supplied string or URL is never echoed.
@@ -658,7 +642,7 @@ pub fn cmd_version(cfg: &Config) {
 /// parent fd, after the parent chain passed in full: a refused chain
 /// creates nothing anywhere (round 7). Audited, never chmodded. Any
 /// failure gets NOTHING: no stamp, no read, no note, no network.
-fn check_dir(cfg: &Config) -> Option<rustix::fd::OwnedFd> {
+pub(crate) fn check_dir(cfg: &Config) -> Option<rustix::fd::OwnedFd> {
     let acl = crate::save::AclAudit::native();
     let parent = cfg.cache_dir.parent()?;
     let leaf = cfg.cache_dir.file_name()?;
@@ -759,10 +743,9 @@ pub(crate) fn fd_custody_ok(st: &rustix::fs::Stat, my_uid: u32) -> bool {
         && st.st_mode & 0o022 == 0
 }
 
-/// Stamp the check cache: content is the latest known tag (empty when the
-/// refresh failed — stamping the failed attempt is the deliberate
-/// anti-thundering choice, one bounded try per TTL window), mtime is the
-/// attempt time. Custody-gated by [`check_dir`].
+/// Stamp a successful explicit release check; mtime is the answer's age.
+/// Failed requests preserve the last good answer. Custody-gated by
+/// [`check_dir`].
 fn write_check(cfg: &Config, tag: &str) {
     if let Some(dirfd) = check_dir(cfg) {
         write_check_at(&dirfd, tag);
@@ -825,8 +808,7 @@ fn read_check(dirfd: &rustix::fd::OwnedFd) -> (bool, String) {
         .modified()
         .map(|t| match std::time::SystemTime::now().duration_since(t) {
             Ok(age) => age <= CHECK_TTL,
-            // A future mtime reads as fresh, not stale — the failure mode
-            // of a skewed clock must be silence, never a hot loop.
+            // Preserve the last known answer during a clock rollback.
             Err(_) => true,
         })
         .unwrap_or(false);
