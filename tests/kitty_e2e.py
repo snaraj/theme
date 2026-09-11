@@ -41,6 +41,7 @@ PAGES = -(-IMAGES // PAGE_SIZE)
 WINDOW = (1400, 900)
 THUMBNAIL_ROWS = 7  # what the sheet reserves per card, before title and swatches
 PLACEHOLDER = "\U0010eeee"  # the cell kitty fills with a transmitted image
+PROMPT = "browse>"  # printed last, which is what makes it the settled signal
 SOCKET_WAIT = 30.0
 ASSERT_WAIT = 10.0
 POLL = 0.2
@@ -321,6 +322,22 @@ class Session:
         self.log.close()
 
 
+def settled(screen):
+    """Whether the browser has finished answering the last key: its prompt
+    is printed after everything else, so the prompt being the final
+    non-empty row is what says the sheet, preview or help above it is whole.
+
+    A page counter is the FIRST line of a sheet, so waiting on the counter
+    alone reads a screen that is still being drawn. On a hosted runner that
+    put a page-2 header on rows 47-48 of a 50-line screen, the band was
+    computed at rows 49-56, the sheet then finished and scrolled the
+    pictures up to rows 24-47, and every retry measured the stale band
+    (#87). Every wait below pairs its own expectation with this.
+    """
+    rows = [row for row in screen.splitlines() if row.strip()]
+    return bool(rows) and rows[-1].startswith(PROMPT)
+
+
 def query_row(screen):
     """The row of the most recent sheet's query line: the header the seven
     reserved thumbnail rows follow. Output is appended, so the last one on
@@ -427,10 +444,10 @@ def main():
         needed = 3 + card_rows * (THUMBNAIL_ROWS + 3) + 2
         check("the whole sheet fits the screen", lines >= needed,
               f"{lines} lines, {needed} needed for {card_rows} card rows")
-        # Wait for the prompt: it is printed last, so a half-drawn sheet can
-        # never answer an assertion.
+        # Settled first, always: a half-drawn sheet must never answer an
+        # assertion, and the band is located from the screen that answers.
         screen = session.wait_until(f"the first sheet ({PAGES} pages)",
-                                    lambda s: "browse>" in s and last_page(s) == f"1/{PAGES}")
+                                    lambda s: settled(s) and last_page(s) == f"1/{PAGES}")
         check("first sheet is page 1", last_page(screen) == f"1/{PAGES}", f"page {last_page(screen)}")
         session.dump("sheet", screen)
 
@@ -470,7 +487,7 @@ def main():
         session.send(b"\x1b[C")
         try:
             session.wait_until("Right previews the sheet's first card",
-                               lambda s: last_title(s) == first)
+                               lambda s: settled(s) and last_title(s) == first)
             check("Right previews the sheet's first card", True, f"title {' '.join(first)}")
         except Failure as error:
             check("Right previews the sheet's first card", False, str(error).splitlines()[0])
@@ -484,11 +501,12 @@ def main():
             session.send(keys)
             try:
                 screen = session.wait_until(f"{name} shows page {want}",
-                                            lambda s: last_page(s) == want)
+                                            lambda s: settled(s) and last_page(s) == want)
                 check(f"{name} shows page {want}", True, f"page {last_page(screen)}")
             except Failure as error:
                 check(f"{name} shows page {want}", False, str(error).splitlines()[0])
             if name == "Down":
+                # `screen` is settled, so this header is the finished sheet's.
                 session.dump("page-change", screen)
                 turned = query_row(screen)
                 if turned is None:
@@ -504,7 +522,8 @@ def main():
                                  (b"p\n", "p steps back to the first", first)]:
             session.send(keys)
             try:
-                screen = session.wait_until(f"{name} ({want})", lambda s: last_title(s) == want)
+                screen = session.wait_until(f"{name} ({want})",
+                                            lambda s: settled(s) and last_title(s) == want)
                 check(name, True, f"title {' '.join(last_title(screen))}")
             except Failure as error:
                 check(name, False, str(error).splitlines()[0])
@@ -513,7 +532,8 @@ def main():
         # screen can hold; the scrollback proves the key map is in it.
         session.send(b"?\n")
         try:
-            session.wait_until("? prints the usage text", lambda s: "THEME_NO_APPLY" in s)
+            session.wait_until("? prints the usage text",
+                               lambda s: settled(s) and "THEME_NO_APPLY" in s)
             printed = session.text(extent="all")
             check("? prints the usage text naming the keys",
                   "theme browse [terms...]" in printed
