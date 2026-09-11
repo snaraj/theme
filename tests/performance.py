@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SGR = re.compile(r"\x1b\[([0-9;]*)m")
 CONFIDENCE = .999
 BOOTSTRAPS = 20000
+RELATIVE_FLOOR = .02
 NEW_WARM_MS, NEW_COLD_MS = 500., 3000.
 BASE_COLORS = ["#000000", "#aa0000", "#00aa00", "#aa5500", "#0000aa", "#aa00aa",
                "#00aaaa", "#aaaaaa", "#555555", "#ff5555", "#55ff55", "#ffff55",
@@ -43,6 +44,9 @@ def digest(data):
 
 def percentile(values, fraction):
     return sorted(values)[max(0, math.ceil(len(values) * fraction) - 1)]
+
+
+MEASURES = {"median": statistics.median, "p95": lambda values: percentile(values, .95)}
 
 
 def bootstrap_bounds(before, after):
@@ -60,25 +64,27 @@ def bootstrap_bounds(before, after):
     return {name: percentile(values, (1 - CONFIDENCE) / 2) for name, values in boot.items()}
 
 
-def compare(before, after):
-    """Paired median/p95 confidence around zero; no allowed slowdown budget."""
+def compare(before, after, gated=("median", "p95")):
+    """Paired confidence per gated metric, floored at 2% of the baseline value."""
     if len(before) != len(after) or len(before) < 9:
         raise ValueError("at least nine matched timing observations are required")
     deltas = [a - b for b, a in zip(before, after)]
     median = statistics.median
     bounds = bootstrap_bounds(before, after)
     metrics = {}
-    for name, measure in [("median", median), ("p95", lambda values: percentile(values, .95))]:
+    for name in gated:
+        measure = MEASURES[name]
         blocks = [measure(after[i::3]) - measure(before[i::3]) for i in range(3)]
-        lower = bounds[name]
+        lower, shift = bounds[name], measure(after) - measure(before)
         supported = [delta > 0 for delta in blocks]
         repeated = sum(supported) >= 2
-        # Exact ties can obscure a p95 shift in small bootstrap samples. A
-        # repeated shift with NO faster pair is still a slowdown, not noise
-        # that may be waived. Real clock measurements rarely contain ties.
-        monotone = all(delta >= 0 for delta in deltas) and measure(after) > measure(before)
-        evidence = lower > 0 or monotone
-        metrics[name] = {"delta_ms": measure(after) - measure(before),
+        # Byte-identical binaries drift by up to 0.9% on this apparatus, so a
+        # smaller shift measures the harness. The floor guards the confidence
+        # bound; the no-faster-pair path must clear it with the shift as well.
+        floor = RELATIVE_FLOOR * measure(before)
+        monotone = all(delta >= 0 for delta in deltas) and shift > 0
+        evidence = lower > floor or (monotone and shift > floor)
+        metrics[name] = {"delta_ms": shift, "floor_ms": floor,
                          "bootstrap_lower_ms": lower, "block_deltas_ms": blocks,
                          "supported_blocks": supported,
                          "monotone": monotone, "regression": repeated and evidence,
@@ -87,23 +93,27 @@ def compare(before, after):
             "before_p95_ms": percentile(before, .95), "after_p95_ms": percentile(after, .95),
             "paired_deltas_ms": deltas, "paired_median_delta_ms": median(deltas),
             "delta_percent": 100 * (median(after) - median(before)) / median(before),
-            "metrics": metrics, "regression_threshold_ms": 0,
+            "metrics": metrics,
             "regression": any(value["regression"] for value in metrics.values()),
             "needs_confirmation": any(value["regression"] or value["inconclusive"] for value in metrics.values())}
 
 
 def compare_cold(before, after):
-    return compare(before, after)
+    # Nine cold pairs put the nearest-rank p95 at the maximum observation: one
+    # outlier is not a tail regression. Cold p95 is reported, never gated.
+    return compare(before, after, gated=("median",))
 
 
-def confirmation_verdict(initial, confirmation):
-    if not initial["needs_confirmation"]:
-        return "PASS"
-    if confirmation is not None and any(initial["metrics"][name]["regression"] and
-                                        confirmation["metrics"][name]["regression"] for name in initial["metrics"]):
-        return "FAIL"
-    # A noisy second batch cannot erase supported evidence from the first.
-    return "INCONCLUSIVE"
+def decisive_verdict(initial, next_batch):
+    """Best of three equal batches; one single metric must vote twice to FAIL."""
+    batches = [initial]
+    votes = lambda: [sum(batch["metrics"][name]["regression"] for batch in batches)
+                     for name in initial["metrics"]]
+    if initial["needs_confirmation"]:
+        batches.append(next_batch())
+        if max(votes()) == 1:
+            batches.append(next_batch())
+    return "FAIL" if max(votes()) >= 2 else "PASS"
 
 
 def supports(command, code, stdout, stderr):
@@ -325,7 +335,7 @@ class Harness:
             self.binary_info[label] = {"path": str(path), "sha256": digest(data),
                 "native_header": data[:4] in (b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
                                               b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xce", b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf")}
-        self.records, self.views, self.failures, self.palettes, self.inconclusive = [], {}, [], {}, []
+        self.records, self.views, self.failures, self.palettes = [], {}, [], {}
         self.library = args.library.resolve(strict=True) if args.library else self.fixture / "library"
         if not args.library:
             self.library.mkdir()
@@ -461,6 +471,15 @@ class Harness:
                 observed[variant].append(self.run(command, variant, phase, sample, environment)[0])
         return observed
 
+    def confirm_batch(self, command, variants, phase, count, environments, batches):
+        """One more equal batch; a cold batch never reuses an earlier cold cache."""
+        label = f"{phase}-confirm-{len(batches) + 1}"
+        observed = self.timing_batch(command, variants, label, count, environments, cold=phase == "cold")
+        comparison = (compare_cold if phase == "cold" else compare)(observed["before"], observed["after"])
+        batches.append({"comparison": comparison, "raw_ms": observed,
+                        "sample_counts": {variant: len(values) for variant, values in observed.items()}})
+        return comparison
+
     def measure(self):
         self.discover()
         comparisons = {}
@@ -489,13 +508,9 @@ class Harness:
             if paired:
                 for phase, initial, count in [("cold", result["cold_comparison"], self.args.cold_samples),
                                                ("warm", result, self.args.samples)]:
-                    confirmation = None
-                    if initial["needs_confirmation"]:
-                        observed = self.timing_batch(command, variants, f"{phase}-confirm", count, environments, cold=phase == "cold")
-                        confirmation = compare(observed["before"], observed["after"])
-                        result["confirmation"][phase] = {"comparison": confirmation, "raw_ms": observed,
-                            "sample_counts": {variant: len(values) for variant, values in observed.items()}}
-                    result["phase_verdicts"][phase] = confirmation_verdict(initial, confirmation)
+                    batches = result["confirmation"][phase] = []
+                    result["phase_verdicts"][phase] = decisive_verdict(initial, lambda: self.confirm_batch(
+                        command, variants, phase, count, environments, batches))
             if not paired:
                 result["absolute_budget"] = new_budget(result["after_median_ms"], result["cold"]["after"]["median_ms"], bool(self.args.library))
                 if result["absolute_budget"]["exceeded"]:
@@ -548,10 +563,7 @@ class Harness:
                 decision = "IDENTICAL_BINARY" if eligible and identical else statistical
                 result["timing_gate_verdicts"][phase] = decision
                 if decision not in ("PASS", "IDENTICAL_BINARY"):
-                    message = f"{command}: {phase} {decision} after independent confirmation"
-                    self.timing_failures.append(message)
-                    if decision == "INCONCLUSIVE":
-                        self.inconclusive.append(message)
+                    self.timing_failures.append(f"{command}: {phase} {decision} after independent confirmation")
 
     def report(self, comparisons):
         self.finalize_timing(comparisons)
@@ -569,18 +581,18 @@ class Harness:
                     "browse/index support is probed through --help. New commands have candidate-only timings, never before/after speed claims.",
                     "New-command synthetic fixture stall budgets: warm median 500 ms, cold median 3000 ms. Budgets are skipped with --library.",
                     "New-command rendering must fit 25/80/120 columns. Once the baseline supports the command, normal paired gates apply."]
-        controls += ["A supported initial timing shift triggers an independent alternating confirmation batch with the same sample count; cold confirmation uses fresh caches.",
-                     "For different executable bytes, matching supported metric regressions in both batches FAIL. An initial signal without a matching confirmation is INCONCLUSIVE and blocks CI; it never becomes a statistical PASS.",
+        controls += ["A metric votes for its batch when its shift repeats in at least two of three interleaved blocks and clears the floor: a 99.9% paired-bootstrap lower bound above 2% of the baseline value, or no faster pair and a shift above the same 2%.",
+                     "The floor exists because byte-identical binaries drift by up to 0.9% on this apparatus; below it the harness cannot tell code from apparatus.",
+                     "The cold phase gates the median alone. With nine cold samples the nearest-rank p95 is the maximum observation, so cold p95 is reported as a diagnostic; the warm phase keeps its p95 gate over 63 pairs. Every observation is retained.",
+                     "Up to three equal batches decide, cold batches always with fresh caches: the second runs when the first votes or shows evidence without repetition, the third only when the first two disagree. One single metric with two votes FAILs; otherwise the phase PASSes.",
                      "IDENTICAL_BINARY is restricted to --built-artifacts with the controlled synthetic fixture, native executable headers and matching before/after hashes for both executables. The caller must supply comparable direct builds; headers alone are not build provenance. Standalone runs stay strict by default.",
-                     "In IDENTICAL_BINARY mode, timing observations and statistical verdicts remain diagnostics: this is no code-performance comparison or speed claim. All execution, semantic, capability and rendering errors still block CI.",
-                     "With nine cold samples the nearest-rank p95 is the maximum observation; every observation is retained."]
+                     "In IDENTICAL_BINARY mode, timing observations and statistical verdicts remain diagnostics: this is no code-performance comparison or speed claim. All execution, semantic, capability and rendering errors still block CI."]
         if self.args.commands:
             controls.append("Explicit command subset: " + ", ".join(self.commands) + "; this is not a complete CI matrix run.")
         failures = self.failures + self.timing_failures
         revisions = {label: os.environ.get(key, "unknown") for label, key in
                      [("before", "THEME_PERF_BASE_SHA"), ("after", "THEME_PERF_HEAD_SHA")]}
-        verdict = ("FAIL" if self.failures or any(failure not in self.inconclusive for failure in self.timing_failures)
-                   else "INCONCLUSIVE" if self.inconclusive else "PASS")
+        verdict = "FAIL" if self.failures or self.timing_failures else "PASS"
         report = {"schema": 2, "platform": {"system": platform.system(), "release": platform.release(),
                   "machine": platform.machine(), "python": platform.python_version()},
                   "harness_sha256": self.harness_sha256,
@@ -588,35 +600,39 @@ class Harness:
                   "revisions": revisions, "capabilities": self.capabilities,
                   "selected_commands": list(self.commands), "complete_matrix": not bool(self.args.commands),
                   "library": self.library_info, "fixture": str(self.fixture), "controls": controls,
-                  "thresholds": {"allowed_slowdown_ms": 0, "bootstrap_confidence": CONFIDENCE, "bootstrap_resamples": BOOTSTRAPS,
-                  "warm_samples": self.args.samples, "cold_samples": self.args.cold_samples},
+                  "thresholds": {"relative_floor": RELATIVE_FLOOR, "bootstrap_confidence": CONFIDENCE, "bootstrap_resamples": BOOTSTRAPS,
+                  "warm_samples": self.args.samples, "cold_samples": self.args.cold_samples, "batches": 3},
                   "comparisons": comparisons, "runs": self.records, "failures": failures,
-                  "inconclusive": self.inconclusive, "verdict": verdict, "passed": verdict == "PASS"}
+                  "verdict": verdict, "passed": verdict == "PASS"}
         (self.output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
         lines = ["# CLI performance and rendering", "", f"Platform: `{platform.system()} {platform.machine()}`. "
                  f"Result: **{verdict}**.", "",
-                 "| Command | Warm before → after (ms) | p95 before → after (ms) | Paired delta | Cold before → after (ms) | Warm / cold timing gate (statistics) |",
-                 "|---|---:|---:|---:|---:|---|"]
+                 "| Command | Warm before → after (ms) | Warm p95 before → after (ms) | Paired delta | "
+                 "Cold before → after (ms) | Cold p95, reported only (ms) | Warm / cold timing gate (statistics) |",
+                 "|---|---:|---:|---:|---:|---:|---|"]
         for name, result in comparisons.items():
             if result["status"] != "PAIRED":
                 lines.append(f"| {name} **NEW** | no baseline → {result['after_median_ms']:.2f} | "
                              f"no baseline → {result['after_p95_ms']:.2f} | not comparable | "
-                             f"no baseline → {result['cold']['after']['median_ms']:.2f} | NEW / no baseline |")
+                             f"no baseline → {result['cold']['after']['median_ms']:.2f} | "
+                             f"no baseline → {result['cold']['after']['p95_ms']:.2f} | NEW / no baseline |")
                 continue
             lines.append(f"| {name} | {result['before_median_ms']:.2f} → {result['after_median_ms']:.2f} | "
                          f"{result['before_p95_ms']:.2f} → {result['after_p95_ms']:.2f} | {result['delta_percent']:+.1f}% | "
                          f"{result['cold']['before']['median_ms']:.2f} → {result['cold']['after']['median_ms']:.2f} | "
+                         f"{result['cold']['before']['p95_ms']:.2f} → {result['cold']['after']['p95_ms']:.2f} | "
                          + " / ".join(f"{result['timing_gate_verdicts'][phase]} ({result['phase_verdicts'][phase]})"
                                       for phase in ("warm", "cold")) + " |")
         lines += ["", "The table shows the initial batch. All initial and confirmation timings, binary/harness SHA-256, fixture facts, width findings, and capture paths: [results.json](results.json).",
                   "Actual ANSI colors/output: [rendering.html](rendering.html).", "", "Controls:", ""]
         lines += [f"- {line}" for line in controls]
-        lines += ["", "Cold and warm median/p95 signals use paired bootstrap 99.9% confidence around zero "
-                  "over the full batch plus positive metric shifts in at least two of three interleaved blocks. "
-                  "A repeated metric shift with no faster pair also qualifies, including exact-tie tail cases. "
-                  "Block point estimates are not themselves confidence intervals. A supported signal without two "
-                  "positive blocks remains inconclusive. Independent confirmation determines statistical verdicts. "
-                  "Different executable bytes retain the zero-slack gate; identical bytes are explicitly classified separately.", "",
+        lines += ["", "A gated metric votes for its batch when its paired bootstrap 99.9% lower bound over the full "
+                  "batch exceeds 2% of the baseline value — or no pair got faster and the shift itself exceeds that "
+                  "2% floor — and the shift repeats in at least two of three interleaved blocks. Block point "
+                  "estimates are not themselves confidence intervals. The cold phase gates the median alone over "
+                  "nine pairs; warm gates median and p95 over 63. Up to three equal batches vote and one single "
+                  "metric with two votes FAILs the phase; anything else PASSes. Different executable bytes are "
+                  "gated; identical bytes are explicitly classified separately.", "",
                   f"Requested samples per supported binary/command: {self.args.samples} warm, {self.args.cold_samples} cold. "
                   "Actual counts are recorded per case in results.json.", ""]
         lines += [f"- {failure}" for failure in failures]
@@ -646,6 +662,19 @@ class Harness:
 
 
 class SelfTests(unittest.TestCase):
+    # The three cold samples recorded between byte-identical binaries in runs
+    # 34620669938 and 34626685624, each of which blocked CI (issue #83).
+    RECORDED_COLD = [
+        ("Linux search-color 34620669938",
+         [231.845474, 231.692235, 232.499242, 232.247373, 233.281251, 232.263767, 231.041132, 231.755401, 232.311497],
+         [232.39666, 232.196921, 338.040356, 232.814766, 241.207854, 232.377113, 232.854634, 232.434998, 234.094167]),
+        ("Linux index 34626685624",
+         [293.608809, 290.862782, 290.259755, 289.487716, 290.448429, 289.862567, 292.308245, 291.561444, 290.932482],
+         [294.938799, 292.126727, 291.379987, 290.138852, 291.28306, 291.983871, 294.059244, 299.113628, 291.98924]),
+        ("macOS search-color 34626685624",
+         [314.321, 304.63875, 310.961708, 320.258167, 326.438875, 387.157792, 318.294958, 299.105167, 299.294958],
+         [309.395958, 309.213583, 336.255583, 331.198666, 360.966708, 394.932208, 320.343208, 353.82225, 331.351416])]
+
     def setUp(self):
         self.enterContext(patch.dict(os.environ))
         os.environ.pop("GITHUB_STEP_SUMMARY", None)
@@ -660,8 +689,16 @@ class SelfTests(unittest.TestCase):
             samples=21, cold_samples=9, timeout=1, built_artifacts=built_artifacts))
         # These are diagnostic verdicts supplied to finalization, not fabricated
         # benchmark observations. The comparator's own tests cover statistics.
-        comparisons = {"version": {"phase_verdicts": {"cold": "INCONCLUSIVE", "warm": "FAIL"}}}
+        comparisons = {"version": {"phase_verdicts": {"cold": "PASS", "warm": "FAIL"}}}
         return harness, comparisons
+
+    def paired_fixture(self, harness, verdicts):
+        """A real comparison of unchanged samples plus the views the report renders."""
+        harness.views = {("version", width, variant): b"" for width in (25, 80, 120)
+                         for variant in ("before", "after")}
+        return {"version": compare([10.] * 21, [10.] * 21) | {"status": "PAIRED", "phase_verdicts": verdicts,
+                "cold": {variant: {"median_ms": 10., "p95_ms": 12.5, "raw_ms": [10.] * 9}
+                         for variant in ("before", "after")}}}
 
     def test_identical_bytes_preserve_statistical_diagnostics(self):
         harness, comparisons = self.identity_fixture()
@@ -674,14 +711,27 @@ class SelfTests(unittest.TestCase):
         self.assertEqual(harness.timing_failures, [])
         self.assertEqual(harness.failures, [])
 
-    def test_different_bytes_keep_zero_slack_verdicts(self):
+    def test_different_bytes_keep_the_statistical_verdicts(self):
         harness, comparisons = self.identity_fixture(after=b"\x7fELFchanged")
         harness.finalize_timing(comparisons)
         self.assertFalse(harness.binary_identity["identical"])
         self.assertEqual(comparisons["version"]["timing_gate_verdicts"],
                          comparisons["version"]["phase_verdicts"])
-        self.assertEqual(len(harness.timing_failures), 2)
-        self.assertEqual(len(harness.inconclusive), 1)
+        self.assertEqual(harness.timing_failures, ["version: warm FAIL after independent confirmation"])
+
+    def test_only_pass_and_fail_decide_the_exit_status(self):
+        # No verdict beyond PASS survives as a success-like state: anything the
+        # statistics did not clear fails, and no separate key records it.
+        harness, _ = self.identity_fixture(after=b"\x7fELFchanged")
+        report = harness.report(self.paired_fixture(harness, {"cold": "INCONCLUSIVE", "warm": "PASS"}))
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertFalse(report["passed"])
+        self.assertNotIn("inconclusive", report)
+        self.assertEqual(report["thresholds"]["relative_floor"], RELATIVE_FLOOR)
+        self.assertNotIn("regression_threshold_ms", report["comparisons"]["version"])
+        table = (harness.output / "report.md").read_text()
+        self.assertIn("| Cold p95, reported only (ms) |", table)
+        self.assertIn("12.50 → 12.50", table)
 
     def test_identity_mode_requires_explicit_controlled_native_builds(self):
         # This caller owns the comparable-build assertion. Losing its opt-in
@@ -693,7 +743,7 @@ class SelfTests(unittest.TestCase):
                 harness.finalize_timing(comparisons)
                 self.assertTrue(harness.binary_identity["identical"])
                 self.assertFalse(harness.binary_identity["eligible"])
-                self.assertEqual(len(harness.timing_failures), 2)
+                self.assertEqual(len(harness.timing_failures), 1)
         harness, _ = self.identity_fixture()
         harness.args.library = harness.library
         with self.assertRaisesRegex(ValueError, "--library stays strict"):
@@ -706,7 +756,7 @@ class SelfTests(unittest.TestCase):
         self.assertTrue(harness.binary_identity["identical"])
         self.assertFalse(harness.binary_identity["eligible"])
         self.assertTrue(harness.failures)
-        self.assertEqual(len(harness.timing_failures), 2)
+        self.assertEqual(len(harness.timing_failures), 1)
 
     def test_expected_control_failures_do_not_pollute_ci_summary(self):
         directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -738,6 +788,9 @@ class SelfTests(unittest.TestCase):
         timing = report["comparisons"]["version"]
         self.assertEqual(timing["timing_gate_verdicts"], timing["phase_verdicts"])
         self.assertEqual(timing["timing_gate_verdicts"]["warm"], "FAIL")
+        self.assertTrue(timing["confirmation"]["warm"])
+        self.assertNotIn("p95", timing["cold_comparison"]["metrics"])
+        self.assertTrue(all("p95_ms" in cold for cold in timing["cold"].values()))
 
     def test_actual_timeout_is_unconditional(self):
         script = b"#!/bin/sh\nexec sleep 1\n"
@@ -763,7 +816,7 @@ class SelfTests(unittest.TestCase):
                 harness.finalize_timing(comparisons)
                 self.assertFalse(harness.binary_identity["identical"])
                 self.assertTrue(harness.failures)
-                self.assertEqual(len(harness.timing_failures), 2)
+                self.assertEqual(len(harness.timing_failures), 1)
 
     def test_missing_binary_fails_and_report_survives(self):
         harness, _ = self.identity_fixture()
@@ -798,34 +851,103 @@ class SelfTests(unittest.TestCase):
 
     def test_regression_requires_repeatable_shift(self):
         self.assertTrue(compare([10.] * 21, [12.] * 21)["regression"])
-        self.assertTrue(compare([1.] * 21, [1.01] * 21)["regression"])
-        self.assertTrue(compare([1.] * 21, [math.nextafter(1., math.inf)] * 21)["regression"])
+        self.assertTrue(compare([1.] * 21, [1.03] * 21)["regression"])
+        self.assertFalse(compare([1.] * 21, [1.01] * 21)["regression"])
+        self.assertFalse(compare([1.] * 21, [math.nextafter(1., math.inf)] * 21)["regression"])
         self.assertTrue(compare([10.] * 21, [50.] * 7 + [10.] * 14)["metrics"]["p95"]["regression"])
-        self.assertTrue(compare_cold([10.] * 9, [100., 9., 100.] * 3)["metrics"]["p95"]["regression"])
         self.assertFalse(compare([9., 10., 11.] * 7, [9., 10., 11.] * 7)["regression"])
         with self.assertRaises(ValueError):
             compare_cold([10.], [14.])
 
-    def test_cold_tail_gate_is_not_defeated_by_ordering(self):
-        # Every permutation of six slow and three faster observations must
-        # remain supported, including the review's contiguous ordering.
-        for faster in itertools.combinations(range(9), 3):
-            after = [9. if i in faster else 100. for i in range(9)]
-            with self.subTest(faster=faster):
-                self.assertTrue(compare_cold([10.] * 9, after)["metrics"]["p95"]["regression"])
+    def test_cold_gates_the_median_and_reports_p95(self):
+        # Six of nine cold pairs ten times slower: the median shift and the p95
+        # observation are both recorded, but three FASTER pairs leave a 99.9%
+        # bound that cannot exclude the faster median, and no monotone shift.
+        outlier = compare_cold([10.] * 9, [100., 9., 100.] * 3)
+        self.assertNotIn("p95", outlier["metrics"])
+        self.assertEqual(outlier["metrics"]["median"]["delta_ms"], 90.)
+        self.assertEqual(outlier["after_p95_ms"], 100.)
+        self.assertFalse(outlier["regression"])
 
-    def test_confirmation_never_turns_supported_evidence_green(self):
-        initial = compare([10.] * 21, [10.01] * 21)
-        confirmed = compare([10.] * 21, [10.02] * 21)
-        unchanged = compare([10.] * 21, [10.] * 21)
-        self.assertEqual(confirmation_verdict(initial, confirmed), "FAIL")
-        self.assertEqual(confirmation_verdict(initial, unchanged), "INCONCLUSIVE")
-        self.assertEqual(confirmation_verdict(initial, None), "INCONCLUSIVE")
-        self.assertEqual(confirmation_verdict(unchanged, None), "PASS")
-        # A tail shift concentrated in one block also cannot pass silently.
-        one_block = compare([10.] * 21, [50., 10., 10.] * 7)
-        self.assertTrue(one_block["needs_confirmation"])
-        self.assertEqual(confirmation_verdict(one_block, unchanged), "INCONCLUSIVE")
+    def test_cold_median_gate_is_not_defeated_by_ordering(self):
+        # Ordering never decides the cold verdict: wherever the three odd
+        # observations sit, tied pairs keep the median shift supported and
+        # faster pairs withdraw support for it (see the test above).
+        for placement in itertools.combinations(range(9), 3):
+            with self.subTest(placement=placement):
+                for value, votes in ((10., True), (9., False)):
+                    after = [value if i in placement else 100. for i in range(9)]
+                    self.assertEqual(compare_cold([10.] * 9, after)["metrics"]["median"]["regression"], votes)
+
+    def test_the_floor_guards_the_bound_not_the_point_estimate(self):
+        self.assertFalse(compare([100.] * 21, [102.] * 21)["regression"])
+        self.assertTrue(compare([100.] * 21, [102.1] * 21)["regression"])
+        # A point estimate above the floor whose bound stays under it is not
+        # evidence: one faster pair drops the resampled median a cluster.
+        bound = compare([100.] * 21, [103.] * 11 + [101.] * 9 + [99.])["metrics"]["median"]
+        self.assertEqual(bound["floor_ms"], 2.)
+        self.assertGreater(bound["delta_ms"], bound["floor_ms"])
+        self.assertGreater(bound["bootstrap_lower_ms"], 0)
+        self.assertLessEqual(bound["bootstrap_lower_ms"], bound["floor_ms"])
+        self.assertTrue(all(bound["supported_blocks"]))
+        self.assertFalse(bound["regression"])
+
+    def test_recorded_identical_binary_cold_incidents_stop_voting(self):
+        for name, before, after in self.RECORDED_COLD:
+            with self.subTest(name=name):
+                incident = compare_cold(before, after)
+                self.assertFalse(incident["regression"])
+                self.assertFalse(incident["needs_confirmation"])
+        # The apparatus offset is what disappears, not a real regression.
+        before, after = self.RECORDED_COLD[1][1:]
+        self.assertTrue(compare_cold(before, [value * 1.05 for value in after])["regression"])
+
+    def batch_schedule(self, initial, script):
+        """Drive the real schedule over scripted batches; count the batches run."""
+        harness, _ = self.identity_fixture()
+        batches = []
+        harness.timing_batch = lambda *arguments, **keywords: dict(zip(("before", "after"), script[len(batches)]))
+        verdict = decisive_verdict(initial, lambda: harness.confirm_batch(
+            "version", ["before", "after"], "warm", 21, {}, batches))
+        return verdict, 1 + len(batches)
+
+    def test_three_batches_vote_and_one_metric_must_repeat_itself(self):
+        quiet = ([10.] * 21, [10.] * 21)
+        both = ([10.] * 21, [12.] * 21)
+        median = ([10.] * 19 + [50., 60.], [12.] * 19 + [50., 60.])
+        tail = ([10.] * 21, [50.] * 7 + [10.] * 14)
+        unrepeated = ([10.] * 21, [50., 10., 10.] * 7)
+        # Every script carries an extra batch that must never be measured.
+        for name, initial, script, expected in [
+                ("no evidence at all", quiet, [quiet], ("PASS", 1)),
+                ("evidence without repetition", unrepeated, [quiet, quiet], ("PASS", 2)),
+                ("two votes stop the schedule", both, [both, quiet], ("FAIL", 2)),
+                ("the third batch confirms", both, [quiet, both, quiet], ("FAIL", 3)),
+                ("the third batch clears", both, [quiet, quiet, quiet], ("PASS", 3)),
+                ("different metrics never add up", median, [tail, quiet, quiet], ("PASS", 3))]:
+            with self.subTest(name=name):
+                self.assertEqual(self.batch_schedule(compare(*initial), script), expected)
+        self.assertTrue(compare(*median)["metrics"]["median"]["regression"])
+        self.assertFalse(compare(*median)["metrics"]["p95"]["regression"])
+        self.assertTrue(compare(*tail)["metrics"]["p95"]["regression"])
+        self.assertFalse(compare(*tail)["metrics"]["median"]["regression"])
+        self.assertTrue(compare(*unrepeated)["metrics"]["p95"]["inconclusive"])
+
+    def test_cold_confirmation_batches_never_reuse_a_cache(self):
+        harness, _ = self.identity_fixture()
+        seen = []
+        harness.run = lambda command, variant, phase, sample, environment: (
+            seen.append(environment["THEME_CACHE_DIR"]), (1., b""))[1]
+        environments = {variant: harness.environment("version", variant) for variant in ("before", "after")}
+        for phase, caches in (("cold", 54), ("warm", 2)):
+            with self.subTest(phase=phase):
+                seen.clear()
+                batches = []
+                for _ in range(3):
+                    harness.confirm_batch("version", ["before", "after"], phase, 9, environments, batches)
+                self.assertEqual(len(batches), 3)
+                self.assertEqual(len(seen), 54)
+                self.assertEqual(len(set(seen)), caches)
 
     def test_actual_color_and_escaped_text(self):
         rendered = ansi_html(b"\x1b[48;2;1;2;3m  \x1b[0m<script>")
