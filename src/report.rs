@@ -757,6 +757,18 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
     }
 }
 
+fn preview_dimensions(
+    path: &Path,
+    prepared: Result<&crate::presentation::PreparedPalette, &String>,
+) -> String {
+    match prepared {
+        // Use the same validated source snapshot as the displayed palette.
+        // Content-sniffed dimensions also work for mislabeled image files.
+        Ok(p) => format!("{}x{}", p.profile.width, p.profile.height),
+        Err(_) => img_size(path),
+    }
+}
+
 pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
     use std::fmt::Write as _;
     let img: PathBuf = match arg {
@@ -784,7 +796,7 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
     }
     let loc = display_text(&loc);
     let src = wall_source(&img);
-    let dims = img_size(&img);
+    let dims = preview_dimensions(&img, prepared.as_ref());
     let bytes = human_bytes(&img);
     // Swatch geometry is width-aware (issue #19): 5 visible cells per
     // swatch beside the label when the full row fits, else as many as fit
@@ -1080,6 +1092,110 @@ pub fn cmd_status(cfg: &Config) {
         "  THEME_CACHE_DIR       ",
         &display_text(&cfg.cache_dir.display().to_string()),
     );
+}
+
+#[cfg(test)]
+mod preview_dimension_tests {
+    use super::*;
+    use crate::presentation::prepare;
+
+    fn fixture(name: &str) -> PathBuf {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("preview-dimensions-{}-{name}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_image(path: &Path, format: image::ImageFormat, width: u32, height: u32) {
+        image::save_buffer_with_format(
+            path,
+            &[45, 90, 140].repeat((width * height) as usize),
+            width,
+            height,
+            image::ColorType::Rgb8,
+            format,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn prepared_dimensions_match_original_headers_and_keep_error_fallback() {
+        let root = fixture("formats");
+        for (format, extension, width, height) in [
+            (image::ImageFormat::Png, "png", 37, 19),
+            (image::ImageFormat::Jpeg, "jpg", 259, 131),
+            (image::ImageFormat::WebP, "webp", 131, 257),
+        ] {
+            let path = root.join(format!("sample.{extension}"));
+            write_image(&path, format, width, height);
+            let opts = pigment::Options::default();
+            pigment::cached_derive(&path, &opts, &root.join("cache")).unwrap();
+            let raw = pigment::read_cached(&path, &opts, &root.join("cache"))
+                .unwrap()
+                .unwrap();
+            let failed = prepare(raw.clone(), f64::NAN, 4.5);
+            let prepared = prepare(raw, 1.0, 4.5);
+            let expected = format!("{width}x{height}");
+            assert_eq!(img_size(&path), expected);
+            assert_eq!(preview_dimensions(&path, prepared.as_ref()), expected);
+            assert!(failed.is_err());
+            assert_eq!(preview_dimensions(&path, failed.as_ref()), expected);
+            // A valid prepared snapshot does not reopen the image. The error
+            // path still probes it and retains the existing unknown result.
+            fs::remove_file(&path).unwrap();
+            assert_eq!(preview_dimensions(&path, prepared.as_ref()), expected);
+            assert_eq!(preview_dimensions(&path, failed.as_ref()), "");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_dimensions_follow_content_for_mislabeled_and_extensionless_files() {
+        let root = fixture("content");
+        for (format, name) in [
+            (image::ImageFormat::Png, "png-bytes.jpg"),
+            (image::ImageFormat::Jpeg, "jpeg-bytes.png"),
+            (image::ImageFormat::WebP, "webp-bytes.jpg"),
+            (image::ImageFormat::Png, "extensionless"),
+        ] {
+            let path = root.join(name);
+            write_image(&path, format, 139, 73);
+            let prepared = prepare(
+                pigment::derive(&path, &pigment::Options::default()).unwrap(),
+                1.0,
+                4.5,
+            );
+            assert_eq!(img_size(&path), "");
+            assert_eq!(preview_dimensions(&path, prepared.as_ref()), "139x73");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_source_gets_new_dimensions_without_changing_the_old_snapshot() {
+        let root = fixture("changed");
+        let path = root.join("sample.png");
+        let cache = root.join("cache");
+        let opts = pigment::Options::default();
+        write_image(&path, image::ImageFormat::Png, 37, 19);
+        let first = prepare(
+            pigment::cached_derive(&path, &opts, &cache).unwrap(),
+            1.0,
+            4.5,
+        );
+        write_image(&path, image::ImageFormat::Png, 71, 43);
+        let second = prepare(
+            pigment::cached_derive(&path, &opts, &cache).unwrap(),
+            1.0,
+            4.5,
+        );
+        assert_eq!(img_size(&path), "71x43");
+        assert_eq!(preview_dimensions(&path, first.as_ref()), "37x19");
+        assert_eq!(preview_dimensions(&path, second.as_ref()), "71x43");
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
