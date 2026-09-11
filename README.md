@@ -257,7 +257,7 @@ summaries and downloadable `command-performance-<OS>-<architecture>` artifacts,
 including `results.json`, all stdout/stderr captures, and `rendering.html` with
 the actual ANSI colors. These are headless renderings; native Kitty graphics,
 font shaping, desktop application, and network latency are outside this gate.
-The existing release workflow requires both exact-source CI jobs to pass.
+The existing release workflow requires every exact-source CI job to pass.
 
 Reproduce from a feature branch (the output directory must be empty):
 

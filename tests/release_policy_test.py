@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,6 +14,28 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("policy", Path(__file__).resolve().parents[1] / ".github/scripts/authorize_release.py")
 policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
+
+WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+
+
+def workflow_jobs(path):
+    """The job names under a workflow's top-level `jobs:`, read as text.
+
+    No PyYAML: this test suite is what CI runs before Rust is even built, so
+    it stays on the standard library. The grammar it needs is narrow — the
+    second-level keys of one block mapping.
+    """
+    names, inside = set(), False
+    for line in path.read_text().splitlines():
+        if re.fullmatch(r"jobs:\s*", line):
+            inside = True
+        elif inside and re.match(r"[^\s#]", line):
+            break  # the next top-level key ends the jobs mapping
+        elif inside:
+            job = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*", line)
+            if job:
+                names.add(job.group(1))
+    return names
 
 
 class Publication(unittest.TestCase):
@@ -24,9 +47,9 @@ class Publication(unittest.TestCase):
         self.run = {"repository": {"id": policy.REPOSITORY_ID}, "head_repository": {"id": policy.REPOSITORY_ID},
                     "event": "push", "head_branch": "main", "head_sha": self.source,
                     "path": ".github/workflows/ci.yml", "status": "completed", "conclusion": "success"}
-        self.jobs = {"total_count": 2, "jobs": [
+        self.jobs = {"total_count": 3, "jobs": [
             {"name": name, "head_sha": self.source, "status": "completed", "conclusion": "success"}
-            for name in ("lint-test", "test-macos")]}
+            for name in ("lint-test", "test-macos", "browser-kitty")]}
         self.branch = {"name": "main", "protected": True}
         self.comparison = {"status": "ahead", "merge_base_commit": {"sha": self.source}}
 
@@ -48,12 +71,19 @@ class Publication(unittest.TestCase):
             self.check()
 
     def test_truncated_or_extra_job_inventory_is_refused(self):
-        self.jobs["total_count"] = 3
+        self.jobs["total_count"] = 4
         with self.assertRaises(ValueError):
             self.check()
-        self.jobs["jobs"].append(copy.deepcopy(self.jobs["jobs"][0]))
+        self.jobs["jobs"].append(dict(self.jobs["jobs"][0], name="browser-ghostty"))
         with self.assertRaises(ValueError):
             self.check()
+
+    def test_authorizer_inventory_matches_the_ci_workflow(self):
+        # #90: the authorizer pinned two jobs while ci.yml had grown a third,
+        # so every release was refused and no pull request could see it.
+        names = workflow_jobs(WORKFLOW)
+        self.assertTrue(names, "no jobs parsed out of " + str(WORKFLOW))
+        self.assertEqual(names, policy.CHECKS)
 
     def test_foreign_or_wrong_ci_is_refused(self):
         for field, value in (("event", "pull_request"), ("head_branch", "other"), ("head_sha", "b" * 40),

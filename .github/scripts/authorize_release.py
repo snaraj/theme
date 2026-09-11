@@ -7,7 +7,7 @@ from pathlib import Path
 
 REPOSITORY = "snaraj/theme"
 REPOSITORY_ID = 1353261670
-CHECKS = {"lint-test", "test-macos"}
+CHECKS = {"lint-test", "test-macos", "browser-kitty"}
 
 
 def require(condition, reason):
