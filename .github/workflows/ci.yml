@@ -51,6 +51,52 @@ jobs:
         run: |
           printf '\n[Download command-performance-%s-%s](%s)\n\nOpen results.json, report.md, and rendering.html inside this downloaded artifact.\n' "$RUNNER_OS" "$RUNNER_ARCH" "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
 
+  # The browser's keys, pressed in a terminal that draws. The PTY tests prove
+  # the bytes; only a real Kitty proves the whole path — raw mode, the key
+  # parser, the redraw and the thumbnails — on a machine that is not the
+  # author's. Kitty is pinned by version AND digest, verified before it is
+  # extracted, and everything runs headless under Xvfb with software GL.
+  browser-kitty:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20 # a hung terminal must cost minutes, not 6h
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the X server, software GL and the screen capture tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb imagemagick \
+            libgl1 libgl1-mesa-dri libegl1 libxkbcommon0 libxkbcommon-x11-0 \
+            libfontconfig1 fonts-dejavu-core libx11-6 libxcb1 libxrandr2 \
+            libxi6 libxcursor1 libxinerama1 libwayland-client0 libdbus-1-3 libcanberra0
+      - name: Verify the pinned Kitty before extracting it
+        env:
+          KITTY_VERSION: 0.48.2
+          KITTY_SHA256: 967a1958e7fc67b495d279c0963bcd1a0482097151817ce6506fabc822689af7
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/kitty.txz" \
+            "https://github.com/kovidgoyal/kitty/releases/download/v$KITTY_VERSION/kitty-$KITTY_VERSION-x86_64.txz"
+          printf '%s  %s\n' "$KITTY_SHA256" "$RUNNER_TEMP/kitty.txz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/kitty"
+          tar -xJf "$RUNNER_TEMP/kitty.txz" -C "$RUNNER_TEMP/kitty"
+      - run: cargo build --release --locked
+      - name: Press the browser's keys in a real Kitty
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          xvfb-run -a -s "-screen 0 1400x900x24" python3 -I -B tests/kitty_e2e.py \
+            --kitty "$RUNNER_TEMP/kitty/bin/kitty" \
+            --theme target/release/theme --output target/kitty-e2e
+      - name: Publish the screenshots, screen dumps and kitty log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kitty-e2e-${{ runner.os }}-${{ runner.arch }}
+          path: target/kitty-e2e/
+          if-no-files-found: error
+          retention-days: 30
+
   test-macos:
     runs-on: macos-latest
     timeout-minutes: 20 # a hung test must cost minutes of feedback, not 6h
@@ -83,6 +129,17 @@ jobs:
           cargo build --release --locked
           python3 -I -B tests/browser_cli_test.py target/release/theme
           python3 -I -B tests/mdls_cli_test.py target/release/theme
+      # No real-Kitty step here, and it is not an omission: the hosted macOS
+      # VM has no accelerated OpenGL, and GLFW's NSGL backend asks for an
+      # accelerated pixel format unconditionally, so the pinned Kitty exits 1
+      # on this runner before it can answer — "[glfw error 65545]: NSGL:
+      # Failed to find a suitable pixel format", then "Failed to create
+      # GLFWwindow ... kitty requires working OpenGL 3.3 drivers" (proven on
+      # run 34644677010). The macOS key path is gated by the step above
+      # instead: browser_cli_test.py drives the real binary through a real
+      # pty, keys, terminal-mode restore and all. The real-Kitty driver runs
+      # hosted on Linux (browser-kitty) and on a Mac before release, with its
+      # assertion lines and screenshots in the pull request.
       - name: Compare command performance and rendering with the base commit
         env:
           THEME_PERF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}

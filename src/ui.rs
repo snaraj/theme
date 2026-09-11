@@ -5,7 +5,9 @@
 //! sanitized display copy is what may be shown, while the operational value
 //! stays byte-exact for everything we open, copy, move or delete.
 
+use rustix::termios::Termios;
 use std::process::exit;
+use std::sync::Mutex;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -18,11 +20,59 @@ pub fn display_text(s: &str) -> String {
 
 /// Print `theme: <msg>` to stderr and exit 1. The message passes through
 /// [`display_text`] like every other sink, and registered scratch files are
-/// swept first — `exit` runs no destructors.
+/// swept first — `exit` runs no destructors, so the terminal mode is given
+/// back here too.
 pub fn die(msg: &str) -> ! {
+    restore_terminal();
     crate::scratch::cleanup();
     eprintln!("theme: {}", display_text(msg));
     exit(1);
+}
+
+/// The terminal settings raw mode replaced, held for whichever exit path
+/// runs first. `Drop` covers quit, EOF, Ctrl-C and an unwinding panic;
+/// `die` and the broken-pipe exit run no destructors and call
+/// [`restore_terminal`] themselves. A cooked terminal is the browser's
+/// responsibility on every one of them: a shell left in raw mode echoes
+/// nothing and needs `stty sane` from the user.
+static COOKED: Mutex<Option<Termios>> = Mutex::new(None);
+
+/// Raw mode on the terminal the caller is looking at, for a reader that
+/// wants keys rather than lines. `None` when the terminal refuses — the
+/// caller then reads what the line discipline gives it, and nothing was
+/// changed. Output post-processing is deliberately kept: every page this
+/// tool prints is `println!` text that must still end with CR LF.
+pub fn raw_mode() -> Option<RawMode> {
+    use rustix::termios::{OptionalActions, OutputModes, tcgetattr, tcsetattr};
+    let terminal = std::io::stdin();
+    let cooked = tcgetattr(&terminal).ok()?;
+    let mut raw = cooked.clone();
+    raw.make_raw();
+    raw.output_modes |= OutputModes::OPOST | OutputModes::ONLCR;
+    tcsetattr(&terminal, OptionalActions::Flush, &raw).ok()?;
+    *COOKED.lock().unwrap_or_else(|e| e.into_inner()) = Some(cooked);
+    Some(RawMode(()))
+}
+
+/// Put the terminal back the way it was found, once. Safe to call on any
+/// exit path, in any order, including from a panic while the lock is held
+/// (`try_lock`, like the scratch sweep).
+pub fn restore_terminal() {
+    use rustix::termios::{OptionalActions, tcsetattr};
+    if let Ok(mut slot) = COOKED.try_lock()
+        && let Some(cooked) = slot.take()
+    {
+        let _ = tcsetattr(std::io::stdin(), OptionalActions::Flush, &cooked);
+    }
+}
+
+/// Held for as long as raw mode should last.
+pub struct RawMode(());
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
 }
 
 /// The print!/println! shims' writer (declared atop main.rs, #59): one
@@ -42,6 +92,7 @@ pub fn out(args: std::fmt::Arguments<'_>, end: &str) {
     };
     if e.kind() == std::io::ErrorKind::BrokenPipe {
         drop(o);
+        restore_terminal();
         crate::scratch::cleanup();
         exit(141);
     }

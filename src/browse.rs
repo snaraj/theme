@@ -9,11 +9,12 @@ use crate::ui::{
     cell_chunks, die, display_text, pad_cells, term_cols, truncate_ellipsis, wrap_prefixed,
 };
 use crate::{apply, report, search};
+use rustix::event::{PollFd, PollFlags, Timespec};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) const HELP: &str = "theme browse [terms...] [options]   (alias: theme surf)
 
@@ -31,11 +32,21 @@ Existing terminal and shell keybindings are unchanged.
   --min-height PIXELS    minimum original image height
   --aspect W:H           aspect ratio within 10 percent
 
+Keys (pressed on an empty line, no Return):
+  Right/Left   next/previous picture, with its preview
+  Down/Up, PageDown/PageUp, Space   one page, redrawn
+  Home/End   first/last page
+
 Commands (type a line, then Return):
-  select ID   next   prev   page N   list   shuffle
+  select ID   next (n)   prev (p)   page N   list   shuffle
   favorite [ID]   favorites   all   history
   query TERMS   calmer   similar   different
-  apply   help   quit
+  apply   help (?)   quit (q)
+
+Backspace, Ctrl-U and Ctrl-W edit the typed line and Escape clears it;
+with text typed, keys insert or edit instead of moving. Ctrl-C or Ctrl-D on
+an empty line leaves the browser, and the terminal mode is given back on
+every exit.
 
 next/prev follow the current queue; shuffle visits each result once.
 page N shows a sheet without selecting or applying anything. IDs stay
@@ -43,9 +54,13 @@ stable during the session. Query and local favorites/history are saved.
 query with no terms clears the query. all leaves the favorites filter.
 calmer ranks measured image texture; similar/different compare the selected
 image's mean Oklab color. Readability is sampled, not an every-pixel guarantee.
-EOF exits. Non-interactive input/output prints one deterministic page and
-never reads commands or applies a wallpaper. THEME_NO_APPLY also skips state
-writes. Escape cancels nothing globally; type quit to leave this browser.";
+EOF exits. Non-interactive input/output prints one deterministic page, reads
+no keys and applies no wallpaper. THEME_NO_APPLY also skips state writes.";
+
+/// The sheet's own reminder. It names the keys first, because the keys are
+/// what a person reaches for; every word wraps, so it survives 25 columns.
+const FOOTER: &str = "arrows move · Space/PgDn page · Home/End ends · \
+                      select ID · query TERMS · favorite ID · help · quit";
 
 fn prose_lines(text: &str, cols: usize) -> Vec<String> {
     let cols = cols.max(1);
@@ -357,7 +372,7 @@ impl Browser<'_> {
     fn sheet(&mut self) {
         let cols = term_cols().max(1);
         let page_size = self.options.page_size;
-        let pages = self.queue.ids.len().div_ceil(page_size).max(1);
+        let pages = self.pages();
         self.page = self.page.min(pages - 1);
         say(&format!(
             "\nWallpaper browser  |  {} matches  |  page {}/{}",
@@ -458,7 +473,7 @@ impl Browser<'_> {
             }
             println!("\n");
         }
-        say("select ID · next/prev · page N · shuffle · query TERMS · favorite ID · help · quit");
+        say(FOOTER);
     }
 
     fn selected(&mut self) {
@@ -503,6 +518,41 @@ impl Browser<'_> {
             }
             Err(e) => note(&format!("preview unavailable: {e}")),
         }
+    }
+
+    /// One picture forward or back — what `next`/`prev` and the Right/Left
+    /// keys both do. The preview moves the page under it (see `selected`).
+    fn step(&mut self, forward: bool) {
+        if self.queue.step(forward) {
+            self.selected();
+        } else {
+            note("end of this queue; use prev, page N, or shuffle");
+        }
+    }
+
+    fn pages(&self) -> usize {
+        self.queue.ids.len().div_ceil(self.options.page_size).max(1)
+    }
+
+    /// One page forward or back, redrawn. The ends are ends: an edge prints
+    /// the queue's own note rather than wrapping around to the far side.
+    fn turn(&mut self, forward: bool) {
+        let next = if forward {
+            (self.page + 1 < self.pages()).then_some(self.page + 1)
+        } else {
+            self.page.checked_sub(1)
+        };
+        match next {
+            Some(page) => self.show(page),
+            None if forward => note("end of these pages; use Home or page N"),
+            None => note("start of these pages; use End or page N"),
+        }
+    }
+
+    /// A page by number, clamped to the last one, redrawn.
+    fn show(&mut self, page: usize) {
+        self.page = page.min(self.pages() - 1);
+        self.sheet();
     }
 
     fn rank(&mut self, mode: &str) {
@@ -552,30 +602,21 @@ impl Browser<'_> {
         match words.as_slice() {
             [] => {}
             ["quit" | "q"] => return false,
-            ["help"] => usage(),
+            ["help" | "?"] => usage(),
             ["list"] => self.sheet(),
-            ["next" | "prev"] => {
-                if self.queue.step(words[0] == "next") {
-                    self.selected();
-                } else {
-                    note("end of this queue; use prev, page N, or shuffle");
-                }
-            }
+            ["next" | "n" | "prev" | "p"] => self.step(matches!(words[0], "next" | "n")),
             ["select", n] => match n.parse::<usize>().ok().and_then(|n| n.checked_sub(1)) {
                 Some(id) if self.queue.select(id) => self.selected(),
                 _ => note("choose an ID from the current results"),
             },
-            ["page", n] => {
-                match n.parse::<usize>().ok().filter(|n| {
-                    *n > 0 && *n <= self.queue.ids.len().div_ceil(self.options.page_size)
-                }) {
-                    Some(n) => {
-                        self.page = n - 1;
-                        self.sheet();
-                    }
-                    None => note("page number is outside these results"),
-                }
-            }
+            ["page", n] => match n
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0 && *n <= self.pages())
+            {
+                Some(n) => self.show(n - 1),
+                None => note("page number is outside these results"),
+            },
             ["shuffle"] => {
                 let seed = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -673,6 +714,350 @@ impl Browser<'_> {
     }
 }
 
+/// What one keypress means here. The parser below is a pure function over
+/// bytes, so hostile input is a table of cases instead of a live terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Key {
+    /// A byte of typed text — never a control byte.
+    Byte(u8),
+    Space,
+    Enter,
+    Backspace,
+    KillLine,
+    KillWord,
+    Interrupt,
+    EndOfFile,
+    Escape,
+    Left,
+    Right,
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    /// A complete sequence with no meaning here: consumed and dropped,
+    /// never echoed and never executed.
+    Discard,
+    /// The bytes so far are the beginning of a longer sequence.
+    Incomplete,
+}
+
+/// The longest sequence the reader will hold before dropping it. Real keys
+/// are at most six bytes; anything longer is a paste or a hostile stream,
+/// and it is consumed in bounded chunks rather than buffered without end.
+const KEY_LIMIT: usize = 16;
+/// Typed-line bound, unchanged from the line-reading browser.
+const LINE_LIMIT: usize = 4096;
+/// How long a lone Escape waits for the rest of a sequence: a terminal's
+/// own arrow bytes arrive in one burst, a person's Escape does not.
+const ESCAPE_WAIT: Duration = Duration::from_millis(50);
+const PROMPT: &str = "browse> ";
+
+/// The key at the front of `bytes`, and how many bytes it consumed.
+/// `Incomplete` consumes nothing; every other answer consumes at least one
+/// byte, so a stream of garbage always makes progress.
+fn key(bytes: &[u8]) -> (Key, usize) {
+    let Some(&first) = bytes.first() else {
+        return (Key::Incomplete, 0);
+    };
+    match first {
+        0x1b => escape(bytes),
+        b'\r' | b'\n' => (Key::Enter, 1),
+        0x7f | 0x08 => (Key::Backspace, 1),
+        0x15 => (Key::KillLine, 1),
+        0x17 => (Key::KillWord, 1),
+        0x03 => (Key::Interrupt, 1),
+        0x04 => (Key::EndOfFile, 1),
+        b' ' => (Key::Space, 1),
+        b if b < 0x20 => (Key::Discard, 1),
+        b => (Key::Byte(b), 1),
+    }
+}
+
+/// An Escape-introduced sequence: CSI (`ESC [ … final`), SS3 (`ESC O x`),
+/// or Escape with any other byte after it, which is dropped whole.
+fn escape(bytes: &[u8]) -> (Key, usize) {
+    match bytes.get(1) {
+        None => (Key::Incomplete, 0),
+        Some(b'[') => csi(bytes),
+        Some(b'O') => match bytes.get(2) {
+            None => (Key::Incomplete, 0),
+            Some(&last) => (named(last, 0), 3),
+        },
+        Some(_) => (Key::Discard, 2),
+    }
+}
+
+/// `ESC [` parameters (0x30..0x40) and intermediates (0x20..0x30), then one
+/// final byte (0x40..0x7f). A sequence that never finishes inside
+/// [`KEY_LIMIT`], or whose "final" byte is not one, is dropped — the bytes
+/// it had are consumed, so `ESC [ ESC [ ESC [ …` cannot accumulate.
+fn csi(bytes: &[u8]) -> (Key, usize) {
+    let mut end = 2;
+    while end < KEY_LIMIT && bytes.get(end).is_some_and(|b| (0x20..0x40).contains(b)) {
+        end += 1;
+    }
+    if end == KEY_LIMIT {
+        return (Key::Discard, KEY_LIMIT);
+    }
+    let Some(&last) = bytes.get(end) else {
+        return (Key::Incomplete, 0);
+    };
+    if !(0x40..0x7f).contains(&last) {
+        return (Key::Discard, end);
+    }
+    let number = bytes[2..end]
+        .split(|b| *b == b';')
+        .next()
+        .and_then(|p| std::str::from_utf8(p).ok())
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(0);
+    (named(last, number), end + 1)
+}
+
+/// The key a final byte names, with the sequence's first parameter for the
+/// `~` family. Terminals disagree about Home/End, so both spellings of each
+/// are accepted; everything else is a sequence we have no meaning for.
+fn named(last: u8, number: u16) -> Key {
+    match (last, number) {
+        (b'A', _) => Key::Up,
+        (b'B', _) => Key::Down,
+        (b'C', _) => Key::Right,
+        (b'D', _) => Key::Left,
+        (b'H', _) => Key::Home,
+        (b'F', _) => Key::End,
+        (b'~', 1 | 7) => Key::Home,
+        (b'~', 4 | 8) => Key::End,
+        (b'~', 5) => Key::PageUp,
+        (b'~', 6) => Key::PageDown,
+        _ => Key::Discard,
+    }
+}
+
+/// The typed line. Bytes accumulate raw and are decoded lossily once, at
+/// Return: a paste of invalid UTF-8 is a bad command, never a panic.
+#[derive(Default)]
+struct Line {
+    bytes: Vec<u8>,
+    echoed: usize,
+    refused: Option<&'static str>,
+}
+
+impl Line {
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn push(&mut self, byte: u8) {
+        if self.bytes.len() >= LINE_LIMIT {
+            self.refused
+                .get_or_insert("command too long; nothing was applied");
+            return;
+        }
+        self.bytes.push(byte);
+        self.echo();
+    }
+
+    /// A dropped sequence. On an empty line it was a keypress with no
+    /// meaning here; inside a typed line it is a pasted control byte, and
+    /// the line it arrived in is refused whole at Return rather than run
+    /// with the byte quietly removed.
+    fn refuse_control(&mut self) {
+        if !self.bytes.is_empty() {
+            self.refused
+                .get_or_insert("command contains control characters; nothing was applied");
+        }
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.refused = None;
+        self.redraw();
+    }
+
+    /// Delete the last character, not the last byte: a multi-byte glyph
+    /// leaves no half behind.
+    fn backspace(&mut self) {
+        while self.bytes.pop().is_some_and(|b| (0x80..0xc0).contains(&b)) {}
+        self.redraw();
+    }
+
+    fn kill_word(&mut self) {
+        while self.bytes.last() == Some(&b' ') {
+            self.bytes.pop();
+        }
+        while matches!(self.bytes.last(), Some(b) if *b != b' ') {
+            self.bytes.pop();
+        }
+        self.redraw();
+    }
+
+    /// The command to run, or the one refusal that poisoned this line.
+    fn take(&mut self) -> Result<String, &'static str> {
+        let refused = self.refused.take();
+        let line = String::from_utf8_lossy(&self.bytes).into_owned();
+        self.bytes.clear();
+        self.echoed = 0;
+        refused.map_or(Ok(line), Err)
+    }
+
+    /// Prompt and line from the start of the row. After a deletion the tail
+    /// of the old line is still on screen, which is what `\x1b[K` erases.
+    fn redraw(&mut self) {
+        print!("\r{}\x1b[K", truncate_ellipsis(PROMPT, term_cols().max(1)));
+        self.echoed = 0;
+        self.echo();
+    }
+
+    /// Echo what raw mode stopped the terminal from echoing, one COMPLETE
+    /// character at a time: a multi-byte glyph arrives byte by byte and
+    /// half of one must not reach the screen.
+    fn echo(&mut self) {
+        while self.echoed < self.bytes.len() {
+            let tail = &self.bytes[self.echoed..];
+            match std::str::from_utf8(tail) {
+                Ok(text) => {
+                    print!("{text}");
+                    self.echoed = self.bytes.len();
+                }
+                Err(e) if e.valid_up_to() > 0 => {
+                    print!("{}", String::from_utf8_lossy(&tail[..e.valid_up_to()]));
+                    self.echoed += e.valid_up_to();
+                }
+                Err(e) => match e.error_len() {
+                    Some(bad) => {
+                        print!("\u{fffd}");
+                        self.echoed += bad;
+                    }
+                    // Truncated, not invalid: the rest is still in flight.
+                    None => break,
+                },
+            }
+        }
+        let _ = io::stdout().flush();
+    }
+}
+
+/// The next key, waiting for it. `None` when the terminal's input ended or
+/// failed, which leaves the browser exactly as EOF always has.
+fn next_key(pending: &mut Vec<u8>) -> Option<Key> {
+    loop {
+        let (key, used) = key(pending);
+        if key != Key::Incomplete {
+            pending.drain(..used);
+            return Some(key);
+        }
+        // Escape is a key of its own once nothing follows it promptly, and a
+        // sequence cut off mid-flight is dropped rather than held forever.
+        if !pending.is_empty() && !readable(ESCAPE_WAIT) {
+            let lone = pending.len() == 1;
+            pending.clear();
+            return Some(if lone { Key::Escape } else { Key::Discard });
+        }
+        let mut buffer = [0u8; 512];
+        match rustix::io::read(io::stdin(), &mut buffer[..]) {
+            Ok(0) => return None,
+            Ok(read) => pending.extend_from_slice(&buffer[..read]),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => {
+                note("input unavailable; leaving browser");
+                return None;
+            }
+        }
+    }
+}
+
+/// Whether the terminal has bytes for us within `wait`. A signal — a window
+/// resize, say — is not an answer: poll again rather than report a lone
+/// Escape that nobody pressed.
+fn readable(wait: Duration) -> bool {
+    let terminal = io::stdin();
+    let mut fds = [PollFd::new(&terminal, PollFlags::IN)];
+    let wait = Timespec {
+        tv_sec: 0,
+        tv_nsec: wait.subsec_nanos() as _,
+    };
+    loop {
+        match rustix::event::poll(&mut fds, Some(&wait)) {
+            Ok(ready) => return ready > 0,
+            Err(rustix::io::Errno::INTR) => {}
+            // Let the read that follows report the real failure.
+            Err(_) => return true,
+        }
+    }
+}
+
+/// The interactive session. Raw mode is entered only here — `run` has
+/// already proved both ends are terminals — and the guard gives the
+/// terminal back on every exit from this function, panic included.
+///
+/// Keys move only on an empty line. Mid-command they are text or nothing at
+/// all, so neither a paste nor a stray sequence can navigate or apply.
+fn interact(browser: &mut Browser) {
+    let _cooked = crate::ui::raw_mode();
+    let mut line = Line::default();
+    let mut pending = Vec::new();
+    let mut prompt = true;
+    loop {
+        if prompt {
+            line.redraw();
+            prompt = false;
+        }
+        let Some(key) = next_key(&mut pending) else {
+            break;
+        };
+        let empty = line.is_empty();
+        match key {
+            Key::Enter => {
+                println!();
+                match line.take() {
+                    Err(refusal) => note(refusal),
+                    Ok(command) => {
+                        if !browser.command(command.trim()) {
+                            break;
+                        }
+                    }
+                }
+                prompt = true;
+            }
+            Key::Byte(byte) => line.push(byte),
+            Key::Space if !empty => line.push(b' '),
+            Key::Backspace => line.backspace(),
+            Key::KillWord => line.kill_word(),
+            Key::KillLine | Key::Escape => line.clear(),
+            Key::Interrupt if empty => break,
+            Key::Interrupt => line.clear(),
+            Key::EndOfFile if empty => break,
+            Key::Discard => line.refuse_control(),
+            // A movement key with text typed: ignored, and the line stands.
+            _ if !empty => {}
+            Key::Right
+            | Key::Left
+            | Key::Up
+            | Key::Down
+            | Key::PageUp
+            | Key::PageDown
+            | Key::Space
+            | Key::Home
+            | Key::End => {
+                // Leave the prompt's row before the key's output lands.
+                println!();
+                match key {
+                    Key::Right | Key::Left => browser.step(key == Key::Right),
+                    Key::Up | Key::PageUp => browser.turn(false),
+                    Key::Home => browser.show(0),
+                    Key::End => browser.show(usize::MAX),
+                    _ => browser.turn(true),
+                }
+                prompt = true;
+            }
+            Key::EndOfFile | Key::Incomplete => {}
+        }
+    }
+    println!();
+}
+
 pub fn run(cfg: &Config, args: &[String]) {
     let options = match Options::parse(args) {
         Ok(Some(o)) => o,
@@ -711,51 +1096,7 @@ pub fn run(cfg: &Config, args: &[String]) {
         return;
     }
     browser.save();
-    let mut input = io::stdin().lock();
-    loop {
-        print!("{}", truncate_ellipsis("browse> ", term_cols().max(1)));
-        let _ = io::stdout().flush();
-        let mut line = String::new();
-        // Bound input before allocation, not after read_line has consumed an
-        // arbitrarily large paste. Drain the rest of an overlong line once.
-        let read = (&mut input).take(4097).read_line(&mut line);
-        match read {
-            Ok(0) => break,
-            Ok(_) if line.len() > 4096 => {
-                if !line.ends_with('\n') {
-                    while let Ok(bytes) = input.fill_buf() {
-                        if bytes.is_empty() {
-                            break;
-                        }
-                        let end = bytes.iter().position(|b| *b == b'\n');
-                        let count = end.map_or(bytes.len(), |i| i + 1);
-                        input.consume(count);
-                        if end.is_some() {
-                            break;
-                        }
-                    }
-                }
-                note("command too long; nothing was applied");
-            }
-            Ok(_)
-                if line
-                    .trim_end_matches(['\r', '\n'])
-                    .chars()
-                    .any(char::is_control) =>
-            {
-                note("command contains control characters; nothing was applied")
-            }
-            Ok(_) => {
-                if !browser.command(line.trim()) {
-                    break;
-                }
-            }
-            Err(_) => {
-                note("input unavailable; leaving browser");
-                break;
-            }
-        }
-    }
+    interact(&mut browser);
 }
 
 #[cfg(test)]
@@ -827,6 +1168,137 @@ mod tests {
     }
 
     #[test]
+    fn keys_parse_the_sequences_real_terminals_send() {
+        let cases: &[(&[u8], Key, usize)] = &[
+            (b"\x1b[A", Key::Up, 3),
+            (b"\x1b[B", Key::Down, 3),
+            (b"\x1b[C", Key::Right, 3),
+            (b"\x1b[D", Key::Left, 3),
+            (b"\x1bOA", Key::Up, 3),
+            (b"\x1bOB", Key::Down, 3),
+            (b"\x1bOC", Key::Right, 3),
+            (b"\x1bOD", Key::Left, 3),
+            (b"\x1b[H", Key::Home, 3),
+            (b"\x1b[F", Key::End, 3),
+            (b"\x1bOH", Key::Home, 3),
+            (b"\x1bOF", Key::End, 3),
+            (b"\x1b[1~", Key::Home, 4),
+            (b"\x1b[7~", Key::Home, 4),
+            (b"\x1b[4~", Key::End, 4),
+            (b"\x1b[8~", Key::End, 4),
+            (b"\x1b[5~", Key::PageUp, 4),
+            (b"\x1b[6~", Key::PageDown, 4),
+            // A modified arrow is still that arrow, not a stray sequence.
+            (b"\x1b[1;5C", Key::Right, 6),
+            (b"\r", Key::Enter, 1),
+            (b"\n", Key::Enter, 1),
+            (b"\x7f", Key::Backspace, 1),
+            (b"\x08", Key::Backspace, 1),
+            (b"\x15", Key::KillLine, 1),
+            (b"\x17", Key::KillWord, 1),
+            (b"\x03", Key::Interrupt, 1),
+            (b"\x04", Key::EndOfFile, 1),
+            (b" ", Key::Space, 1),
+            (b"q", Key::Byte(b'q'), 1),
+            // One key at a time out of a burst that holds several.
+            (b"\x1b[C\x1b[D\n", Key::Right, 3),
+        ];
+        for (bytes, want, used) in cases {
+            assert_eq!(key(bytes), (*want, *used), "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn truncated_and_hostile_sequences_stay_bounded() {
+        for partial in [
+            b"\x1b".as_slice(),
+            b"\x1b[",
+            b"\x1b[5",
+            b"\x1bO",
+            b"\x1b[1;5",
+        ] {
+            assert_eq!(key(partial), (Key::Incomplete, 0), "{partial:?}");
+        }
+        // A stream that never finishes a sequence still makes progress: no
+        // unbounded buffer, no repeat of the same byte, no panic.
+        let garbage = b"\x1b[".repeat(1000);
+        let (mut rest, mut dropped) = (garbage.as_slice(), 0);
+        loop {
+            let (k, used) = key(rest);
+            if k == Key::Incomplete {
+                break;
+            }
+            assert_eq!((k, used > 0), (Key::Discard, true));
+            rest = &rest[used..];
+            dropped += 1;
+        }
+        assert_eq!((dropped, rest), (999, b"\x1b[".as_slice()));
+        // An absurd parameter run is consumed at the limit, never held.
+        let long = [b"\x1b[".as_slice(), &b"1".repeat(64)].concat();
+        assert_eq!(key(&long), (Key::Discard, KEY_LIMIT));
+        // Well-formed sequences with no meaning here, and bare control
+        // bytes, are consumed and dropped.
+        let unknown: &[(&[u8], usize)] = &[
+            (b"\x1b[200~", 6),
+            (b"\x1b[Z", 3),
+            (b"\x1bZ", 2),
+            (b"\x1bOZ", 3),
+            (b"\x1b[3~", 4),
+            (b"\x01", 1),
+        ];
+        for (bytes, used) in unknown {
+            assert_eq!(key(bytes), (Key::Discard, *used), "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn typed_line_edits_bounds_and_refuses_a_poisoned_paste() {
+        let mut line = Line::default();
+        for b in b"select 12" {
+            line.push(*b);
+        }
+        line.backspace();
+        assert_eq!(line.bytes, b"select 1");
+        // Ctrl-W takes the word, and the next one takes the space with it.
+        line.kill_word();
+        assert_eq!(line.bytes, b"select ");
+        line.kill_word();
+        assert!(line.is_empty());
+        for b in b"select" {
+            line.push(*b);
+        }
+        // A dropped control byte poisons the line it arrived in — that line
+        // is refused whole rather than run with the byte quietly removed.
+        line.refuse_control();
+        assert_eq!(
+            line.take(),
+            Err("command contains control characters; nothing was applied")
+        );
+        assert!(line.is_empty());
+        // The refusal belongs to that line only, and on an empty line a
+        // dropped key says nothing at all.
+        line.refuse_control();
+        assert_eq!(line.take(), Ok(String::new()));
+        // The bound refuses the line instead of silently truncating it.
+        for _ in 0..LINE_LIMIT + 10 {
+            line.push(b'x');
+        }
+        assert_eq!(line.bytes.len(), LINE_LIMIT);
+        assert_eq!(line.take(), Err("command too long; nothing was applied"));
+        // Multi-byte glyphs delete whole; invalid bytes decode lossily at
+        // Return rather than panicking mid-line.
+        for b in "界æ".as_bytes() {
+            line.push(*b);
+        }
+        line.backspace();
+        assert_eq!(line.take(), Ok("界".to_string()));
+        for b in [b'a', 0xff, 0xfe] {
+            line.push(b);
+        }
+        assert_eq!(line.take(), Ok("a\u{fffd}\u{fffd}".to_string()));
+    }
+
+    #[test]
     fn palette_color_filter_uses_colors_not_search_words() {
         let blue = pigment::Rgb::parse("#2244dd").unwrap();
         assert!(color_matches("blue", blue));
@@ -843,7 +1315,7 @@ mod tests {
                 "/library/中国山水中国山水中国山水中国山水中国山水.png",
                 "/library/e\u{301}toile-👩‍💻-👍🏽-🇺🇸-\u{f120}.png",
                 "Sampled readability: worst 7.02:1 | 99.7% coverage | 256 points",
-                "select ID · next/prev · page N · shuffle · favorite ID · help · quit",
+                FOOTER,
             ] {
                 assert!(
                     prose_lines(text, cols)

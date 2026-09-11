@@ -118,12 +118,18 @@ theme browse --all --coverage 0.9 --min-width 2560 --aspect 16:9
 theme index                          # prepare palettes and cache searchable metadata
 ```
 
-The browser shows six larger thumbnails per page in Kitty. Type `select 3`
-for the picture's final terminal palette and a text specimen, then `next` or
-`prev` to move through the results. Only `apply` changes the wallpaper and
-terminal colors. `page 2` shows another sheet; `shuffle` makes a queue that
-visits each result once. Existing shell and terminal shortcuts keep their
-meaning: browser commands are ordinary lines followed by Return.
+The browser shows six larger thumbnails per page in Kitty, and the keys move
+it: Right/Left step through the results and preview each one, Down/Up,
+PageDown/PageUp and Space turn the page, Home/End jump to the first or last.
+They act on an empty line and need no Return. Type `select 3` for a picture's
+final terminal palette and a text specimen; `n`, `p`, `page 2`, `shuffle`,
+`?` and `quit` are lines followed by Return, as before. Only `apply` changes
+the wallpaper and terminal colors. Backspace, Ctrl-U and Ctrl-W edit the
+typed line and Escape clears it; with text typed the movement keys are
+ignored, so a paste can never navigate. Ctrl-C or Ctrl-D on an empty line
+leaves, and the terminal is given back the mode it was found in on every exit
+— including an error or a panic. Existing shell and terminal shortcuts keep
+their meaning.
 
 `favorite` saves the selection; `favorites` shows that collection. `history`
 shows recently previewed IDs, and `query mountains` changes the search.
@@ -131,7 +137,26 @@ shows recently previewed IDs, and `query mountains` changes the search.
 mean Oklab color distance from the selection. These are measured image
 properties, not subject or style recognition. `--all` clears the saved query.
 Non-interactive use prints one deterministic page and never consumes commands
-or applies a wallpaper.
+or applies a wallpaper: no keys are read and the terminal mode is untouched.
+
+That key path is tested in a terminal that draws, not only down a pipe. The
+hosted Linux CI job downloads Kitty 0.48.2 — pinned by SHA-256 and verified
+before extraction — runs `theme browse` inside it headless under Xvfb with
+software GL, presses the keys above through `kitten @ send-text`, and asserts
+on what the screen says afterwards; it decodes its own screenshot of the
+contact sheet, so a row of blank thumbnails fails it. Screenshots, screen
+dumps and the kitty log are published as `kitty-e2e-<OS>-<architecture>`
+artifacts, pass or fail. macOS CI cannot host that test — the runner has no
+accelerated OpenGL, so Kitty exits before it opens a window — so there the
+keys are driven through a real pty against the real binary, and the Kitty
+driver is run on a Mac before each release with its results in the pull
+request. All of it proves the terminal side only: applying a wallpaper, the
+macOS Spaces store and the desktop itself stay outside it.
+
+```sh
+python3 -I -B tests/kitty_e2e.py --kitty "$(command -v kitty)" \
+  --theme target/release/theme --output target/kitty-e2e
+```
 
 Previews use the same contrast-adjusted colors as apply, including all 16 ANSI
 colors and Kitty's selection, border, and tab accents. Readability samples a
