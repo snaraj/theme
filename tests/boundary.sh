@@ -173,6 +173,7 @@ pipe_into_gone() { # $1 expected status, $2 label, then the theme argv
 }
 pipe_into_gone 141 "help"   help
 pipe_into_gone 141 "list"   list
+pipe_into_gone 141 "preview" preview tiny.png
 pipe_into_gone 141 "status" status
 pipe_into_gone 141 "-V"     -V
 pipe_into_gone 141 "search" search tiny

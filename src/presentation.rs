@@ -4,8 +4,10 @@
 use crate::apply::{derive_options, schemes_dir};
 use crate::config::Config;
 use pigment::{Floored, ImageProfile, Palette, Readability, Rgb, effective_background};
+use std::borrow::Cow;
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 pub struct PreparedPalette {
@@ -51,12 +53,32 @@ fn configured_opacity(cfg: &Config, explicit: Option<&str>) -> Result<f64, Strin
     Ok(value)
 }
 
+struct OpacityFrame {
+    path: PathBuf,
+    identity: (u64, u64),
+    canonical: Option<PathBuf>,
+}
+
+fn config_path(path: &Path) -> Result<PathBuf, String> {
+    path.canonicalize()
+        .map_err(|_| opacity_error("config path"))
+}
+
+fn config_identity(path: &Path, opened: &fs::Metadata) -> Result<(u64, u64), String> {
+    let identity = (opened.dev(), opened.ino());
+    let current = fs::metadata(path).map_err(|_| opacity_error("config path"))?;
+    if (current.dev(), current.ino()) != identity {
+        return Err(opacity_error("config path changed"));
+    }
+    Ok(identity)
+}
+
 /// Local literal includes only. Dynamic configuration is never executed and
 /// unsupported expansion is reported instead of pretending it was resolved.
 fn read_opacity(
     path: &Path,
     value: &mut f64,
-    stack: &mut Vec<PathBuf>,
+    stack: &mut Vec<OpacityFrame>,
     files: &mut usize,
     bytes: &mut usize,
 ) -> Result<(), String> {
@@ -75,20 +97,30 @@ fn read_opacity(
         Err(_) => return Err(opacity_error("unreadable config")),
     };
     let file = fs::File::from(descriptor);
-    if !file
+    let metadata = file
         .metadata()
-        .map_err(|_| opacity_error("config metadata"))?
-        .is_file()
-    {
+        .map_err(|_| opacity_error("config metadata"))?;
+    if !metadata.is_file() {
         return Err(opacity_error("config is not a regular file"));
     }
-    let canonical = path
-        .canonicalize()
-        .map_err(|_| opacity_error("config path"))?;
-    if stack.contains(&canonical) {
-        return Err(opacity_error("include cycle"));
-    }
-    let mut text = String::new();
+    let identity = config_identity(path, &metadata)?;
+    // Distinct open files cannot form a cycle. Repeated identities still need
+    // canonical paths: hardlinks may have different relative-include contexts.
+    let canonical = if stack.iter().any(|frame| frame.identity == identity) {
+        let canonical = config_path(path)?;
+        for frame in stack.iter_mut().filter(|frame| frame.identity == identity) {
+            if frame.canonical.is_none() {
+                frame.canonical = Some(config_path(&frame.path)?);
+            }
+            if frame.canonical.as_ref() == Some(&canonical) {
+                return Err(opacity_error("include cycle"));
+            }
+        }
+        Some(canonical)
+    } else {
+        None
+    };
+    let mut text = String::with_capacity(metadata.len().min(65_537) as usize);
     file.take(65_537)
         .read_to_string(&mut text)
         .map_err(|_| opacity_error("config text"))?;
@@ -97,17 +129,21 @@ fn read_opacity(
     if text.len() > 65_536 || *bytes > 262_144 {
         return Err(opacity_error("config size limit"));
     }
-    stack.push(canonical);
-    let mut logical: Vec<String> = Vec::new();
+    stack.push(OpacityFrame {
+        path: path.to_path_buf(),
+        identity,
+        canonical,
+    });
+    let mut logical: Vec<Cow<'_, str>> = Vec::new();
     for physical in text.lines() {
         let line = physical.trim_start();
         if let Some(continued) = line.strip_prefix('\\') {
             let previous = logical
                 .last_mut()
                 .ok_or_else(|| opacity_error("orphan continuation"))?;
-            previous.push_str(continued.trim_start());
+            previous.to_mut().push_str(continued.trim_start());
         } else {
-            logical.push(line.to_string());
+            logical.push(Cow::Borrowed(line));
         }
     }
     for line in logical {
@@ -321,6 +357,134 @@ mod tests {
         .unwrap();
         assert_eq!(configured_opacity(&cfg, None).unwrap(), 0.65);
         assert_eq!(configured_opacity(&cfg, Some("0.8")).unwrap(), 0.8);
+        fs::remove_dir_all(&cfg.kitty_dir).unwrap();
+    }
+
+    #[test]
+    fn opacity_keeps_hardlink_contexts_and_detects_symlink_cycles() {
+        let cfg = config("link-contexts");
+        fs::create_dir_all(cfg.kitty_dir.join("one/next")).unwrap();
+        let outer = cfg.kitty_dir.join("one/shared.conf");
+        fs::write(&outer, "include next/shared.conf\ninclude value.conf\n").unwrap();
+        fs::hard_link(&outer, cfg.kitty_dir.join("one/next/shared.conf")).unwrap();
+        fs::write(
+            cfg.kitty_dir.join("one/next/value.conf"),
+            "background_opacity 0.8\n",
+        )
+        .unwrap();
+        fs::write(
+            cfg.kitty_dir.join("kitty.conf"),
+            "include one/shared.conf\n",
+        )
+        .unwrap();
+        // The same inode is active twice, but each relative include belongs to
+        // its original parent. A missing include still leaves the value alone.
+        assert_eq!(configured_opacity(&cfg, None).unwrap(), 0.8);
+        std::os::unix::fs::symlink("kitty.conf", cfg.kitty_dir.join("alias.conf")).unwrap();
+        fs::write(cfg.kitty_dir.join("kitty.conf"), "include alias.conf\n").unwrap();
+        assert!(
+            configured_opacity(&cfg, None)
+                .unwrap_err()
+                .contains("include cycle")
+        );
+        fs::remove_dir_all(&cfg.kitty_dir).unwrap();
+    }
+
+    #[test]
+    fn opacity_rejects_a_replaced_path_after_open() {
+        let cfg = config("path-binding");
+        let path = cfg.kitty_dir.join("kitty.conf");
+        fs::write(&path, "background_opacity 0.4\n").unwrap();
+        let opened = fs::File::open(&path).unwrap();
+        let metadata = opened.metadata().unwrap();
+        assert!(config_identity(&path, &metadata).is_ok());
+        let replacement = cfg.kitty_dir.join("replacement.conf");
+        fs::write(&replacement, "background_opacity 0.8\n").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert!(
+            config_identity(&path, &metadata)
+                .unwrap_err()
+                .contains("config path changed")
+        );
+        fs::remove_dir_all(&cfg.kitty_dir).unwrap();
+    }
+
+    #[test]
+    fn opacity_preserves_continuations_and_absolute_include_order() {
+        let cfg = config("logical-lines");
+        let included = cfg.kitty_dir.join("included.conf");
+        fs::write(&included, "background_opacity 0.4\n").unwrap();
+        for (text, expected) in [
+            ("\tbackground_opacity\t0.\n\\ 65\n".to_string(), 0.65),
+            (
+                "# ignored\n\\ continuation\nbackground_opacity 0.6\n".into(),
+                0.6,
+            ),
+            ("\n\\ background_opacity 0.8\n".into(), 0.8),
+            ("include ./included.\n\\ conf\n".into(), 0.4),
+            (
+                format!(
+                    "background_opacity 0.2\ninclude {}\nbackground_opacity 0.7\n",
+                    included.display()
+                ),
+                0.7,
+            ),
+        ] {
+            fs::write(cfg.kitty_dir.join("kitty.conf"), text).unwrap();
+            assert_eq!(configured_opacity(&cfg, None).unwrap(), expected);
+        }
+        fs::write(
+            cfg.kitty_dir.join("kitty.conf"),
+            "\\ background_opacity 0.8\n",
+        )
+        .unwrap();
+        assert!(
+            configured_opacity(&cfg, None)
+                .unwrap_err()
+                .contains("orphan continuation")
+        );
+        fs::remove_dir_all(&cfg.kitty_dir).unwrap();
+    }
+
+    #[test]
+    fn opacity_keeps_depth_file_and_total_byte_limits() {
+        let cfg = config("include-bounds");
+        let main = cfg.kitty_dir.join("kitty.conf");
+        fs::write(&main, "include depth-1.conf\n").unwrap();
+        for depth in 1..7 {
+            fs::write(
+                cfg.kitty_dir.join(format!("depth-{depth}.conf")),
+                format!("include depth-{}.conf\n", depth + 1),
+            )
+            .unwrap();
+        }
+        let leaf = cfg.kitty_dir.join("depth-7.conf");
+        fs::write(&leaf, "background_opacity 0.6\n").unwrap();
+        assert_eq!(configured_opacity(&cfg, None).unwrap(), 0.6);
+        fs::write(&leaf, "include missing-depth-8.conf\n").unwrap();
+        assert!(
+            configured_opacity(&cfg, None)
+                .unwrap_err()
+                .contains("include limit")
+        );
+        fs::write(&main, "include depth-7.conf\n".repeat(31)).unwrap();
+        fs::write(&leaf, "background_opacity 0.6\n").unwrap();
+        assert_eq!(configured_opacity(&cfg, None).unwrap(), 0.6);
+        fs::write(&main, "include depth-7.conf\n".repeat(32)).unwrap();
+        assert!(
+            configured_opacity(&cfg, None)
+                .unwrap_err()
+                .contains("include limit")
+        );
+        fs::write(cfg.kitty_dir.join("large.conf"), "#".repeat(65_500)).unwrap();
+        fs::write(&main, "include large.conf\n".repeat(4)).unwrap();
+        assert_eq!(configured_opacity(&cfg, None).unwrap(), 1.0);
+        fs::write(&main, "include large.conf\n".repeat(5)).unwrap();
+        assert!(
+            configured_opacity(&cfg, None)
+                .unwrap_err()
+                .contains("config size limit")
+        );
         fs::remove_dir_all(&cfg.kitty_dir).unwrap();
     }
 

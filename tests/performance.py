@@ -583,7 +583,8 @@ class Harness:
         (self.output / "report.md").write_text(markdown)
         if os.environ.get("GITHUB_STEP_SUMMARY"):
             with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-                summary.write(markdown)
+                summary.write(markdown.replace("[results.json](results.json)", "`results.json`")
+                              .replace("[rendering.html](rendering.html)", "`rendering.html`"))
         panels = []
         for command in comparisons:
             for width in (25, 80, 120):

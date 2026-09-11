@@ -41,8 +41,21 @@ fn have(cmd: &str) -> bool {
 /// Unknown is an honest "-", never a guess; the label is decided by the
 /// PARSED hostname, never a substring.
 pub fn wall_source(path: &Path) -> String {
+    wall_source_with_mdls(path, || {
+        #[cfg(target_os = "macos")]
+        {
+            true
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            !mdls_absent(std::env::var_os("PATH").as_deref())
+        }
+    })
+}
+
+fn wall_source_with_mdls(path: &Path, mdls: impl FnOnce() -> bool) -> String {
     let xattr = xattr_value(path, "theme.source");
-    let src = if xattr.is_empty() {
+    let src = if xattr.is_empty() && mdls() {
         Command::new("mdls")
             .args(["-raw", "-name", "kMDItemWhereFroms"])
             .arg(path)
@@ -85,11 +98,26 @@ fn source_label(src: &str) -> String {
 /// Amortize macOS metadata startup while retaining xattr precedence and the
 /// existing per-file fallback. Results belong only to this requested snapshot.
 pub(crate) fn wall_sources(paths: &[&Path]) -> BTreeMap<PathBuf, String> {
+    if paths.is_empty() {
+        return BTreeMap::new();
+    }
     #[cfg(not(target_os = "macos"))]
-    return paths
-        .iter()
-        .map(|path| (path.to_path_buf(), wall_source(path)))
-        .collect();
+    {
+        // Linux normally has no Spotlight helper. Establish absence once for
+        // this batch, rather than attempting one failed spawn per file. An
+        // unset PATH, existing candidate, or ambiguous stat error retains the
+        // original per-file helper behavior and its xattr precedence.
+        let mdls = std::cell::OnceCell::new();
+        paths
+            .iter()
+            .map(|path| {
+                let source = wall_source_with_mdls(path, || {
+                    *mdls.get_or_init(|| !mdls_absent(std::env::var_os("PATH").as_deref()))
+                });
+                (path.to_path_buf(), source)
+            })
+            .collect()
+    }
     #[cfg(target_os = "macos")]
     {
         const ARG_BYTES: usize = 64 * 1024;
@@ -124,6 +152,20 @@ pub(crate) fn wall_sources(paths: &[&Path]) -> BTreeMap<PathBuf, String> {
         source_batch(&batch, &mut sources);
         sources
     }
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn mdls_absent(path: Option<&std::ffi::OsStr>) -> bool {
+    path.is_some_and(|path| {
+        std::env::split_paths(path).all(|dir| {
+            fs::symlink_metadata(dir.join("mdls")).is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                )
+            })
+        })
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -716,6 +758,7 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
 }
 
 pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
+    use std::fmt::Write as _;
     let img: PathBuf = match arg {
         Some(a) => resolve_local(cfg, a).unwrap_or_else(|| {
             die(&format!(
@@ -795,6 +838,10 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
     };
     fields.push(("SIZE", format!("{dims_disp} ({bytes})")));
 
+    // Assemble this display before the stdout write, retaining the shared
+    // broken-pipe handling while avoiding a flush for every rendered line.
+    let mut frame = String::with_capacity(4096);
+
     // Thumbnail above, fields below — stacked, so a long value can never
     // interleave with the image rows; values wrap with a hanging indent.
     // The thumb clamps to the terminal (issue #19): narrower than its 24
@@ -804,27 +851,27 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
     if pw >= 8
         && let Some(p) = render_preview(&img, pw, 10)
     {
-        print!("{}", p.apc);
+        write!(frame, "{}", p.apc).unwrap();
         for r in &p.rows {
-            println!("  {r}");
+            writeln!(frame, "  {r}").unwrap();
         }
-        println!();
+        writeln!(frame).unwrap();
     }
     for (label, value) in &fields {
         for line in wrap_field(label, value, cols) {
-            println!("{line}");
+            writeln!(frame, "{line}").unwrap();
         }
     }
     if scheme.is_empty() {
-        println!("  {:<12} -", "COLORSCHEME");
+        writeln!(frame, "  {:<12} -", "COLORSCHEME").unwrap();
     } else if cols >= 15 + 8 * 5 {
-        println!("  {:<12} {}", "COLORSCHEME", sw_fit(8));
+        writeln!(frame, "  {:<12} {}", "COLORSCHEME", sw_fit(8)).unwrap();
     } else {
-        println!("  COLORSCHEME");
-        println!("    {}", sw_fit((cols.saturating_sub(4) / 5).max(1)));
+        writeln!(frame, "  COLORSCHEME").unwrap();
+        writeln!(frame, "    {}", sw_fit((cols.saturating_sub(4) / 5).max(1))).unwrap();
     }
     for line in wrap_field("LOCATION", &loc, cols) {
-        println!("{line}");
+        writeln!(frame, "{line}").unwrap();
     }
     match prepared {
         Ok(p) => {
@@ -837,11 +884,11 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
                 p.opacity
             );
             for line in wrap_field("READABILITY", &value, cols) {
-                println!("{line}");
+                writeln!(frame, "{line}").unwrap();
             }
-            println!();
+            writeln!(frame).unwrap();
             for line in p.specimen(cols.saturating_sub(2)).lines() {
-                println!("  {line}");
+                writeln!(frame, "  {line}").unwrap();
             }
         }
         Err(e) => {
@@ -850,10 +897,11 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
                 &format!("unavailable: {}", display_text(&e)),
                 cols,
             ) {
-                println!("{line}");
+                writeln!(frame, "{line}").unwrap();
             }
         }
     }
+    print!("{frame}");
 }
 
 /// One metadata line, wrapped at the terminal edge with a hanging indent to
@@ -1183,6 +1231,94 @@ mod date_tests {
     }
 }
 
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn source_helper_child() {
+        let Some(image) = std::env::var_os("THEME_TEST_SOURCE_IMAGE") else {
+            return;
+        };
+        let path = std::env::var_os("PATH");
+        let absent = mdls_absent(path.as_deref());
+        assert_eq!(
+            absent,
+            std::env::var("THEME_TEST_MDLS_ABSENT").unwrap() == "1"
+        );
+        let original = wall_source_with_mdls(Path::new(&image), || true);
+        let optimized = wall_source_with_mdls(Path::new(&image), || !absent);
+        assert_eq!(optimized, original);
+        assert_eq!(optimized, std::env::var("THEME_TEST_SOURCE_LABEL").unwrap());
+    }
+
+    #[test]
+    fn helper_absence_preserves_present_ambiguous_and_empty_path_behavior() {
+        assert!(!mdls_absent(None)); // exec's default PATH is not absence.
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("source-helper-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("image.png");
+        fs::write(&image, b"source fixture").unwrap();
+        for name in ["missing", "present", "directory", "dangling", "loop"] {
+            fs::create_dir(dir.join(name)).unwrap();
+        }
+        let helper = dir.join("present/mdls");
+        fs::write(
+            &helper,
+            b"#!/bin/sh\nprintf '(\\n    \"https://images.unsplash.com/fixture\"\\n)\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(dir.join("directory/mdls")).unwrap();
+        std::os::unix::fs::symlink("absent", dir.join("dangling/mdls")).unwrap();
+        std::os::unix::fs::symlink("mdls", dir.join("loop/mdls")).unwrap();
+        std::os::unix::fs::symlink("ancestor-loop", dir.join("ancestor-loop")).unwrap();
+        assert!(fs::symlink_metadata(dir.join("ancestor-loop/mdls")).is_err());
+        let missing = dir.join("missing");
+        let present = dir.join("present");
+        for (path, cwd, absent, label) in [
+            (missing.as_os_str().to_owned(), &dir, true, "-"),
+            (image.as_os_str().to_owned(), &dir, true, "-"),
+            (
+                std::env::join_paths([&missing, &present]).unwrap(),
+                &dir,
+                false,
+                "unsplash",
+            ),
+            (std::ffi::OsString::new(), &present, false, "unsplash"),
+            (dir.join("directory").into_os_string(), &dir, false, "-"),
+            (dir.join("dangling").into_os_string(), &dir, false, "-"),
+            (dir.join("loop").into_os_string(), &dir, false, "-"),
+            (dir.join("ancestor-loop").into_os_string(), &dir, false, "-"),
+        ] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "report::helper_tests::source_helper_child",
+                    "--nocapture",
+                ])
+                .current_dir(cwd)
+                .env("PATH", path)
+                .env("THEME_TEST_SOURCE_IMAGE", &image)
+                .env("THEME_TEST_MDLS_ABSENT", if absent { "1" } else { "0" })
+                .env("THEME_TEST_SOURCE_LABEL", label)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod source_tests {
     use super::*;
@@ -1240,6 +1376,12 @@ mod source_tests {
         let got = wall_sources(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
         assert_eq!(got[&paths[0]], "unsplash");
         assert_eq!(got[&paths[1]], "example.org");
+        for path in &paths {
+            assert_eq!(
+                wall_source_with_mdls(path, || panic!("xattr source probed helper availability")),
+                got[path]
+            );
+        }
         assert_eq!(got.len(), 2);
         assert!(wall_sources(&[]).is_empty());
         std::fs::remove_dir_all(dir).unwrap();
