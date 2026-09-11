@@ -20,4 +20,4 @@ export THEME_PERF_BASE_SHA="$base"
 export THEME_PERF_HEAD_SHA="$(git -C "$root" rev-parse HEAD)"
 python3 -I -B "$root/tests/performance.py" \
     --before "$root/target/performance-base-build/release/theme" \
-    --after "$root/target/release/theme" --output "$root/target/performance"
+    --after "$root/target/release/theme" --built-artifacts --output "$root/target/performance"

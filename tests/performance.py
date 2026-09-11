@@ -24,6 +24,7 @@ import tempfile
 import time
 import unicodedata
 import unittest
+from unittest.mock import patch
 import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -306,6 +307,8 @@ def png(number, width, height):
 
 class Harness:
     def __init__(self, args):
+        if args.built_artifacts and args.library:
+            raise ValueError("--built-artifacts requires the controlled synthetic fixture; --library stays strict")
         self.args = args
         self.harness_sha256 = digest(Path(__file__).read_bytes())
         self.output = args.output.resolve()
@@ -316,8 +319,12 @@ class Harness:
         private.mkdir(parents=True, exist_ok=True)
         self.fixture = Path(tempfile.mkdtemp(prefix="performance-", dir=private))
         self.binaries = {label: path.resolve(strict=True) for label, path in [("before", args.before), ("after", args.after)]}
-        self.binary_info = {label: {"path": str(path), "sha256": digest(path.read_bytes())}
-                            for label, path in self.binaries.items()}
+        self.binary_info = {}
+        for label, path in self.binaries.items():
+            data = path.read_bytes()
+            self.binary_info[label] = {"path": str(path), "sha256": digest(data),
+                "native_header": data[:4] in (b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
+                                              b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xce", b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf")}
         self.records, self.views, self.failures, self.palettes, self.inconclusive = [], {}, [], {}, []
         self.library = args.library.resolve(strict=True) if args.library else self.fixture / "library"
         if not args.library:
@@ -488,13 +495,7 @@ class Harness:
                         confirmation = compare(observed["before"], observed["after"])
                         result["confirmation"][phase] = {"comparison": confirmation, "raw_ms": observed,
                             "sample_counts": {variant: len(values) for variant, values in observed.items()}}
-                    verdict = confirmation_verdict(initial, confirmation)
-                    result["phase_verdicts"][phase] = verdict
-                    if verdict != "PASS":
-                        message = f"{command}: {phase} {verdict} after independent confirmation"
-                        self.failures.append(message)
-                        if verdict == "INCONCLUSIVE":
-                            self.inconclusive.append(message)
+                    result["phase_verdicts"][phase] = confirmation_verdict(initial, confirmation)
             if not paired:
                 result["absolute_budget"] = new_budget(result["after_median_ms"], result["cold"]["after"]["median_ms"], bool(self.args.library))
                 if result["absolute_budget"]["exceeded"]:
@@ -516,7 +517,44 @@ class Harness:
             print(f"{command}: {baseline}{result['after_median_ms']:.2f} ms {result['phase_verdicts']}", flush=True)
         return comparisons
 
+    def finalize_timing(self, comparisons):
+        # Identity is evidence about executable bytes, never a statistical
+        # PASS. Re-read both files after the complete measurement/rendering run.
+        final = {}
+        for label, path in self.binaries.items():
+            try:
+                final[label] = digest(path.read_bytes())
+            except OSError as error:
+                final[label] = None
+                self.failures.append(f"{label} binary unreadable after measurement: {error}")
+            if final[label] != self.binary_info[label]["sha256"]:
+                self.failures.append(f"{label} binary changed during measurement")
+        initial = {label: info["sha256"] for label, info in self.binary_info.items()}
+        identical = len(set(initial.values()) | set(final.values())) == 1
+        eligible = (self.args.built_artifacts and not self.args.library and
+                    all(info["native_header"] for info in self.binary_info.values()))
+        if eligible and identical:
+            for feature, probes in self.capabilities.items():
+                if probes["before"]["supported"] != probes["after"]["supported"]:
+                    self.failures.append(f"identical binaries disagree on {feature} capability")
+                    eligible = False
+        self.binary_identity = {"initial_sha256": initial, "final_sha256": final,
+                                "identical": identical, "built_artifacts_requested": self.args.built_artifacts,
+                                "eligible": eligible}
+        self.timing_failures = []
+        for command, result in comparisons.items():
+            result["timing_gate_verdicts"] = {}
+            for phase, statistical in result["phase_verdicts"].items():
+                decision = "IDENTICAL_BINARY" if eligible and identical else statistical
+                result["timing_gate_verdicts"][phase] = decision
+                if decision not in ("PASS", "IDENTICAL_BINARY"):
+                    message = f"{command}: {phase} {decision} after independent confirmation"
+                    self.timing_failures.append(message)
+                    if decision == "INCONCLUSIVE":
+                        self.inconclusive.append(message)
+
     def report(self, comparisons):
+        self.finalize_timing(comparisons)
         controls = ["Wall-clock subprocess execution includes captured stdout/stderr; file artifact writes are outside timings.",
                     "Fresh application caches for cold samples; OS/filesystem page caches are not flushed.",
                     "Each command/binary has its own cache; two recorded warmups precede paired alternating warm samples and are excluded from comparisons.",
@@ -532,30 +570,32 @@ class Harness:
                     "New-command synthetic fixture stall budgets: warm median 500 ms, cold median 3000 ms. Budgets are skipped with --library.",
                     "New-command rendering must fit 25/80/120 columns. Once the baseline supports the command, normal paired gates apply."]
         controls += ["A supported initial timing shift triggers an independent alternating confirmation batch with the same sample count; cold confirmation uses fresh caches.",
-                     "Matching supported metric regressions in both batches FAIL. An initial signal without a matching confirmation is INCONCLUSIVE and also blocks CI; it never becomes PASS."]
+                     "For different executable bytes, matching supported metric regressions in both batches FAIL. An initial signal without a matching confirmation is INCONCLUSIVE and blocks CI; it never becomes a statistical PASS.",
+                     "IDENTICAL_BINARY is restricted to --built-artifacts with the controlled synthetic fixture, native executable headers and matching before/after hashes for both executables. The caller must supply comparable direct builds; headers alone are not build provenance. Standalone runs stay strict by default.",
+                     "In IDENTICAL_BINARY mode, timing observations and statistical verdicts remain diagnostics: this is no code-performance comparison or speed claim. All execution, semantic, capability and rendering errors still block CI.",
+                     "With nine cold samples the nearest-rank p95 is the maximum observation; every observation is retained."]
         if self.args.commands:
             controls.append("Explicit command subset: " + ", ".join(self.commands) + "; this is not a complete CI matrix run.")
-        for label, path in self.binaries.items():
-            if digest(path.read_bytes()) != self.binary_info[label]["sha256"]:
-                self.failures.append(f"{label} binary changed during measurement")
+        failures = self.failures + self.timing_failures
         revisions = {label: os.environ.get(key, "unknown") for label, key in
                      [("before", "THEME_PERF_BASE_SHA"), ("after", "THEME_PERF_HEAD_SHA")]}
-        verdict = ("FAIL" if any(failure not in self.inconclusive for failure in self.failures)
+        verdict = ("FAIL" if self.failures or any(failure not in self.inconclusive for failure in self.timing_failures)
                    else "INCONCLUSIVE" if self.inconclusive else "PASS")
         report = {"schema": 2, "platform": {"system": platform.system(), "release": platform.release(),
                   "machine": platform.machine(), "python": platform.python_version()},
                   "harness_sha256": self.harness_sha256,
-                  "binaries": self.binary_info, "revisions": revisions, "capabilities": self.capabilities,
+                  "binaries": self.binary_info, "binary_identity": self.binary_identity,
+                  "revisions": revisions, "capabilities": self.capabilities,
                   "selected_commands": list(self.commands), "complete_matrix": not bool(self.args.commands),
                   "library": self.library_info, "fixture": str(self.fixture), "controls": controls,
                   "thresholds": {"allowed_slowdown_ms": 0, "bootstrap_confidence": CONFIDENCE, "bootstrap_resamples": BOOTSTRAPS,
                   "warm_samples": self.args.samples, "cold_samples": self.args.cold_samples},
-                  "comparisons": comparisons, "runs": self.records, "failures": self.failures,
+                  "comparisons": comparisons, "runs": self.records, "failures": failures,
                   "inconclusive": self.inconclusive, "verdict": verdict, "passed": verdict == "PASS"}
         (self.output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
         lines = ["# CLI performance and rendering", "", f"Platform: `{platform.system()} {platform.machine()}`. "
                  f"Result: **{verdict}**.", "",
-                 "| Command | Warm before → after (ms) | p95 before → after (ms) | Paired delta | Cold before → after (ms) | Warm / cold gate |",
+                 "| Command | Warm before → after (ms) | p95 before → after (ms) | Paired delta | Cold before → after (ms) | Warm / cold timing gate (statistics) |",
                  "|---|---:|---:|---:|---:|---|"]
         for name, result in comparisons.items():
             if result["status"] != "PAIRED":
@@ -566,7 +606,8 @@ class Harness:
             lines.append(f"| {name} | {result['before_median_ms']:.2f} → {result['after_median_ms']:.2f} | "
                          f"{result['before_p95_ms']:.2f} → {result['after_p95_ms']:.2f} | {result['delta_percent']:+.1f}% | "
                          f"{result['cold']['before']['median_ms']:.2f} → {result['cold']['after']['median_ms']:.2f} | "
-                         f"{result['phase_verdicts']['warm']} / {result['phase_verdicts']['cold']} |")
+                         + " / ".join(f"{result['timing_gate_verdicts'][phase]} ({result['phase_verdicts'][phase]})"
+                                      for phase in ("warm", "cold")) + " |")
         lines += ["", "The table shows the initial batch. All initial and confirmation timings, binary/harness SHA-256, fixture facts, width findings, and capture paths: [results.json](results.json).",
                   "Actual ANSI colors/output: [rendering.html](rendering.html).", "", "Controls:", ""]
         lines += [f"- {line}" for line in controls]
@@ -574,11 +615,11 @@ class Harness:
                   "over the full batch plus positive metric shifts in at least two of three interleaved blocks. "
                   "A repeated metric shift with no faster pair also qualifies, including exact-tie tail cases. "
                   "Block point estimates are not themselves confidence intervals. A supported signal without two "
-                  "positive blocks remains inconclusive. Independent confirmation determines the final gate above; "
-                  "no absolute or relative slowdown is waived.", "",
+                  "positive blocks remains inconclusive. Independent confirmation determines statistical verdicts. "
+                  "Different executable bytes retain the zero-slack gate; identical bytes are explicitly classified separately.", "",
                   f"Requested samples per supported binary/command: {self.args.samples} warm, {self.args.cold_samples} cold. "
                   "Actual counts are recorded per case in results.json.", ""]
-        lines += [f"- {failure}" for failure in self.failures]
+        lines += [f"- {failure}" for failure in failures]
         markdown = "\n".join(lines) + "\n"
         (self.output / "report.md").write_text(markdown)
         if os.environ.get("GITHUB_STEP_SUMMARY"):
@@ -601,9 +642,160 @@ class Harness:
             "section{flex:none}h2{margin-top:40px}</style><h1>Actual captured ANSI output</h1>"
             "<p>Pipe rendering, no native Kitty images. Overflow remains visible. See results.json for cell-width findings.</p>"
             + "".join(panels))
+        return report
 
 
 class SelfTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.dict(os.environ))
+        os.environ.pop("GITHUB_STEP_SUMMARY", None)
+
+    def identity_fixture(self, before=b"\x7fELForiginal", after=b"\x7fELForiginal", built_artifacts=True):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        binaries = [directory / name for name in ("before", "after")]
+        for path, data in zip(binaries, (before, after)):
+            path.write_bytes(data)
+        harness = Harness(argparse.Namespace(before=binaries[0], after=binaries[1],
+            output=directory / "output", library=None, images=2, commands=["version"],
+            samples=21, cold_samples=9, timeout=1, built_artifacts=built_artifacts))
+        # These are diagnostic verdicts supplied to finalization, not fabricated
+        # benchmark observations. The comparator's own tests cover statistics.
+        comparisons = {"version": {"phase_verdicts": {"cold": "INCONCLUSIVE", "warm": "FAIL"}}}
+        return harness, comparisons
+
+    def test_identical_bytes_preserve_statistical_diagnostics(self):
+        harness, comparisons = self.identity_fixture()
+        original = dict(comparisons["version"]["phase_verdicts"])
+        harness.finalize_timing(comparisons)
+        self.assertTrue(harness.binary_identity["identical"])
+        self.assertEqual(comparisons["version"]["phase_verdicts"], original)
+        self.assertEqual(comparisons["version"]["timing_gate_verdicts"],
+                         {"cold": "IDENTICAL_BINARY", "warm": "IDENTICAL_BINARY"})
+        self.assertEqual(harness.timing_failures, [])
+        self.assertEqual(harness.failures, [])
+
+    def test_different_bytes_keep_zero_slack_verdicts(self):
+        harness, comparisons = self.identity_fixture(after=b"\x7fELFchanged")
+        harness.finalize_timing(comparisons)
+        self.assertFalse(harness.binary_identity["identical"])
+        self.assertEqual(comparisons["version"]["timing_gate_verdicts"],
+                         comparisons["version"]["phase_verdicts"])
+        self.assertEqual(len(harness.timing_failures), 2)
+        self.assertEqual(len(harness.inconclusive), 1)
+
+    def test_identity_mode_requires_explicit_controlled_native_builds(self):
+        # This caller owns the comparable-build assertion. Losing its opt-in
+        # would silently restore flaky comparisons of identical CI artifacts.
+        self.assertIn("--built-artifacts", (ROOT / "tests/performance-ci.sh").read_text())
+        for options in ({"built_artifacts": False}, {"before": b"script", "after": b"script"}):
+            with self.subTest(options=options):
+                harness, comparisons = self.identity_fixture(**options)
+                harness.finalize_timing(comparisons)
+                self.assertTrue(harness.binary_identity["identical"])
+                self.assertFalse(harness.binary_identity["eligible"])
+                self.assertEqual(len(harness.timing_failures), 2)
+        harness, _ = self.identity_fixture()
+        harness.args.library = harness.library
+        with self.assertRaisesRegex(ValueError, "--library stays strict"):
+            Harness(harness.args)
+
+    def test_identity_denies_contradictory_capabilities(self):
+        harness, comparisons = self.identity_fixture()
+        harness.capabilities = {"index": {"before": {"supported": False}, "after": {"supported": True}}}
+        harness.finalize_timing(comparisons)
+        self.assertTrue(harness.binary_identity["identical"])
+        self.assertFalse(harness.binary_identity["eligible"])
+        self.assertTrue(harness.failures)
+        self.assertEqual(len(harness.timing_failures), 2)
+
+    def test_expected_control_failures_do_not_pollute_ci_summary(self):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        summary = directory / "summary.md"
+        summary.write_text("earlier CI steps\n")
+        os.environ["GITHUB_STEP_SUMMARY"] = str(summary)
+        result = unittest.TestResult()
+        SelfTests("test_identical_binary_cannot_hide_other_failure_classes").run(result)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self.assertEqual(summary.read_text(), "earlier CI steps\n")
+        self.assertEqual(os.environ["GITHUB_STEP_SUMMARY"], str(summary))
+        harness, _ = self.identity_fixture()
+        harness.report({})
+        self.assertIn("Result: **PASS**", summary.read_text())
+
+    def test_identical_path_sensitive_wrapper_delay_still_fails(self):
+        script = (b'#!/bin/sh\ncase "$0" in */after) sleep 0.03;; esac\n'
+                  b'printf "version: v1.2.3\\ngithub: https://github.com/snaraj/theme\\nmaintainer: Samuel Naranjo\\n"\n')
+        harness, _ = self.identity_fixture(script, script, built_artifacts=False)
+        for path in harness.binaries.values():
+            path.chmod(0o700)
+        code = main(["--before", str(harness.binaries["before"]), "--after", str(harness.binaries["after"]),
+                     "--output", str(harness.output), "--commands", "version", "--images", "2", "--samples", "21"])
+        report = json.loads((harness.output / "results.json").read_text())
+        self.assertTrue(code)
+        self.assertTrue(report["binary_identity"]["identical"])
+        self.assertFalse(report["binary_identity"]["eligible"])
+        self.assertEqual(report["verdict"], "FAIL")
+        timing = report["comparisons"]["version"]
+        self.assertEqual(timing["timing_gate_verdicts"], timing["phase_verdicts"])
+        self.assertEqual(timing["timing_gate_verdicts"]["warm"], "FAIL")
+
+    def test_actual_timeout_is_unconditional(self):
+        script = b"#!/bin/sh\nexec sleep 1\n"
+        harness, _ = self.identity_fixture(script, script)
+        harness.binaries["after"].chmod(0o700)
+        harness.args.timeout = .01
+        harness.run("version", "after", "control", 0, harness.environment("version", "after"))
+        report = harness.report({})
+        self.assertEqual(report["runs"][0]["exit_code"], "timeout")
+        self.assertEqual(report["verdict"], "FAIL")
+
+    def test_identity_requires_both_initial_and_both_final_hashes(self):
+        cases = [(b"original", b"original", {"before": b"changed"}),
+                 (b"original", b"original", {"after": b"changed"}),
+                 (b"original", b"original", {"before": b"changed", "after": b"changed"}),
+                 (b"changed", b"original", {"before": b"original"}),
+                 (b"original", b"changed", {"after": b"original"})]
+        for before, after, changes in cases:
+            with self.subTest(changes=changes, before=before, after=after):
+                harness, comparisons = self.identity_fixture(b"\x7fELF" + before, b"\x7fELF" + after)
+                for label, data in changes.items():
+                    harness.binaries[label].write_bytes(b"\x7fELF" + data)
+                harness.finalize_timing(comparisons)
+                self.assertFalse(harness.binary_identity["identical"])
+                self.assertTrue(harness.failures)
+                self.assertEqual(len(harness.timing_failures), 2)
+
+    def test_missing_binary_fails_and_report_survives(self):
+        harness, _ = self.identity_fixture()
+        harness.binaries["after"].unlink()
+        report = harness.report({})
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertIsNone(report["binary_identity"]["final_sha256"]["after"])
+        self.assertTrue((harness.output / "results.json").is_file())
+        self.assertTrue((harness.output / "rendering.html").is_file())
+
+    def test_identical_binary_cannot_hide_execution_or_semantic_errors(self):
+        for executable in (b"not executable", b"#!/bin/sh\nexit 7\n", b"#!/bin/sh\nprintf empty\n"):
+            with self.subTest(executable=executable):
+                harness, _ = self.identity_fixture(executable, executable)
+                harness.binaries["after"].chmod(0o700)
+                harness.run("version", "after", "control", 0, harness.environment("version", "after"))
+                report = harness.report({})
+                self.assertTrue(report["binary_identity"]["identical"])
+                self.assertEqual(report["verdict"], "FAIL")
+                record = report["runs"][0]
+                self.assertEqual(digest((harness.output / record["stdout"]).read_bytes()), record["stdout_sha256"])
+
+    def test_identical_binary_cannot_hide_other_failure_classes(self):
+        for failure in ("timeout", "capability", "palette", "rendering"):
+            with self.subTest(failure=failure):
+                harness, _ = self.identity_fixture()
+                harness.failures.append(failure)
+                report = harness.report({})
+                self.assertTrue(report["binary_identity"]["identical"])
+                self.assertEqual(report["verdict"], "FAIL")
+                self.assertIn(failure, report["failures"])
+
     def test_regression_requires_repeatable_shift(self):
         self.assertTrue(compare([10.] * 21, [12.] * 21)["regression"])
         self.assertTrue(compare([1.] * 21, [1.01] * 21)["regression"])
@@ -718,19 +910,21 @@ class SelfTests(unittest.TestCase):
         self.assertNotEqual(data, png(2, 2, 3))
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--before", type=Path)
     parser.add_argument("--after", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--library", type=Path, help="explicit read-only library; defaults to deterministic generated PNGs")
+    parser.add_argument("--built-artifacts", action="store_true",
+                        help="explicit CI mode for comparable direct native builds with the synthetic fixture; standalone timings remain strict by default")
     parser.add_argument("--images", type=int, default=64)
     parser.add_argument("--commands", nargs="+", help="explicit subset for bounded controls; omitted runs the full CI matrix")
     parser.add_argument("--samples", type=int, default=63, help="warm pairs, at least 21 and divisible by 3")
     parser.add_argument("--cold-samples", type=int, default=9)
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--self-test", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.self_test:
         return not unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(SelfTests)).wasSuccessful()
     if not all((args.before, args.after, args.output)):
@@ -740,9 +934,9 @@ def main():
     try:
         harness = Harness(args)
         comparisons = harness.measure()
-        harness.report(comparisons)
+        report = harness.report(comparisons)
         print(f"Evidence: {harness.output}")
-        return bool(harness.failures)
+        return not report["passed"]
     except (OSError, ValueError) as error:
         print(f"performance: {error}", file=sys.stderr)
         return 2
