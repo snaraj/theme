@@ -203,21 +203,25 @@ Cold here does not mean a flushed OS filesystem cache. New commands have no
 historical speed comparison until the base supports them; generated-fixture
 stall budgets are 500 ms warm and 3 s cold.
 
-The gate checks median and p95 changes against zero, with 99.9% paired bootstrap
-confidence and repetition across interleaved sample blocks. Supported shifts
-trigger a fresh confirmation batch with the same sample count. Confirmed
-regressions and inconclusive confirmations both block CI for changed binaries.
-There is no fixed millisecond or percentage slowdown allowance. CI explicitly
+The gate checks median and p95 shifts with 99.9% paired bootstrap confidence and
+repetition across interleaved sample blocks. A shift counts only above a floor
+of 2% of the baseline value, applied to the bootstrap lower bound; a shift with
+no faster pair must clear the same 2%. Byte-identical binaries drift by up to
+0.9% on this apparatus, and below the floor the harness cannot tell code from
+apparatus. The cold phase gates the median alone, because with nine cold samples
+p95 is the maximum observation: cold p95 is reported, never gated. Up to three
+equal batches vote per metric — the second runs when the first votes or shows
+evidence without repetition, the third only when the first two disagree — and
+one metric with two votes blocks CI for changed binaries. CI explicitly
 selects `--built-artifacts` after comparable direct Cargo builds. With its
 controlled synthetic fixture, native executable headers and identical SHA-256
 values for both binaries before and after the run, the timing gate reports
 `IDENTICAL_BINARY`: there is no code-performance
-comparison. All measurements and statistical verdicts remain visible, including
-inconclusive results; executable identity is not a measured speedup. Execution,
-semantic and rendering failures still block CI. With nine cold samples, p95 is
-the maximum observation. These checks cannot prove identical performance on
-every machine or workload. The harness tests tiny consistent slowdowns,
-tail-only regressions, missing output and changes to either executable.
+comparison. All measurements and statistical verdicts remain visible;
+executable identity is not a measured speedup. Execution,
+semantic and rendering failures still block CI. These checks cannot prove
+identical performance on every machine or workload. The harness tests consistent
+slowdowns above the floor, missing output and changes to either executable.
 Standalone comparisons remain strict by default, including identical wrappers.
 `--built-artifacts` rejects `--library`; headers alone do not prove provenance.
 
