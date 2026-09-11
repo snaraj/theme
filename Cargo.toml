@@ -42,7 +42,9 @@ image = { version = "0.25", default-features = false, features = [
 # does not expose; rustix is the safe binding that keeps deny(unsafe_code)
 # intact (raw libc would need unsafe in this crate). `system` is uname(2),
 # which the bare screen's OS line reads instead of spawning uname(1).
-rustix = { version = "1", default-features = false, features = ["fs", "process", "std", "system", "termios"] }
+# `event` is poll(2): the browser's key reader must tell a lone Escape from
+# the start of an arrow sequence, which is a timed read, not a blocking one.
+rustix = { version = "1", default-features = false, features = ["event", "fs", "process", "std", "system", "termios"] }
 # `theme update` verifies a release download against SHA256SUMS before it
 # may replace the running binary. In-process (RustCrypto) rather than
 # shelling to shasum/sha256sum: a PATH-resolved tool must not be the
