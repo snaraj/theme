@@ -40,6 +40,7 @@ PAGE_SIZE = 6  # 14 images over 6 per page: three pages, the last one short
 PAGES = -(-IMAGES // PAGE_SIZE)
 WINDOW = (1400, 900)
 THUMBNAIL_ROWS = 7  # what the sheet reserves per card, before title and swatches
+PLACEHOLDER = "\U0010eeee"  # the cell kitty fills with a transmitted image
 SOCKET_WAIT = 30.0
 ASSERT_WAIT = 10.0
 POLL = 0.2
@@ -320,6 +321,53 @@ class Session:
         self.log.close()
 
 
+def query_row(screen):
+    """The row of the most recent sheet's query line: the header the seven
+    reserved thumbnail rows follow. Output is appended, so the last one on
+    screen belongs to the sheet just drawn."""
+    rows = screen.splitlines()
+    found = [i for i, row in enumerate(rows) if row.startswith("Query:")]
+    return found[-1] if found else None
+
+
+def sheet_cards(screen, top):
+    """The cards of the title row under a sheet's thumbnails, in the order
+    the browser laid them out. Which picture the queue starts on is the
+    library's business — the search order differs between filesystems — so
+    every selection assertion is derived from here, never from a name."""
+    rows = screen.splitlines()
+    row = rows[top + THUMBNAIL_ROWS] if top + THUMBNAIL_ROWS < len(rows) else ""
+    return re.findall(r"(\d+)\s+(fixture-\d{3}\.png)", row)
+
+
+def drawn_band(session, name, top, columns, lines):
+    """Capture the window until the thumbnail band holds pictures, or the
+    wait runs out. Transmitting an image and drawing it are not the same
+    instant: a hosted runner on software GL had the sheet's text on screen
+    with the pictures not yet painted, so one capture can race the paint. A
+    sheet that never draws them still fails at the deadline, which is the
+    whole point of the assertion, and the last capture is the one kept.
+    """
+    attempts, deadline = 0, time.monotonic() + ASSERT_WAIT
+    while True:
+        attempts += 1
+        shot = session.screenshot(name)
+        capture = shot.read_bytes()
+        # The cell grid comes from the capture's own size over the grid kitty
+        # reports, so a Retina capture needs no special case; only the rows
+        # this band needs are decoded.
+        size = struct.unpack(">II", capture[16:24])
+        cell = {"width": size[0] // columns, "height": size[1] // lines}
+        image = decode_png(capture, max_rows=(top + THUMBNAIL_ROWS) * cell["height"] + 1)
+        band = band_colours(image, top * cell["height"], (top + THUMBNAIL_ROWS) * cell["height"])
+        drawn = band["colours"] >= 64 and band["foreground"] >= 0.05
+        if drawn or time.monotonic() >= deadline:
+            return {"file": shot.name, "width": image["width"], "height": image["height"],
+                    "decoded_rows": image["rows"], "cell": cell, "captures": attempts,
+                    "band_rows": [top, top + THUMBNAIL_ROWS], "thumbnails": band, "drawn": drawn}
+        time.sleep(POLL)
+
+
 def last_page(screen):
     """The page counter of the most recent sheet: output is appended, so the
     last counter on screen is the one this key produced."""
@@ -388,37 +436,44 @@ def main():
 
         # The thumbnails, as pixels. The sheet prints the page header, the
         # query line, then this card row's THUMBNAIL_ROWS reserved rows.
-        rows = screen.splitlines()
-        query = next((i for i, row in enumerate(rows) if row.startswith("Query:")), None)
+        query = query_row(screen)
         check("sheet header is on screen", query is not None, f"Query: at row {query}")
-        sheet_shot = session.screenshot("sheet")
-        thumbnails = {}
+        cards = []
         if query is not None:
             top = query + 1
-            capture = sheet_shot.read_bytes()
-            # The cell grid comes from the capture's own size over the grid
-            # kitty reports, so a Retina capture needs no special case; only
-            # the rows this band needs are decoded.
-            shot = struct.unpack(">II", capture[16:24])
-            cell = {"width": shot[0] // columns, "height": shot[1] // lines}
-            image = decode_png(capture, max_rows=(top + THUMBNAIL_ROWS) * cell["height"] + 1)
-            thumbnails = band_colours(image, top * cell["height"],
-                                      (top + THUMBNAIL_ROWS) * cell["height"])
-            summary["capture"] = {"file": sheet_shot.name, "width": image["width"],
-                                  "height": image["height"], "decoded_rows": image["rows"],
-                                  "cell": cell, "band_rows": [top, top + THUMBNAIL_ROWS],
-                                  "thumbnails": thumbnails}
-            check("thumbnail rows are pictures, not empty cells",
-                  thumbnails["colours"] >= 64 and thumbnails["foreground"] >= 0.05,
-                  f"{thumbnails['colours']} distinct colours, "
-                  f"{thumbnails['foreground'] * 100:.1f}% non-background "
-                  f"(background {thumbnails['background']}), cell {cell['width']}x{cell['height']}px")
+            # Two halves, and the evidence says which one broke: the sheet
+            # asking for images (placeholder cells in the screen text), and
+            # the terminal having drawn them (colour in those rows' pixels).
+            asked = sum(1 for row in screen.splitlines()[top:top + THUMBNAIL_ROWS]
+                        if PLACEHOLDER in row)
+            check("every thumbnail row asks the terminal for an image",
+                  asked == THUMBNAIL_ROWS, f"{asked}/{THUMBNAIL_ROWS} rows with image cells")
+            capture = drawn_band(session, "sheet", top, columns, lines)
+            summary["capture"] = capture
+            band = capture["thumbnails"]
+            check("thumbnail rows are pictures, not empty cells", capture["drawn"],
+                  f"{band['colours']} distinct colours, {band['foreground'] * 100:.1f}% "
+                  f"non-background (background {band['background']}), cell "
+                  f"{capture['cell']['width']}x{capture['cell']['height']}px, "
+                  f"{capture['captures']} capture(s)")
+            cards = sheet_cards(screen, top)
+            check("the sheet names its cards", len(cards) >= 2,
+                  " · ".join(f"{n} {name}" for n, name in cards[:3]) or "no title row found")
 
-        # The keys a person presses, in the order a person presses them.
+        # The keys a person presses, in the order a person presses them. Which
+        # picture the queue starts on is the library's business, not this
+        # test's — the search order differs between filesystems — so the
+        # selection is asserted by movement, never by an absolute name.
+        if len(cards) < 2:
+            raise Failure("the sheet's title row gave no two cards to steer by")
+        first, second = cards[0], cards[1]
         session.send(b"\x1b[C")
-        screen = session.wait_until("Right previews a picture", lambda s: "Preview only" in s)
-        check("Right previews the first picture", last_title(screen) == ("1", "fixture-000.png"),
-              f"title {last_title(screen)}")
+        try:
+            session.wait_until("Right previews the sheet's first card",
+                               lambda s: last_title(s) == first)
+            check("Right previews the sheet's first card", True, f"title {' '.join(first)}")
+        except Failure as error:
+            check("Right previews the sheet's first card", False, str(error).splitlines()[0])
 
         for keys, name, want in [(b"\x1b[B", "Down", f"2/{PAGES}"),
                                  (b"\x1b[6~", "PageDown", f"3/{PAGES}"),
@@ -434,15 +489,22 @@ def main():
             except Failure as error:
                 check(f"{name} shows page {want}", False, str(error).splitlines()[0])
             if name == "Down":
-                page_shot = session.screenshot("page-change")
                 session.dump("page-change", screen)
-                summary["page_change_capture"] = page_shot.name
+                turned = query_row(screen)
+                if turned is None:
+                    raise Failure("the turned page printed no header to measure from")
+                capture = drawn_band(session, "page-change", turned + 1, columns, lines)
+                summary["page_change_capture"] = capture
+                band = capture["thumbnails"]
+                check("the page that was turned to is pictures too", capture["drawn"],
+                      f"{band['colours']} distinct colours, {band['foreground'] * 100:.1f}% "
+                      f"non-background, {capture['captures']} capture(s)")
 
-        for keys, name, want in [(b"n\n", "n steps the selection", ("2", "fixture-001.png")),
-                                 (b"p\n", "p steps back", ("1", "fixture-000.png"))]:
+        for keys, name, want in [(b"n\n", "n steps to the second card", second),
+                                 (b"p\n", "p steps back to the first", first)]:
             session.send(keys)
             try:
-                screen = session.wait_until(name, lambda s: last_title(s) == want)
+                screen = session.wait_until(f"{name} ({want})", lambda s: last_title(s) == want)
                 check(name, True, f"title {' '.join(last_title(screen))}")
             except Failure as error:
                 check(name, False, str(error).splitlines()[0])

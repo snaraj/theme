@@ -129,32 +129,17 @@ jobs:
           cargo build --release --locked
           python3 -I -B tests/browser_cli_test.py target/release/theme
           python3 -I -B tests/mdls_cli_test.py target/release/theme
-      # The same key path in the same pinned Kitty, on the platform most of
-      # this tool's users are on — in the runner's own GUI session, so the
-      # window is drawn and captured rather than simulated.
-      - name: Press the browser's keys in a real Kitty
-        env:
-          KITTY_VERSION: 0.48.2
-          KITTY_SHA256: f804f58ee4b69c76f84eb3281e140748269a63f3f4a816015a8dec2a06d2b195
-        run: |
-          curl -fsSL -o "$RUNNER_TEMP/kitty.dmg" \
-            "https://github.com/kovidgoyal/kitty/releases/download/v$KITTY_VERSION/kitty-$KITTY_VERSION.dmg"
-          printf '%s  %s\n' "$KITTY_SHA256" "$RUNNER_TEMP/kitty.dmg" | shasum -a 256 -c -
-          hdiutil attach -nobrowse -readonly -mountpoint /Volumes/kitty "$RUNNER_TEMP/kitty.dmg"
-          python3 -I -B tests/kitty_e2e.py \
-            --kitty /Volumes/kitty/kitty.app/Contents/MacOS/kitty \
-            --theme target/release/theme --output target/kitty-e2e
-      - name: Publish the screenshots, screen dumps and kitty log
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: kitty-e2e-${{ runner.os }}-${{ runner.arch }}
-          path: target/kitty-e2e/
-          if-no-files-found: error
-          retention-days: 30
-      - name: Unmount the Kitty image
-        if: always()
-        run: hdiutil detach /Volumes/kitty || true
+      # No real-Kitty step here, and it is not an omission: the hosted macOS
+      # VM has no accelerated OpenGL, and GLFW's NSGL backend asks for an
+      # accelerated pixel format unconditionally, so the pinned Kitty exits 1
+      # on this runner before it can answer — "[glfw error 65545]: NSGL:
+      # Failed to find a suitable pixel format", then "Failed to create
+      # GLFWwindow ... kitty requires working OpenGL 3.3 drivers" (proven on
+      # run 34644677010). The macOS key path is gated by the step above
+      # instead: browser_cli_test.py drives the real binary through a real
+      # pty, keys, terminal-mode restore and all. The real-Kitty driver runs
+      # hosted on Linux (browser-kitty) and on a Mac before release, with its
+      # assertion lines and screenshots in the pull request.
       - name: Compare command performance and rendering with the base commit
         env:
           THEME_PERF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}

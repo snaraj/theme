@@ -139,16 +139,19 @@ properties, not subject or style recognition. `--all` clears the saved query.
 Non-interactive use prints one deterministic page and never consumes commands
 or applies a wallpaper: no keys are read and the terminal mode is untouched.
 
-That key path is tested in a terminal that draws, not only down a pipe. Both
-hosted CI runners download Kitty 0.48.2 — pinned by SHA-256 and verified
-before extraction — run `theme browse` inside it (Linux headless under Xvfb
-with software GL, macOS in the runner's own GUI session), press the keys
-above through `kitten @ send-text`, and assert on what the screen says
-afterwards. The test decodes its own screenshot of the contact sheet, so a
-row of blank thumbnails fails it. Screenshots, screen dumps and the kitty log
-are published as `kitty-e2e-<OS>-<architecture>` artifacts, pass or fail. It
-proves the terminal side only: applying a wallpaper, the macOS Spaces store
-and the desktop itself stay outside it.
+That key path is tested in a terminal that draws, not only down a pipe. The
+hosted Linux CI job downloads Kitty 0.48.2 — pinned by SHA-256 and verified
+before extraction — runs `theme browse` inside it headless under Xvfb with
+software GL, presses the keys above through `kitten @ send-text`, and asserts
+on what the screen says afterwards; it decodes its own screenshot of the
+contact sheet, so a row of blank thumbnails fails it. Screenshots, screen
+dumps and the kitty log are published as `kitty-e2e-<OS>-<architecture>`
+artifacts, pass or fail. macOS CI cannot host that test — the runner has no
+accelerated OpenGL, so Kitty exits before it opens a window — so there the
+keys are driven through a real pty against the real binary, and the Kitty
+driver is run on a Mac before each release with its results in the pull
+request. All of it proves the terminal side only: applying a wallpaper, the
+macOS Spaces store and the desktop itself stay outside it.
 
 ```sh
 python3 -I -B tests/kitty_e2e.py --kitty "$(command -v kitty)" \
