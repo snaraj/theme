@@ -10,7 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-# Sole runtime dependency (coordinator ruling, issue #2): decoders only, and
+# Image decoding dependency (coordinator ruling, issue #2): decoders only, and
 # exactly the codecs THEME_FORMATS names — jpg/jpeg, png, webp, gif, bmp,
 # tif/tiff. Decoding hostile image bytes in-house would trade away security.
 image = { version = "0.25", default-features = false, features = [
@@ -21,6 +21,9 @@ image = { version = "0.25", default-features = false, features = [
     "bmp",
     "tiff",
 ] }
+# Reuse the CLI's locked safe bindings to reject nonregular cache entries
+# without following symlinks or blocking on open.
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = [

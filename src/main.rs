@@ -40,14 +40,18 @@ macro_rules! eprintln {
 }
 
 mod apply;
+mod browse;
+mod browse_state;
 mod commands;
 mod config;
 mod help;
 mod imaging;
+mod index;
 mod json;
 mod library;
 mod main_flags;
 mod net;
+mod presentation;
 mod report;
 mod save;
 mod scratch;
@@ -55,6 +59,7 @@ mod search;
 /// The per-Space wallpaper store is macOS-only machinery.
 #[cfg(target_os = "macos")]
 mod spaces;
+mod store;
 mod ui;
 mod unsplash;
 mod update;
@@ -90,6 +95,12 @@ fn main() {
             std::process::exit(code);
         }
         update::cmd_update(&cfg, &version_sel, binary.as_deref());
+        scratch::cleanup();
+        return;
+    }
+    // Browser filters own a strict grammar and never become global image flags.
+    if matches!(argv.first().map(String::as_str), Some("browse" | "surf")) {
+        browse::run(&cfg, &argv[1..]);
         scratch::cleanup();
         return;
     }
@@ -183,6 +194,12 @@ fn main() {
         }
         "url" => die("theme url was folded into theme set — run: theme set <link>"),
         "list" | "ls" => report::cmd_list(&cfg, flags.verbose, flags.list_n),
+        "index" => {
+            if args.len() != 1 {
+                die("usage: theme index");
+            }
+            search::cmd_index(&cfg);
+        }
         "search" => {
             // Same kubectl-style root as unsplash: bare `theme search` is the
             // command's help, not a whole-library dump.

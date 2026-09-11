@@ -11,10 +11,10 @@ use crate::imaging::img_size;
 use crate::library::all_images;
 use crate::report::{
     added_date, backfill_schemes, birth_key, human_bytes, swatch_cells, wall_meta, wall_scheme,
-    wall_source,
+    wall_sources,
 };
 use crate::ui::{display_text, parse_hex6, term_cols, truncate_ellipsis, wrap_prefixed};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The `theme.*` provenance xattrs `preview` reads, as fields a term can hit.
 const META: [&str; 5] = ["artist", "published", "camera", "place", "license"];
@@ -73,7 +73,7 @@ fn shape_words(size: &str) -> String {
 /// A hex color as the word someone would type. HSL buckets, because hue is
 /// how people name a color and lightness is what separates brown from orange
 /// and black from everything.
-fn color_word(hex: &str) -> Option<&'static str> {
+pub(crate) fn color_word(hex: &str) -> Option<&'static str> {
     let (r, g, b) = parse_hex6(hex.trim_start_matches('#'))?;
     let n = |c: u8| f64::from(c) / 255.0;
     let (r, g, b) = (n(r), n(g), n(b));
@@ -104,7 +104,12 @@ fn color_word(hex: &str) -> Option<&'static str> {
 
 /// Everything one wallpaper can be searched by. An empty value is dropped
 /// rather than stored, so a fact the file does not have can never match.
-fn facts(cfg: &Config, path: &Path, scheme: &[String]) -> Vec<(&'static str, String)> {
+fn facts(
+    cfg: &Config,
+    path: &Path,
+    scheme: &[String],
+    source: &str,
+) -> Vec<(&'static str, String)> {
     let size = img_size(path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let mut words: Vec<&str> = Vec::new();
@@ -132,9 +137,8 @@ fn facts(cfg: &Config, path: &Path, scheme: &[String]) -> Vec<(&'static str, Str
         ("colors", words.join(" ")),
         ("mode", mode.to_string()),
     ];
-    let src = wall_source(path);
-    if src != "-" {
-        f.push(("source", src));
+    if source != "-" {
+        f.push(("source", source.to_owned()));
     }
     for field in META {
         f.push((field, wall_meta(path, &format!("theme.{field}"))));
@@ -242,6 +246,7 @@ fn rank(facts: &[(&str, String)], scheme: &[String], terms: &[Term]) -> Option<(
 /// One matching wallpaper, reduced to what the table prints and the keys it
 /// sorts by.
 struct Hit {
+    path: PathBuf,
     score: u32,
     added: i64,
     title: String,
@@ -249,19 +254,88 @@ struct Hit {
     matched: String,
 }
 
-#[allow(clippy::print_literal)] // column headers: the formatter pads them, hand-counted spaces would rot
-pub fn cmd_search(cfg: &Config, args: &[String], list_n: usize) {
+fn needs_colors(args: &[String]) -> bool {
+    // A colors fact contains up to eight words in any order. Repeating the
+    // vocabulary eight times is a conservative supersequence: even quoted
+    // multiword and cross-word fuzzy terms must give the same cold/warm answer.
+    let words = HUE_WORD
+        .iter()
+        .chain(["black", "white", "gray", "brown"].iter())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let colors: Vec<char> = format!("{words} ").repeat(8).chars().collect();
+    args.iter().any(|arg| {
+        let t = term(arg);
+        t.hex.is_some()
+            || score(&t.chars, &colors) > 0
+            || ["dark", "light"]
+                .iter()
+                .any(|w| score(&t.chars, &w.chars().collect::<Vec<_>>()) > 0)
+    })
+}
+
+struct Collected {
+    hits: Vec<Hit>,
+    total: usize,
+    schemes: usize,
+    cached: Result<usize, String>,
+}
+
+fn collect_hits(cfg: &Config, args: &[String], prepare: bool) -> Collected {
     let terms: Vec<Term> = args.iter().map(|a| term(a)).collect();
-    let files = all_images(cfg);
+    let mut files = all_images(cfg);
+    files.sort();
+    files.dedup();
     let total = files.len();
-    // A wallpaper with no cached scheme can answer no color question, so the
-    // candidate set is indexed once first — exactly as `list` does.
-    backfill_schemes(cfg, files.iter());
+    // Metadata browsing need not decode the whole library. Color questions
+    // prepare missing palettes; `theme index` makes that work explicit up front.
+    let prepared = (prepare || needs_colors(args)).then(|| backfill_schemes(cfg, files.iter()));
+    let mut index = crate::index::Index::open(cfg);
+    let records: Vec<_> = files
+        .iter()
+        .map(|f| {
+            let scheme = match &prepared {
+                Some(schemes) => schemes.get(f).cloned().unwrap_or_default(),
+                None => wall_scheme(cfg, f).unwrap_or_default(),
+            };
+            let lookup = index.lookup(f, &scheme);
+            (f, scheme, lookup)
+        })
+        .collect();
+    let missing: Vec<_> = records
+        .iter()
+        .filter_map(|(f, _, lookup)| {
+            matches!(lookup, crate::index::Lookup::Missing(_)).then_some(f.as_path())
+        })
+        .collect();
+    let sources = wall_sources(&missing);
     let mut hits: Vec<Hit> = Vec::new();
-    for f in &files {
-        let scheme = wall_scheme(cfg, f).unwrap_or_default();
-        if let Some((score, matched)) = rank(&facts(cfg, f, &scheme), &scheme, &terms) {
+    let mut schemes = 0;
+    for (f, scheme, lookup) in records {
+        schemes += usize::from(!scheme.is_empty());
+        let cached = match lookup {
+            crate::index::Lookup::Cached(facts) => facts,
+            crate::index::Lookup::Missing(missing) => index.store(
+                missing,
+                facts(
+                    cfg,
+                    f,
+                    &scheme,
+                    sources.get(f).map(String::as_str).unwrap_or("-"),
+                )
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            ),
+        };
+        let borrowed: Vec<(&str, String)> = cached
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
+        if let Some((score, matched)) = rank(&borrowed, &scheme, &terms) {
             hits.push(Hit {
+                path: f.clone(),
                 score,
                 added: birth_key(f),
                 title: title(f),
@@ -270,8 +344,73 @@ pub fn cmd_search(cfg: &Config, args: &[String], list_n: usize) {
             });
         }
     }
+    let cached = index.finish(cfg);
     // Best answer first; equally good answers newest first, like `list`.
     hits.sort_by_key(|h| (std::cmp::Reverse(h.score), std::cmp::Reverse(h.added)));
+    Collected {
+        hits,
+        total,
+        schemes,
+        cached,
+    }
+}
+
+/// One stable snapshot for the browser. Navigation reuses it, without rescans.
+pub fn matching_paths(cfg: &Config, args: &[String]) -> Vec<PathBuf> {
+    // An unfiltered browser only needs live paths and newest-first ordering.
+    // Computing every image's searchable facts here delays the first page.
+    if args.is_empty() {
+        let mut files = all_images(cfg);
+        files.sort();
+        files.dedup();
+        files.sort_by_cached_key(|p| std::cmp::Reverse(birth_key(p)));
+        return files;
+    }
+    collect_hits(cfg, args, false)
+        .hits
+        .into_iter()
+        .map(|h| h.path)
+        .collect()
+}
+
+pub fn cmd_index(cfg: &Config) {
+    let result = collect_hits(cfg, &[], true);
+    let say = |text: &str| {
+        for line in wrap_prefixed(text, term_cols(), "", "  ") {
+            println!("{line}");
+        }
+    };
+    say(&format!(
+        "inspected {} wallpaper(s); {} palette(s) available",
+        result.total, result.schemes
+    ));
+    if cfg.no_apply {
+        say("no-apply: no cache writes");
+    } else {
+        match result.cached {
+            Ok(n) => say(&format!(
+                "cached {n} of {} metadata record(s)",
+                result.total
+            )),
+            Err(e) => crate::ui::die(&format!("metadata index was not saved: {e}")),
+        }
+    }
+}
+
+#[allow(clippy::print_literal)] // column headers: the formatter pads them, hand-counted spaces would rot
+pub fn cmd_search(cfg: &Config, args: &[String], list_n: usize) {
+    let Collected {
+        mut hits, total, ..
+    } = collect_hits(cfg, args, false);
+    // Metadata searches derive only the rows actually shown. This preserves
+    // their swatches without decoding every unrelated image in the library.
+    if !needs_colors(args) {
+        let shown = if list_n > 0 { list_n } else { hits.len() };
+        let schemes = backfill_schemes(cfg, hits.iter().take(shown).map(|h| &h.path));
+        for hit in hits.iter_mut().take(shown) {
+            hit.scheme = schemes.get(&hit.path).cloned().unwrap_or_default();
+        }
+    }
 
     let cols = term_cols();
     let query = display_text(&args.join(" "));
@@ -351,6 +490,56 @@ pub fn cmd_search(cfg: &Config, args: &[String], list_n: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_queries_need_no_full_library_image_decode() {
+        assert!(!needs_colors(&["mountains".into(), "landscape".into()]));
+        assert!(!needs_colors(&[]));
+        for query in [
+            "blue",
+            "blu",
+            "#496f91",
+            "dark",
+            "brown",
+            "blue green",
+            "ocean",
+        ] {
+            assert!(needs_colors(&[query.into()]), "{query}");
+        }
+    }
+
+    #[test]
+    fn combined_color_queries_prepare_cold_and_warm_equivalently() {
+        let facts = vec![("colors", "orange cyan red black blue green".to_string())];
+        for query in ["blue green", "ocean", "cyan blue"] {
+            assert!(rank(&facts, &[], &[term(query)]).is_some());
+            assert!(needs_colors(&[query.into()]));
+        }
+    }
+
+    #[test]
+    fn unfiltered_snapshot_needs_no_image_facts_or_index_writes() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("unfiltered-snapshot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.png");
+        std::fs::write(&path, b"snapshot does not decode image bytes").unwrap();
+        let cfg = Config {
+            wallpaper_dirs: vec![dir.clone(), dir.clone()],
+            wallpaper_dirs_display: dir.display().to_string(),
+            cache_dir: dir.join("cache"),
+            kitty_dir: dir.join("kitty"),
+            current: dir.join("kitty/current-theme.conf"),
+            formats: vec!["png".into()],
+            contrast: 7.0,
+            no_apply: false,
+        };
+        assert_eq!(matching_paths(&cfg, &[]), vec![path]);
+        assert!(!cfg.cache_dir.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn sc(t: &str, v: &str) -> u32 {
         let (t, v): (Vec<char>, Vec<char>) = (t.chars().collect(), v.chars().collect());

@@ -1,6 +1,6 @@
 //! Image loading: one decode, one pass, one in-memory downsample.
 
-use crate::{Error, Rgb};
+use crate::{Error, ImageProfile, Rgb};
 use std::path::Path;
 
 /// Longest edge of the analysis grid. 128x128 = at most 16,384 samples for
@@ -18,6 +18,7 @@ pub(crate) struct Decoded {
     /// Mean color of every full-resolution pixel (what `magick -resize 1x1`
     /// approximated in the shell floor).
     pub average: Rgb,
+    pub profile: ImageProfile,
 }
 
 pub(crate) fn load(path: &Path) -> Result<Decoded, Error> {
@@ -49,12 +50,15 @@ pub(crate) fn load(path: &Path) -> Result<Decoded, Error> {
     let mut sums = vec![[0u64; 3]; cells];
     let mut counts = vec![0u64; cells];
     let mut total = [0u64; 3];
+    // Column membership is identical on every row; divide once per column.
+    let x_cells: Vec<usize> = (0..w)
+        .map(|x| (u64::from(x) * u64::from(gw) / u64::from(w)) as usize)
+        .collect();
 
     for (y, row) in rgb.rows().enumerate() {
-        let by = (y as u64 * u64::from(gh) / u64::from(h)) as usize;
-        for (x, p) in row.enumerate() {
-            let bx = (x as u64 * u64::from(gw) / u64::from(w)) as usize;
-            let cell = by * gw as usize + bx;
+        let row_cell = (y as u64 * u64::from(gh) / u64::from(h)) as usize * gw as usize;
+        for (p, &bx) in row.zip(&x_cells) {
+            let cell = row_cell + bx;
             let s = &mut sums[cell];
             s[0] += u64::from(p[0]);
             s[1] += u64::from(p[1]);
@@ -68,7 +72,7 @@ pub(crate) fn load(path: &Path) -> Result<Decoded, Error> {
 
     let n = u64::from(w) * u64::from(h);
     let avg = |t: u64| ((t + n / 2) / n) as u8;
-    let pixels = sums
+    let pixels: Vec<Rgb> = sums
         .iter()
         .zip(&counts)
         .filter(|&(_, &c)| c > 0)
@@ -80,6 +84,7 @@ pub(crate) fn load(path: &Path) -> Result<Decoded, Error> {
         .collect();
 
     Ok(Decoded {
+        profile: ImageProfile::from_grid(w, h, gw as usize, gh as usize, &pixels),
         pixels,
         average: Rgb {
             r: avg(total[0]),
@@ -140,6 +145,63 @@ mod tests {
         let d = load(&p).unwrap();
         std::fs::remove_file(&p).ok();
         assert_eq!(d.pixels.len(), 6);
+    }
+
+    #[test]
+    fn downsample_matches_independent_cell_rectangle_means() {
+        let color = |x: u32, y: u32| {
+            [
+                ((73 * x + 19 * y + 11 * x * y) % 256) as u8,
+                ((29 * x + 101 * y + x * x) % 256) as u8,
+                ((131 * x + 7 * y + y * y) % 256) as u8,
+            ]
+        };
+        for (w, h) in [
+            (1, 1),
+            (1, 17),
+            (7, 3),
+            (15, 33),
+            (16, 16),
+            (17, 127),
+            (127, 17),
+            (128, 127),
+            (129, 131),
+            (257, 65),
+            (65, 257),
+            (511, 19),
+        ] {
+            let path = write_png(&format!("grid-reference-{w}-{h}"), w, h, color);
+            let actual = load(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            let (gw, gh) = (w.min(GRID), h.min(GRID));
+            let mut expected = Vec::new();
+            let mut total = [0u64; 3];
+            // Invert grid membership into half-open source rectangles. This
+            // independent reference never computes a cell from a pixel index.
+            for row in 0..gh {
+                for column in 0..gw {
+                    let mut sum = [0u64; 3];
+                    let mut count = 0;
+                    for y in (row * h).div_ceil(gh)..((row + 1) * h).div_ceil(gh) {
+                        for x in (column * w).div_ceil(gw)..((column + 1) * w).div_ceil(gw) {
+                            for (channel, value) in sum.iter_mut().zip(color(x, y)) {
+                                *channel += u64::from(value);
+                            }
+                            count += 1;
+                        }
+                    }
+                    for (all, region) in total.iter_mut().zip(sum) {
+                        *all += region;
+                    }
+                    let [r, g, b] = sum.map(|channel| ((channel + count / 2) / count) as u8);
+                    expected.push(Rgb { r, g, b });
+                }
+            }
+            let count = u64::from(w) * u64::from(h);
+            let [r, g, b] = total.map(|channel| ((channel + count / 2) / count) as u8);
+            assert_eq!(actual.pixels, expected, "grid {w}x{h}");
+            assert_eq!(actual.average, Rgb { r, g, b }, "average {w}x{h}");
+        }
     }
 
     #[test]

@@ -54,6 +54,14 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "Library Commands:",
         &[
             (
+                "browse, surf",
+                "browse wallpaper previews, colors, readability and favorites",
+            ),
+            (
+                "index",
+                "prepare library colors and metadata for fast repeat searches",
+            ),
+            (
                 "list, ls",
                 "wallpaper table: title + colorscheme (-v adds source, format, size, date)",
             ),
@@ -313,6 +321,8 @@ pub fn usage(cfg: &Config) {
 pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
     let wdir = display_text(&cfg.wallpaper_dirs_display);
     match cmd {
+        "browse" | "surf" => crate::browse::usage(),
+        "index" => print!("theme index\n\n  Prepare missing palettes and refresh the incremental search index.\n  Repeated searches reuse unchanged image metadata; new, replaced, or\n  edited files are refreshed. No desktop or terminal colors are applied.\n"),
         "random" => print!(
             "theme random [--rotate left|right] [--extend[=RRGGBB]]
 
@@ -408,7 +418,8 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
   camera, place, license, source, format, size — empty fields are
   omitted, never rendered blank. Long values wrap under their own
   column. Colorscheme swatches and the location (~/path) close the
-  block. With no name it previews the CURRENT wallpaper; a name
+  block, followed by sampled readability and a final-color text specimen.
+  With no name it previews the CURRENT wallpaper; a name
   (positional or -w/--wallpaper, truncated titles welcome) previews
   that one.
 

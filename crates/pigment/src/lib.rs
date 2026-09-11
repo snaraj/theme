@@ -20,10 +20,12 @@ mod derive;
 mod emit;
 mod extract;
 mod floor;
+mod profile;
 
-pub use cache::{cache_key, cached_derive};
+pub use cache::{cache_key, cached_derive, read_cached, read_cached_colors};
 pub use color::Rgb;
-pub use floor::{Floored, effective_background};
+pub use floor::{Floored, InterfaceColors, effective_background};
+pub use profile::{ImageProfile, PROFILE_EDGE, Readability};
 
 use std::path::Path;
 
@@ -71,7 +73,7 @@ impl Default for Options {
 
 /// A derived 16-color terminal palette plus the metadata the contrast floor
 /// and the cache need.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Palette {
     /// ANSI slots 0-15. Slot 0 is the background.
     pub colors: [Rgb; 16],
@@ -81,6 +83,8 @@ pub struct Palette {
     pub cursor: Rgb,
     /// Mean color of the full-resolution image (the floor blends against it).
     pub wallpaper_average: Rgb,
+    /// Bounded spatial/color summary used by previews and readability reports.
+    pub profile: ImageProfile,
     /// The light/dark decision that shaped the palette.
     pub mode: Mode,
 }
@@ -120,5 +124,7 @@ impl std::error::Error for Error {}
 pub fn derive(path: &Path, opts: &Options) -> Result<Palette, Error> {
     let img = decode::load(path)?;
     let clusters = extract::kmeans(&img.pixels, opts.clusters, opts.seed);
-    Ok(derive::palette(&clusters, img.average, opts.mode))
+    let mut palette = derive::palette(&clusters, img.average, opts.mode);
+    palette.profile = img.profile;
+    Ok(palette)
 }

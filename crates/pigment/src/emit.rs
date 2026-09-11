@@ -6,7 +6,7 @@
 //! system makes it unforgettable. Only the cache format — which stores the
 //! pre-floor palette on purpose — stays on [`Palette`].
 
-use crate::{Floored, Mode, Palette, Rgb};
+use crate::{Floored, ImageProfile, Mode, Palette, Rgb};
 
 impl Floored {
     /// kitty color file, shaped like the `colors-kitty.conf` the include
@@ -18,6 +18,20 @@ impl Floored {
         out.push_str(&format!("cursor {}\n\n", self.cursor.hex()));
         for (i, c) in self.colors.iter().enumerate() {
             out.push_str(&format!("color{i} {}\n", c.hex()));
+        }
+        let ui = self.interface();
+        for (name, color) in [
+            ("selection_foreground", ui.selection_foreground),
+            ("selection_background", ui.selection_background),
+            ("active_tab_foreground", ui.active_tab_foreground),
+            ("active_tab_background", ui.active_tab_background),
+            ("inactive_tab_foreground", ui.inactive_tab_foreground),
+            ("inactive_tab_background", ui.inactive_tab_background),
+            ("active_border_color", ui.active_border_color),
+            ("inactive_border_color", ui.inactive_border_color),
+            ("cursor_text_color", ui.cursor_text_color),
+        ] {
+            out.push_str(&format!("{name} {}\n", color.hex()));
         }
         out
     }
@@ -68,8 +82,9 @@ impl Palette {
     /// lines, then foreground, cursor, wallpaper average, and mode. Line
     /// oriented and greppable on purpose — no serializer dependency.
     pub fn to_cache_format(&self) -> String {
-        let mut out = String::with_capacity(256);
-        out.push_str("pigment1\n");
+        use std::fmt::Write;
+        let mut out = String::with_capacity(256 + self.profile.colors.len() * 8);
+        out.push_str("pigment2\n");
         for c in &self.colors {
             out.push_str(&c.hex());
             out.push('\n');
@@ -84,13 +99,41 @@ impl Palette {
             Mode::Dark => "dark\n",
             Mode::Light => "light\n",
         });
+        out.push_str(&format!(
+            "profile {} {} {} {}\n",
+            self.profile.width, self.profile.height, self.profile.columns, self.profile.rows
+        ));
+        for color in &self.profile.colors {
+            writeln!(out, "#{:02x}{:02x}{:02x}", color.r, color.g, color.b).unwrap();
+        }
         out
     }
 
     /// Parse [`Palette::to_cache_format`] output.
     pub fn from_cache_format(s: &str) -> Option<Palette> {
+        CacheRecord::parse(s)?.into_palette()
+    }
+}
+
+/// Validated cache data, before computing profile features. Color-only readers
+/// still validate the entire record, but need no luminance/Oklab calculations.
+pub(crate) struct CacheRecord {
+    pub colors: [Rgb; 16],
+    foreground: Rgb,
+    cursor: Rgb,
+    wallpaper_average: Rgb,
+    mode: Mode,
+    width: u32,
+    height: u32,
+    columns: usize,
+    rows: usize,
+    samples: Vec<Rgb>,
+}
+
+impl CacheRecord {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         let mut lines = s.lines();
-        if lines.next()? != "pigment1" {
+        if lines.next()? != "pigment2" {
             return None;
         }
         let mut colors = [Rgb::BLACK; 16];
@@ -105,11 +148,58 @@ impl Palette {
             "light" => Mode::Light,
             _ => return None,
         };
+        let mut shape = lines.next()?.split_whitespace();
+        if shape.next()? != "profile" {
+            return None;
+        }
+        let width = shape.next()?.parse().ok()?;
+        let height = shape.next()?.parse().ok()?;
+        let columns: usize = shape.next()?.parse().ok()?;
+        let rows: usize = shape.next()?.parse().ok()?;
+        if shape.next().is_some() || !ImageProfile::valid_shape(width, height, columns, rows) {
+            return None;
+        }
+        let mut samples = Vec::with_capacity(columns * rows);
+        for _ in 0..columns * rows {
+            samples.push(Rgb::parse(lines.next()?)?);
+        }
+        if lines.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            colors,
+            foreground,
+            cursor,
+            wallpaper_average,
+            mode,
+            width,
+            height,
+            columns,
+            rows,
+            samples,
+        })
+    }
+
+    pub(crate) fn into_palette(self) -> Option<Palette> {
+        let Self {
+            colors,
+            foreground,
+            cursor,
+            wallpaper_average,
+            mode,
+            width,
+            height,
+            columns,
+            rows,
+            samples,
+        } = self;
+        let profile = ImageProfile::new(width, height, columns, rows, samples)?;
         Some(Palette {
             colors,
             foreground,
             cursor,
             wallpaper_average,
+            profile,
             mode,
         })
     }
@@ -146,6 +236,11 @@ mod tests {
                 b: 70,
             },
             mode: Mode::Dark,
+            profile: ImageProfile::uniform(Rgb {
+                r: 90,
+                g: 80,
+                b: 70,
+            }),
         }
     }
 
@@ -204,5 +299,14 @@ mod tests {
         assert!(Palette::from_cache_format("").is_none());
         assert!(Palette::from_cache_format("pigment1\nnot-a-color\n").is_none());
         assert!(Palette::from_cache_format("wal\n#000000\n").is_none());
+        let valid = sample().to_cache_format();
+        for invalid in [
+            valid.replace("pigment2", "pigment1"),
+            valid.replace("profile 1 1 1 1", "profile 1 1 17 1"),
+            valid.replace("profile 1 1 1 1", "profile 0 1 1 1"),
+            valid.clone() + "#123456\n",
+        ] {
+            assert!(Palette::from_cache_format(&invalid).is_none());
+        }
     }
 }

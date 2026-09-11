@@ -2,7 +2,7 @@
 //! Run: `cargo bench -p pigment`.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use pigment::{Options, cached_derive, derive, effective_background};
+use pigment::{Options, cached_derive, derive, effective_background, read_cached_colors};
 use std::path::PathBuf;
 
 /// A 3840x2160 gradient-plus-blobs image: non-trivial for k-means, cheap to
@@ -41,6 +41,9 @@ fn benches(c: &mut Criterion) {
     cached_derive(&img, &opts, &cache).unwrap();
     c.bench_function("derive_cached_4k", |b| {
         b.iter(|| cached_derive(&img, &opts, &cache).unwrap())
+    });
+    c.bench_function("read_colors_cached_4k", |b| {
+        b.iter(|| read_cached_colors(&img, &opts, &cache).unwrap().unwrap())
     });
 
     let p = derive(&img, &opts).unwrap();

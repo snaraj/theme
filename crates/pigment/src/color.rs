@@ -1,5 +1,23 @@
 //! Color types and the exact WCAG math the contrast floor depends on.
 
+/// Both sRGB thresholds used below choose the same branch for 8-bit channels:
+/// 0..=10 are linear, 11..=255 use the power curve. Compute those exact values
+/// once, preserving the existing arithmetic while sharing it across profiles
+/// and contrast calculations.
+fn linear_channel(value: u8) -> f64 {
+    static VALUES: std::sync::LazyLock<[f64; 256]> = std::sync::LazyLock::new(|| {
+        std::array::from_fn(|value| {
+            let value = value as f64 / 255.0;
+            if value <= 0.03928 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        })
+    });
+    VALUES[usize::from(value)]
+}
+
 /// An sRGB color, 8 bits per channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Rgb {
@@ -51,15 +69,9 @@ impl Rgb {
     /// WCAG relative luminance, with the exact constants the shell floor
     /// used (threshold 0.03928): changing them would move floor decisions.
     pub fn luminance(&self) -> f64 {
-        fn ch(x: u8) -> f64 {
-            let x = f64::from(x) / 255.0;
-            if x <= 0.03928 {
-                x / 12.92
-            } else {
-                ((x + 0.055) / 1.055).powf(2.4)
-            }
-        }
-        0.2126 * ch(self.r) + 0.7152 * ch(self.g) + 0.0722 * ch(self.b)
+        0.2126 * linear_channel(self.r)
+            + 0.7152 * linear_channel(self.g)
+            + 0.0722 * linear_channel(self.b)
     }
 
     /// WCAG contrast ratio against `other`, in `1.0..=21.0`.
@@ -67,6 +79,23 @@ impl Rgb {
         let (a, b) = (self.luminance(), other.luminance());
         let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
         (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// Oklab coordinates for perceptual color comparisons, from linear sRGB.
+    pub fn oklab(&self) -> [f64; 3] {
+        let (r, g, b) = (
+            linear_channel(self.r),
+            linear_channel(self.g),
+            linear_channel(self.b),
+        );
+        let l = (0.412_221_470_8 * r + 0.536_332_536_3 * g + 0.051_445_992_9 * b).cbrt();
+        let m = (0.211_903_498_2 * r + 0.680_699_545_1 * g + 0.107_396_956_6 * b).cbrt();
+        let s = (0.088_302_461_9 * r + 0.281_718_837_6 * g + 0.629_978_700_5 * b).cbrt();
+        [
+            0.210_454_255_3 * l + 0.793_617_785 * m - 0.004_072_046_8 * s,
+            1.977_998_495_1 * l - 2.428_592_205 * m + 0.450_593_709_9 * s,
+            0.025_904_037_1 * l + 0.782_771_766_2 * m - 0.808_675_766 * s,
+        ]
     }
 
     /// Per-channel mix toward `target` by `t` in `0.0..=1.0`.
@@ -138,6 +167,36 @@ pub(crate) fn hue_dist(a: f64, b: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_table_preserves_both_reference_curves_exactly() {
+        for value in 0..=255u8 {
+            let normalized = f64::from(value) / 255.0;
+            for threshold in [0.03928, 0.04045] {
+                let reference = if normalized <= threshold {
+                    normalized / 12.92
+                } else {
+                    ((normalized + 0.055) / 1.055).powf(2.4)
+                };
+                assert_eq!(linear_channel(value).to_bits(), reference.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn oklab_matches_reference_primaries() {
+        let red = Rgb { r: 255, g: 0, b: 0 }.oklab();
+        for (value, expected) in red
+            .into_iter()
+            .zip([0.627_955_36, 0.224_863_06, 0.125_846_30])
+        {
+            assert!((value - expected).abs() < 1e-8);
+        }
+        assert_eq!(Rgb::BLACK.oklab(), [0.0; 3]);
+        let white = Rgb::WHITE.oklab();
+        assert!((white[0] - 1.0).abs() < 1e-7);
+        assert!(white[1].hypot(white[2]) < 1e-7);
+    }
 
     #[test]
     fn hex_roundtrip() {

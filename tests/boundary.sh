@@ -280,7 +280,7 @@ else fail "the long source lost its label line"; fi
 if printf '%s' "$pv_out" | grep -q '^               nvalid$'; then
     pass "the wrapped remainder carries the hanging indent"
 else fail "a wrapped value landed outside the value column"; fi
-if printf '%s\n' "$pv_out" | awk 'length($0) > 60 { exit 1 }'; then
+if printf '%s\n' "$pv_out" | python3 -c 'import re,sys; text=re.sub(r"\x1b\[[0-9;:]*m", "", sys.stdin.read()); sys.exit(any(len(line)>60 for line in text.splitlines()))'; then
     pass "no preview line exceeds the terminal width"
 else fail "a preview line overran COLUMNS"; fi
 if printf '%s' "$pv_out" | grep -q '^a'; then
@@ -598,8 +598,8 @@ rm -f "$lib"/bulk-*.jpg
 # in different seconds for their order to be a fact rather than a coincidence
 # — that is what the two sleeps buy. `stat` is shadowed by a counting stub:
 # the plain listing used to spend ~2·n·log₂n spawns of it on a key it never
-# printed, and must now spend none. The verbose listing keeps exactly one per
-# PRINTED date on macOS, where the date is spelled in LOCAL time.
+# printed, and must now spend none. Verbose dates also stay in-process;
+# unsupported macOS timezone syntax retains the original BSD stat fallback.
 birthlib="$fixture/birthlib"; birthcache="$fixture/birthcache"
 statbin="$fixture/statbin"; statlog="$fixture/stat-spawns"
 mkdir -p "$birthlib" "$birthcache" "$statbin"
@@ -614,7 +614,7 @@ printf '%s\n' "\$*" >>"$statlog"
 exec /usr/bin/stat "\$@"
 EOS
 chmod +x "$statbin/stat"
-birth_run() { COLUMNS=200 THEME_WALLPAPER_DIR="$birthlib" THEME_CACHE_DIR="$birthcache" \
+birth_run() { TZ="${BIRTH_TZ-UTC}" COLUMNS=200 THEME_WALLPAPER_DIR="$birthlib" THEME_CACHE_DIR="$birthcache" \
     KITTY_WINDOW_ID='' THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
     PATH="$statbin:$PATH" "$THEME" "$@"; }
 : >"$statlog"
@@ -626,7 +626,7 @@ statn=$(wc -l <"$statlog" | tr -d ' ')
 if [ "$statn" = 0 ]; then pass "a plain listing spawns stat zero times"
 else fail "a plain listing spawned stat $statn times"; fi
 case "$(uname -s)" in
-    Darwin) want_added=$(/usr/bin/stat -f '%SB' -t '%Y-%m-%d' "$birthlib/born-third.png") ;;
+    Darwin) want_added=$(TZ=UTC /usr/bin/stat -f '%SB' -t '%Y-%m-%d' "$birthlib/born-third.png") ;;
     *) want_added=$(date -u +%F) ;;
 esac
 : >"$statlog"
@@ -635,14 +635,26 @@ if [ "$got_added" = "$want_added" ]; then
     pass "ADDED is the file's own birth date ($want_added)"
 else fail "ADDED said '$got_added', the birth date is '$want_added'"; fi
 statn=$(wc -l <"$statlog" | tr -d ' ')
-case "$(uname -s)" in
-    Darwin)
-        if [ "$statn" = 3 ]; then pass "a verbose listing spawns stat once per printed date"
-        else fail "a verbose listing spawned stat $statn times, not once per row"; fi ;;
-    *)
-        if [ "$statn" = 0 ]; then pass "a verbose listing spawns stat zero times"
-        else fail "a verbose listing spawned stat $statn times"; fi ;;
-esac
+if [ "$statn" = 0 ]; then pass "a verbose listing spawns stat zero times"
+else fail "a verbose listing spawned stat $statn times"; fi
+if [ "$(uname -s)" = Darwin ]; then
+    : >"$statlog"
+    fallback_added=$(BIRTH_TZ=theme-invalid-zone birth_run list -v --all 2>/dev/null | grep 'born-third' | awk '{print $NF}')
+    want_fallback=$(TZ=theme-invalid-zone /usr/bin/stat -f '%SB' -t '%Y-%m-%d' "$birthlib/born-third.png")
+    statn=$(wc -l <"$statlog" | tr -d ' ')
+    if [ "$fallback_added" = "$want_fallback" ] && [ "$statn" = 3 ]; then
+        pass "unsupported timezone preserves BSD date fallback"
+    else fail "unsupported timezone lost the original date fallback"; fi
+    oversized_zone="$fixture/oversized-zone"
+    python3 -c 'import sys; f = open(sys.argv[1], "wb"); f.truncate(1024 * 1024 + 1); f.close()' "$oversized_zone"
+    : >"$statlog"
+    zone_error=$(BIRTH_TZ="$oversized_zone" birth_run list -v --all 2>&1)
+    zone_rc=$?
+    if [ "$zone_rc" != 0 ] && [ ! -s "$statlog" ] &&
+        printf '%s' "$zone_error" | grep -q 'cannot read timezone file'; then
+        pass "rejected timezone file never reaches the unbounded stat fallback"
+    else fail "rejected timezone file reached fallback or was accepted"; fi
+fi
 
 # --- the desktop fact is asked ONCE per desktop change ---------------------
 # macOS keeps every Space's choice in ONE store file under HOME, so a fixture
@@ -662,9 +674,14 @@ printf '%s\n' "$lib/tiny.png"
 EOS
     chmod +x "$dbin/wallpaper"
     desk_run() { HOME="$dhome" PATH="$dbin:$PATH" COLUMNS=400 KITTY_WINDOW_ID='' \
-        THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$dcache" THEME_NO_APPLY=1 \
+        THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$dcache" THEME_NO_APPLY="${DESK_NO_APPLY:-}" \
         TMPDIR="$fixture/tmpdir" "$THEME" "$@"; }
     rm -f "$dran" "$dcache/desktop"
+    DESK_NO_APPLY=1 desk_run >/dev/null 2>&1
+    if [ -e "$dran" ] && [ ! -e "$dcache/desktop" ]; then
+        pass "dry-run desktop lookup does not write its display cache"
+    else fail "dry-run desktop lookup wrote a record or skipped the helper"; fi
+    rm -f "$dran"
     desk_cold=$(desk_run 2>&1)
     if [ -e "$dran" ] && printf '%s' "$desk_cold" | grep -q '^  tiny$'; then
         pass "with no record the helper is asked, and its answer opens the screen"
@@ -1701,14 +1718,14 @@ exit 6
 EOS
 chmod +x "$failbin/curl"
 note_out="$updd/note.out"
+note_verb=''
 note_run() { # bare `theme` with the check ENABLED; env-pair overrides last.
-    # DEBUG build + THEME_CURL seam: the footer's trusted-transport lane
-    # reaches the failing stub by absolute path, never via PATH (round 8).
+    # The debug seam makes any accidental footer refresh observable.
     env THEME_NO_UPDATE_CHECK= \
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$notecache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" KITTY_WINDOW_ID='' \
         THEME_CURL="$failbin/curl" \
-        PATH="$failbin:$sweepbin:$PATH" "$@" "$THEME_DBG" >"$note_out" 2>&1
+        PATH="$failbin:$sweepbin:$PATH" "$@" "$THEME_DBG" ${note_verb:+"$note_verb"} >"$note_out" 2>&1
     note_rc=$?
 }
 expect1="update to the latest theme version: v9.9.9 -> https://github.com/snaraj/theme/releases/tag/v9.9.9"
@@ -1751,29 +1768,43 @@ note_run
 if [ "$note_rc" = 0 ] && ! grep -qiE 'update to the latest|error|curl' "$note_out"; then
     pass "no cache + no network is silent and exits clean"
 else fail "the offline check leaked noise (rc=$note_rc): $(tail -3 "$note_out")"; fi
-if [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ] && [ -e "$notecache/update-check" ]; then
-    pass "the failed attempt was stamped into the cache"
-else fail "offline attempt accounting is wrong: $(wc -l <"$notefaillog") attempts"; fi
+if [ ! -s "$notefaillog" ] && [ ! -e "$notecache/update-check" ]; then
+    pass "a missing footer cache neither fetches nor stamps"
+else fail "a missing footer cache caused a request or stamp"; fi
 note_run
-if [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ]; then
-    pass "one bounded attempt per TTL window, not per run"
-else fail "the note retried inside the TTL window"; fi
+if [ ! -s "$notefaillog" ] && [ ! -e "$notecache/update-check" ]; then
+    pass "repeated bare screens remain network-free with no cache"
+else fail "a repeated bare screen fetched or stamped"; fi
+
+# Every root-help spelling has the same cache-only contract, even when a
+# previously newer answer has expired. Its bytes and mtime stay untouched.
+printf 'v9.9.9' >"$notecache/update-check"
+touch -t 200001010000 "$notecache/update-check"
+cp -p "$notecache/update-check" "$fixture/stale-note"
+for note_verb in '' help --help -h; do
+    note_run
+    if [ "$note_rc" = 0 ] && [ ! -s "$notefaillog" ] \
+       && ! grep -qF 'update to the latest' "$note_out" \
+       && cmp -s "$notecache/update-check" "$fixture/stale-note" \
+       && [ ! "$notecache/update-check" -nt "$fixture/stale-note" ]; then
+        pass "theme ${note_verb:-bare} ignores a stale footer cache without fetching or stamping"
+    else fail "theme ${note_verb:-bare} refreshed or trusted a stale footer cache"; fi
+done
+note_verb=''
 
 rm -f "$notecache/update-check"
 note_run THEME_NO_UPDATE_CHECK=1
 if ! grep -qF 'update to the latest' "$note_out" \
-   && [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ]; then
+   && [ ! -s "$notefaillog" ]; then
     pass "the kill-switch spawns nothing and renders nothing"
 else fail "THEME_NO_UPDATE_CHECK did not disable the check"; fi
 
-# Round 8, decided-and-stated: NO trusted transport ⇒ no network AND no
-# stamp — the TTL stamp rate-limits network ATTEMPTS, and none happened,
-# so a recovered transport a minute later must not find itself masked.
+# Cache-only help does not need a transport, with or without a record.
 rm -f "$notecache/update-check"
 note_run THEME_CURL=
 if [ "$note_rc" = 0 ] && [ ! -e "$notecache/update-check" ] \
    && ! grep -qF 'update to the latest' "$note_out" \
-   && [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ]; then
+   && [ ! -s "$notefaillog" ]; then
     pass "a missing transport neither stamps nor fetches nor renders"
 else fail "missing transport misbehaved (rc=$note_rc): $(ls -l "$notecache" 2>/dev/null)"; fi
 # ...but a still-fresh cache renders with no transport at all — displaying
@@ -1989,21 +2020,28 @@ after_ls=$(ls -a "$hostile")
 if [ "$note_rc" = 0 ] && ! grep -qF 'update to the latest' "$note_out" \
    && [ "$(cksum <"$fixture/stamp-victim")" = "$vic2_sum" ] \
    && [ "$before_ls" = "$after_ls" ] \
-   && [ "$(wc -l <"$notefaillog" | tr -d ' ')" = 1 ]; then
+   && [ ! -s "$notefaillog" ]; then
     pass "a hostile cache dir is refused: victim intact, dir untouched, zero transfers"
 else fail "hostile cache dir was touched (rc=$note_rc): $(ls -al "$hostile")"; fi
 chmod 700 "$hostile"
 
 # A FIFO planted at the cache name in an otherwise-valid dir must neither
-# hang the bare command nor render — and the next stamp heals it into a
-# regular file by renameat-replacing the entry.
+# hang the bare command nor render. Help leaves it untouched; a successful
+# explicit check heals it by renameat-replacing the entry.
 rm -f "$notecache/update-check"
 mkfifo "$notecache/update-check"
 note_run
 if [ "$note_rc" = 0 ] && ! grep -qF 'update to the latest' "$note_out" \
-   && [ -f "$notecache/update-check" ] && [ ! -p "$notecache/update-check" ]; then
-    pass "a planted FIFO neither hangs nor renders, and the stamp heals it"
+   && [ -p "$notecache/update-check" ] && [ ! -s "$notefaillog" ]; then
+    pass "a planted FIFO neither hangs nor renders, and help leaves it untouched"
 else fail "FIFO at the cache name broke (rc=$note_rc): $(ls -l "$notecache" 2>/dev/null)"; fi
+ver_tag=v9.9.9
+ver_run version THEME_CACHE_DIR="$notecache"
+if closes "$newer" && [ "$(verreqs)" = 1 ] \
+   && [ -f "$notecache/update-check" ] && [ ! -p "$notecache/update-check" ] \
+   && [ "$(cat "$notecache/update-check")" = v9.9.9 ]; then
+    pass "a successful explicit version check heals the FIFO with a regular stamp"
+else fail "the explicit version check did not heal the FIFO"; fi
 
 # --- custody depth: steering refused, benign symlinks legal (round 5) ------
 # A symlink held in a world-writable dir steers the endpoint wherever the
@@ -2047,9 +2085,7 @@ for tool in id getfacl ls; do
     printf '#!/bin/sh\n: >"%s/audit-stub-ran-%s"\nexit 0\n' "$fixture" "$tool" >"$auditbin/$tool"
     chmod +x "$auditbin/$tool"
 done
-# The FIFO section above leaves a regular file behind ONLY if the heal it
-# pins actually happened; a stale FIFO here would block this write forever
-# and hang CI instead of failing it, so the entry goes before it is written.
+# Remove any FIFO left by a failed explicit-healing check before writing.
 rm -f "$notecache/update-check"
 printf 'v9.9.9' >"$notecache/update-check"
 note_run PATH="$auditbin:$failbin:$sweepbin:$PATH"
@@ -2242,6 +2278,19 @@ if [ "$?" = 0 ] && ! grep -q "$(printf '\033_G')" "$narrow_out" \
    && why=$(narrowck 42 0 0); then
     pass "no kitty means no graphics bytes, fields intact"
 else fail "non-kitty degradation leaked protocol: ${why:-$(tail -3 "$narrow_out")}"; fi
+
+# Real argv/TTY browser behavior, with synthetic files and dry-run application.
+if python3 -I -B "$root/tests/browser_cli_test.py" "$THEME"; then
+    pass "browser CLI dispatch, rendering and dry-run navigation"
+else
+    fail "browser CLI integration"
+fi
+
+if python3 -I -B "$root/tests/mdls_cli_test.py" "$THEME"; then
+    pass "metadata batch mapping, fallback and warm index"
+else
+    fail "metadata batch CLI integration"
+fi
 
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILURES"; fi
 [ "$fails" -eq 0 ]

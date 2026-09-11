@@ -76,6 +76,8 @@ pub(crate) fn kmeans(pixels: &[Rgb], k: usize, seed: u64) -> Vec<Cluster> {
     let mut assign = vec![0usize; points.len()];
     for _ in 0..12 {
         let mut moved = false;
+        let mut sums = vec![[0.0f64; 3]; centers.len()];
+        let mut counts = vec![0usize; centers.len()];
         for (a, p) in assign.iter_mut().zip(&points) {
             let mut best = 0;
             let mut bd = f64::MAX;
@@ -90,17 +92,15 @@ pub(crate) fn kmeans(pixels: &[Rgb], k: usize, seed: u64) -> Vec<Cluster> {
                 *a = best;
                 moved = true;
             }
+            // The same point order and arithmetic as a separate accumulation
+            // pass, while the point and its chosen cluster are already hot.
+            sums[best][0] += p[0];
+            sums[best][1] += p[1];
+            sums[best][2] += p[2];
+            counts[best] += 1;
         }
         if !moved {
             break;
-        }
-        let mut sums = vec![[0.0f64; 3]; centers.len()];
-        let mut counts = vec![0usize; centers.len()];
-        for (&a, p) in assign.iter().zip(&points) {
-            sums[a][0] += p[0];
-            sums[a][1] += p[1];
-            sums[a][2] += p[2];
-            counts[a] += 1;
         }
         for (c, (s, &n)) in centers.iter_mut().zip(sums.iter().zip(&counts)) {
             if n > 0 {

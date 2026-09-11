@@ -98,6 +98,7 @@ pub(crate) fn palette(clusters: &[Cluster], average: Rgb, pref: ModePref) -> Pal
         foreground: fg,
         cursor: fg,
         wallpaper_average: average,
+        profile: crate::ImageProfile::uniform(average),
         mode,
     }
 }
