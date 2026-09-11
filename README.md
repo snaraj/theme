@@ -206,11 +206,20 @@ stall budgets are 500 ms warm and 3 s cold.
 The gate checks median and p95 changes against zero, with 99.9% paired bootstrap
 confidence and repetition across interleaved sample blocks. Supported shifts
 trigger a fresh confirmation batch with the same sample count. Confirmed
-regressions and inconclusive confirmations both block CI. There is no fixed
-millisecond or percentage slowdown allowance. A pass means no repeatable
-regression was detected in this matrix; it cannot prove identical performance
-on every machine or under every workload. The harness tests its own rejection
-of tiny consistent slowdowns, tail-only regressions, and missing output.
+regressions and inconclusive confirmations both block CI for changed binaries.
+There is no fixed millisecond or percentage slowdown allowance. CI explicitly
+selects `--built-artifacts` after comparable direct Cargo builds. With its
+controlled synthetic fixture, native executable headers and identical SHA-256
+values for both binaries before and after the run, the timing gate reports
+`IDENTICAL_BINARY`: there is no code-performance
+comparison. All measurements and statistical verdicts remain visible, including
+inconclusive results; executable identity is not a measured speedup. Execution,
+semantic and rendering failures still block CI. With nine cold samples, p95 is
+the maximum observation. These checks cannot prove identical performance on
+every machine or workload. The harness tests tiny consistent slowdowns,
+tail-only regressions, missing output and changes to either executable.
+Standalone comparisons remain strict by default, including identical wrappers.
+`--built-artifacts` rejects `--library`; headers alone do not prove provenance.
 
 Every measured capture must still contain the expected rows, metadata, and
 colors. Rendering checks compare 25-, 80-, and 120-column output, while separate
