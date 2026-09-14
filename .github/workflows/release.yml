@@ -117,6 +117,7 @@ jobs:
           ref: ${{ needs.slot.outputs.source_sha }}
           persist-credentials: false
       - name: Isolate compilation from generated release metadata and Git history
+        id: export
         working-directory: ${{ github.workspace }}
         run: |
           mkdir "$GITHUB_WORKSPACE/../theme-source"
@@ -124,6 +125,7 @@ jobs:
           if git -C "$GITHUB_WORKSPACE/../theme-source" rev-parse --show-toplevel >/dev/null 2>&1; then
             echo "::error::exported source can still discover Git history"; exit 1
           fi
+          echo "directory=$(cd "$GITHUB_WORKSPACE/../theme-source" && pwd -P)" >> "$GITHUB_OUTPUT"
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - if: runner.os == 'macOS'
@@ -178,9 +180,9 @@ jobs:
         with:
           name: theme-${{ matrix.target }}
           path: |
-            ${{ github.workspace }}/../theme-source/theme-${{ matrix.target }}.tar.gz
-            ${{ github.workspace }}/../theme-source/theme_*.deb
-            ${{ github.workspace }}/../theme-source/theme-*.rpm
+            ${{ steps.export.outputs.directory }}/theme-${{ matrix.target }}.tar.gz
+            ${{ steps.export.outputs.directory }}/theme_*.deb
+            ${{ steps.export.outputs.directory }}/theme-*.rpm
           if-no-files-found: error
           retention-days: 90
 

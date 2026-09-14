@@ -182,6 +182,8 @@ class Preparation(unittest.TestCase):
         self.assertIn("        shell: bash\n", build)
         self.assertIn("working-directory: ${{ github.workspace }}/../theme-source", build)
         self.assertIn('git -C "$GITHUB_WORKSPACE/../theme-source" rev-parse --show-toplevel', build)
+        self.assertIn('echo "directory=$(cd "$GITHUB_WORKSPACE/../theme-source" && pwd -P)" >> "$GITHUB_OUTPUT"', build)
+        self.assertIn("${{ steps.export.outputs.directory }}/theme-${{ matrix.target }}.tar.gz", build)
         self.assertIn("retention-days: 90", build)
         self.assertIn("if: needs.slot.outputs.publish == 'true'", publish)
         self.assertIn("ref: ${{ needs.slot.outputs.source_sha }}", publish)
