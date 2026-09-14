@@ -60,8 +60,14 @@ money, never trade away security.
   ledger itself: a Draft claims the next unpublished `vX.Y.Z`; parallel
   Drafts each claim base+1, and declared merge order resolves who re-cuts.
 - A merge to main that moves `Cargo.toml` publishes after its Linux and macOS
-  CI jobs succeed. A dispatch on main requires the same exact-source CI
-  proof; other branch dispatches are dry runs. Tags never trigger publication.
+  CI jobs succeed. Before merge, dispatch the branch release dry run and record
+  its tested artifacts in `.github/release-preparation.json`; update the four
+  Homebrew pins in that same PR. Publication verifies the source tree matches
+  preparation, excluding only that receipt and `Formula/theme.rb`, which are
+  absent from compilation. Any other source change needs a new preparation.
+  A dispatch on main requires the same exact-source CI proof; branch dispatches
+  never publish. Tags never trigger publication. Missing or expired prepared
+  artifacts stop publication; merge within their 90-day retention window.
 
 ## Code rules
 

@@ -82,15 +82,15 @@ const SUMS_CAP: u64 = 64 * 1024;
 const TARGET: &str = "aarch64-apple-darwin";
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 const TARGET: &str = "x86_64-apple-darwin";
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"))]
 const TARGET: &str = "aarch64-unknown-linux-gnu";
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 #[cfg(not(any(
     all(target_os = "macos", target_arch = "aarch64"),
     all(target_os = "macos", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "aarch64"),
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"),
+    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
 )))]
 const TARGET: &str = "";
 
@@ -99,6 +99,7 @@ const TARGET: &str = "";
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Install {
     Homebrew,
+    Nix,
     Deb,
     Rpm,
     Package,
@@ -127,6 +128,9 @@ fn cargo_bins() -> Vec<PathBuf> {
 /// outranks the distro directories it may be symlinked beside, and only a
 /// path under a distro bin directory is a package's to own.
 fn classify(exe: &Path, cargo_bins: &[PathBuf], deb_installed: bool, rpm_db: bool) -> Install {
+    if exe.starts_with("/nix/store") {
+        return Install::Nix;
+    }
     // COMPONENTS, never substrings: `Cellar` then this formula's name, so
     // `/opt/homebrew`, `/usr/local` and linuxbrew prefixes all match while a
     // directory merely named `Cellarium` — or another formula's keg that
@@ -205,26 +209,22 @@ fn route(exe: &Path) -> bool {
     match kind {
         Install::File => return false,
         Install::Homebrew => {
-            println!("theme here is a Homebrew keg ({p}).");
+            println!("==> Updating theme...");
             match (tap_version(exe), current_v3()) {
                 (Some((a, b, c)), Some(current)) if (a, b, c) <= current => {
-                    println!(
-                        "The local tap offers v{a}.{b}.{c}; no Homebrew upgrade is available in this checkout."
-                    );
-                    println!(
-                        "A newer GitHub release needs a formula bump and a refreshed tap before Homebrew can install it."
-                    );
+                    println!("Already up-to-date.");
                 }
                 (Some((a, b, c)), _) => {
-                    println!("The local tap offers v{a}.{b}.{c} — install it with:");
-                    println!("  brew upgrade snaraj/theme/theme");
+                    println!("Update available: v{a}.{b}.{c}");
+                    println!("Run: brew upgrade snaraj/theme/theme");
                 }
                 _ => {
-                    println!("Could not read this tap's version; Homebrew availability is unknown.")
+                    println!("Run: brew update && brew upgrade snaraj/theme/theme");
                 }
             }
-            println!("For the latest verified binary in a separate, new location:");
-            println!("  theme update --binary /absolute/path/to/theme");
+        }
+        Install::Nix => {
+            println!("Managed by Nix. Update theme in your Nix configuration.");
         }
         // One sentence, one place to keep true; only the extension and the
         // manager's own install line differ.
@@ -1509,10 +1509,12 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
     #[test]
     #[rustfmt::skip]
     fn the_install_route_reads_only_where_the_binary_lives() {
-        use Install::{Cargo, Deb, File, Homebrew, Package, Rpm};
+        use Install::{Cargo, Deb, File, Homebrew, Nix, Package, Rpm};
         // CARGO_INSTALL_ROOT/bin, CARGO_HOME/bin, HOME/.cargo/bin.
         let cargo = ["/ci/root/bin", "/home/u/.cargohome/bin", "/home/u/.cargo/bin"].map(PathBuf::from);
         let cases: &[(&str, bool, bool, bool, Install)] = &[
+            ("/nix/store/abc-theme-0.3.10/bin/theme", false, false, false, Nix),
+            ("/nix/storehouse/theme", false, false, false, File),
             // Every Homebrew prefix, matched on COMPONENTS — so `Cellarium`
             // is not a keg, and another formula's keg shipping a `theme` is
             // not ours. A keg outranks both package databases.

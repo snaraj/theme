@@ -36,7 +36,7 @@ pub fn effective_background(palette_bg: Rgb, opacity: f64, wallpaper_avg: Rgb) -
 
 /// Smallest mix toward `target` that reaches `floor` against fixed background luminance, or None
 /// when even the endpoint itself cannot.
-fn solve(c: Rgb, target: Rgb, background: f64, floor: f64) -> Option<(f64, Rgb)> {
+fn solve(c: Rgb, target: Rgb, background: (f64, f64), floor: f64) -> Option<(f64, Rgb)> {
     if contrast(target, background) < floor {
         return None;
     }
@@ -58,17 +58,24 @@ pub(crate) fn floor_color(c: Rgb, eff: Rgb, floor: f64) -> Rgb {
 
 // The background stays fixed throughout every binary search. Compute its
 // luminance once; retain the original operations and comparison order.
-fn contrast(color: Rgb, background: f64) -> f64 {
+fn contrast(color: Rgb, background: (f64, f64)) -> f64 {
     let foreground = color.luminance();
-    let (hi, lo) = if foreground >= background {
-        (foreground, background)
+    let (low, high) = background;
+    let (hi, lo) = if foreground > high {
+        (foreground, high)
+    } else if foreground < low {
+        (low, foreground)
     } else {
-        (background, foreground)
+        return 1.0;
     };
     (hi + 0.05) / (lo + 0.05)
 }
 
 fn floor_luminance(c: Rgb, background: f64, floor: f64) -> Rgb {
+    floor_range(c, (background, background), floor)
+}
+
+fn floor_range(c: Rgb, background: (f64, f64), floor: f64) -> Rgb {
     if contrast(c, background) >= floor {
         return c;
     }
@@ -167,6 +174,47 @@ impl std::ops::Deref for Floored {
 }
 
 impl Palette {
+    /// Adjust text across the luminance range of the blended image regions
+    /// and the solid background used by applications. The boolean says whether
+    /// that range can meet the target. If not, retain a colored palette safe on
+    /// the solid background; collapsing every accent to white/black would still
+    /// leave the translucent view unreadable. Regional means are estimates.
+    pub fn floor_for_image(mut self, opacity: f64, floor: f64) -> (Floored, bool) {
+        let solid = self.background();
+        let luminance = solid.luminance();
+        // Opaque windows have one background regardless of the image. Avoid
+        // blending and converting all 256 regions on every filtered row.
+        if opacity == 1.0 {
+            let achievable = (1.05 / (luminance + 0.05)).max((luminance + 0.05) / 0.05) >= floor;
+            return (self.floor_against(solid, floor), achievable);
+        }
+        let range =
+            self.profile
+                .colors
+                .iter()
+                .fold((luminance, luminance), |(low, high), &region| {
+                    let value = effective_background(solid, opacity, region).luminance();
+                    (low.min(value), high.max(value))
+                });
+        let achievable = contrast(Rgb::WHITE, range).max(contrast(Rgb::BLACK, range)) >= floor;
+        if !achievable {
+            return (self.floor_against(solid, floor), false);
+        }
+        for color in self.colors[1..]
+            .iter_mut()
+            .chain([&mut self.foreground, &mut self.cursor])
+        {
+            *color = floor_range(*color, range, floor);
+        }
+        (
+            Floored {
+                palette: self,
+                target: floor,
+            },
+            true,
+        )
+    }
+
     /// Floor every text color (slots 1-15 and the foreground) to at least
     /// `floor` contrast against `eff` — normally
     /// [`effective_background`]`(self.background(), opacity, self.wallpaper_average)`
@@ -189,6 +237,70 @@ impl Palette {
 mod tests {
     use super::*;
     use crate::{Mode, Palette};
+
+    #[test]
+    fn interval_interior_is_not_mistaken_for_readable_endpoints() {
+        let middle = Rgb {
+            r: 117,
+            g: 117,
+            b: 117,
+        };
+        assert!(middle.contrast(Rgb::BLACK) >= 4.5);
+        assert!(middle.contrast(Rgb::WHITE) >= 4.5);
+        assert_eq!(contrast(middle, (0.0, 1.0)), 1.0);
+        for range in [(0.0, 0.05), (0.6, 1.0)] {
+            let floored = floor_range(middle, range, 4.5);
+            for step in 0..=100 {
+                let background = range.0 + (range.1 - range.0) * f64::from(step) / 100.0;
+                let text = floored.luminance();
+                assert!((text.max(background) + 0.05) / (text.min(background) + 0.05) >= 4.5);
+            }
+        }
+    }
+
+    #[test]
+    fn image_floor_uses_regions_preserves_colors_and_reports_unreachable_transparency() {
+        let average = Rgb {
+            r: 128,
+            g: 128,
+            b: 128,
+        };
+        let raw = crate::derive::palette(&[], average, crate::ModePref::Dark);
+        let mut mixed = raw.clone();
+        mixed.profile = crate::ImageProfile::new(2, 1, 2, 1, vec![Rgb::BLACK, Rgb::WHITE]).unwrap();
+        let solid = raw.background();
+        // Equal averages do not conceal the brighter region.
+        let (uniform, uniform_ok) = raw.clone().floor_for_image(0.65, 4.5);
+        let (regional, regional_ok) = mixed.clone().floor_for_image(0.65, 4.5);
+        assert!(uniform_ok && regional_ok);
+        assert_ne!(uniform, regional);
+        for region in [Rgb::BLACK, Rgb::WHITE] {
+            let effective = effective_background(solid, 0.65, region);
+            for color in regional.colors[1..]
+                .iter()
+                .chain([&regional.foreground, &regional.cursor])
+            {
+                assert!(color.contrast(effective) >= 4.5);
+                assert!(color.contrast(solid) >= 4.5);
+            }
+        }
+        let (limited, achievable) = mixed.clone().floor_for_image(0.1, 7.0);
+        assert!(!achievable);
+        assert_eq!(limited, mixed.clone().floor_against(solid, 7.0));
+        assert!(
+            limited.colors[1..]
+                .windows(2)
+                .any(|pair| pair[0] != pair[1])
+        );
+        let (opaque, achievable) = mixed.clone().floor_for_image(1.0, 4.5);
+        assert!(achievable);
+        assert_eq!(opaque, mixed.clone().floor_against(solid, 4.5));
+        let (identity, achievable) = mixed.clone().floor_for_image(0.1, 1.0);
+        assert!(achievable);
+        assert_eq!(*identity, mixed);
+        let passing = Rgb::WHITE;
+        assert_eq!(floor_range(passing, (0.0, 0.05), 4.5), passing);
+    }
 
     fn prng_color(state: &mut u64) -> Rgb {
         *state = state

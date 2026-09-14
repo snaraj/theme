@@ -25,8 +25,10 @@ brew tap snaraj/theme https://github.com/snaraj/theme
 brew install snaraj/theme/theme
 ```
 
-The release workflow verifies published downloads and tests the Homebrew
-installation. Delivery stays incomplete until the matching formula PR merges.
+The release PR includes Homebrew's version and verified binary checksums.
+After that one merge, CI publishes the prepared binaries and packages and
+tests the Homebrew installation. Wait for the release workflow to finish
+before upgrading; the new download URLs are unavailable during publication.
 
 **Debian, Ubuntu, Fedora, RHEL** — take the `.deb` or `.rpm` for your
 architecture from the
@@ -90,6 +92,15 @@ source build and the whole `tests/boundary.sh` fixture for the other.
 `tests/linux-matrix.sh` re-runs the prebuilt half against the current
 release.
 
+Source CI also exercises command output, image decoding, palettes, search,
+browsing and dry-run application in Ubuntu, Debian and Fedora containers.
+An independently compiled musl binary runs those checks in Alpine; musl
+builds refuse the glibc-only self-update download. The NixOS job builds from
+`Cargo.lock`, boots a NixOS VM, and tests the installed package and browser
+keys as an ordinary user. Run that job locally on an x86_64 Linux host with
+Nix and KVM using `nix-build tests/nixos.nix`. This tests CLI compatibility;
+desktop integration still depends on the desktop and terminal in use.
+
 ## Use
 
 `theme help` is the reference. In brief:
@@ -118,11 +129,20 @@ theme browse --all --coverage 0.9 --min-width 2560 --aspect 16:9
 theme index                          # prepare palettes and cache searchable metadata
 ```
 
+Kitty previews stream their image data and use the terminal's cell geometry.
+Redirecting output omits the graphics. The browser reuses recent thumbnails;
+changing the image or resizing its cells refreshes them automatically.
+Previews show the picture, its name, and all 16 final colorscheme swatches.
+Use `theme preview -v <name>` when you want the file's metadata as well.
+Other terminals show a clear notice that pictures require Kitty; names and
+colors remain usable. Missing or failing image helpers also produce a notice,
+once per browser session. Redirected output stays free of these notices.
+
 The browser shows six larger thumbnails per page in Kitty, and the keys move
 it: Right/Left step through the results and preview each one, Down/Up,
 PageDown/PageUp and Space turn the page, Home/End jump to the first or last.
 They act on an empty line and need no Return. Type `select 3` for a picture's
-final terminal palette and a text specimen; `n`, `p`, `page 2`, `shuffle`,
+name and final colorscheme; `n`, `p`, `page 2`, `shuffle`,
 `?` and `quit` are lines followed by Return, as before. Only `apply` changes
 the wallpaper and terminal colors. Backspace, Ctrl-U and Ctrl-W edit the
 typed line and Escape clears it; with text typed the movement keys are
@@ -143,14 +163,19 @@ That key path is tested in a terminal that draws, not only down a pipe. The
 hosted Linux CI job downloads Kitty 0.48.2 — pinned by SHA-256 and verified
 before extraction — runs `theme browse` inside it headless under Xvfb with
 software GL, presses the keys above through `kitten @ send-text`, and asserts
-on what the screen says afterwards; it decodes its own screenshot of the
-contact sheet, so a row of blank thumbnails fails it. Screenshots, screen
+on what the screen says afterwards. Screenshot checks compare the named image's
+colours, their spatial arrangement and its aspect ratio on contact sheets and
+selected previews. Standalone `preview` and `get` also render a 6000×4000 JPEG;
+the download uses a local transport fixture, with saving and rendering unchanged.
+Wrong pictures, blank regions, literal placeholder glyphs and stretched images
+fail the pixel checks. Screenshots, screen
 dumps and the kitty log are published as `kitty-e2e-<OS>-<architecture>`
 artifacts, pass or fail. macOS CI cannot host that test — the runner has no
 accelerated OpenGL, so Kitty exits before it opens a window — so there the
-keys are driven through a real pty against the real binary, and the Kitty
-driver is run on a Mac before each release with its results in the pull
-request. All of it proves the terminal side only: applying a wallpaper, the
+keys and unsupported-terminal notices are checked through a real pty. CI tests
+an installed candidate on both platforms, and exercises the published Homebrew
+installation's commands on macOS. Physical macOS rendering needs a person on a
+Mac. Applying a wallpaper, the
 macOS Spaces store and the desktop itself stay outside it.
 
 ```sh
@@ -159,12 +184,19 @@ python3 -I -B tests/kitty_e2e.py --kitty "$(command -v kitty)" \
 ```
 
 Previews use the same contrast-adjusted colors as apply, including all 16 ANSI
-colors and Kitty's selection, border, and tab accents. Readability samples a
-16-by-16 image grid at the configured opacity; it reports worst text contrast
-and the fraction meeting `THEME_CONTRAST`. `--min-contrast 4.5` and
+colors and Kitty's selection, border, and tab accents. Optional readability
+filters sample a 16-by-16 image grid at the configured opacity to calculate
+worst text contrast and the fraction meeting `THEME_CONTRAST`. `--min-contrast 4.5` and
 `--coverage 0.9` filter those measurements. Sampling models the wallpaper behind
 the terminal; cropping, another window behind it, live opacity changes, and
 unsampled detail can affect the real result. It is not an every-pixel guarantee.
+
+Colour adjustment considers the range from dark to bright image regions and
+the solid terminal background, rather than just the image average. Very low
+opacity can make readable text impossible across that range. In that case,
+`theme set` warns that opacity needs increasing and keeps a coloured palette
+suited to the solid background. Theme does not change your opacity settings.
+Applications that choose their own RGB colours can also bypass the palette.
 
 Search facts are cached by configured roots, timezone files, image identity,
 and palette. Changed images or timezone files refresh automatically. Opening
@@ -258,6 +290,23 @@ including `results.json`, all stdout/stderr captures, and `rendering.html` with
 the actual ANSI colors. These are headless renderings; native Kitty graphics,
 font shaping, desktop application, and network latency are outside this gate.
 The existing release workflow requires every exact-source CI job to pass.
+
+Release preparation happens before merge. After the branch's source is final,
+dispatch `release.yml` on that branch. It builds the four prebuilt targets and
+installs both Linux package formats. Record the successful run with:
+
+```sh
+python3 -I -B .github/scripts/prepared_release.py record --run RUN_ID \
+  --tag vX.Y.Z --output .github/release-preparation.json
+```
+
+Update `Formula/theme.rb` to that version and the four recorded tarball hashes,
+then commit both files in the release PR. CI verifies the source, producing
+run, artifact containers and all eight payload hashes; Homebrew installs the
+prepared download from its cache before public URLs exist. Main publishes
+those exact bytes after its own CI succeeds. Preparation expires after 90 days;
+missing artifacts or any source change beyond those two generated files requires
+a new preparation, never an unchecked rebuild using old checksums.
 
 Reproduce from a feature branch (the output directory must be empty):
 

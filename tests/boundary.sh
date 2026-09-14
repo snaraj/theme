@@ -249,8 +249,11 @@ if printf '%s' "$pv_pos" | grep -qi 'wallpaper preview'; then
     fail "the 'wallpaper preview' banner is back"
 else pass "the preview banner is gone"; fi
 if printf '%s' "$pv_pos" | grep -q 'TITLE        tiny'; then
-    pass "preview still shows the labeled block"
+    pass "preview still shows the title"
 else fail "preview block lost its labels"; fi
+if printf '%s' "$pv_pos" | python3 -c 'import re,sys; text=re.sub(r"\x1b\[[0-9;:]*m", "", sys.stdin.read()); lines=[line.strip() for line in text.splitlines() if line.strip()]; sys.exit(lines != ["TITLE        tiny", "COLORSCHEME"])'; then
+    pass "ordinary preview shows only the name and colorscheme beside its picture"
+else fail "ordinary preview includes extra details"; fi
 
 # --- OWNER FIX: THEME_WALLPAPER_DIR is a colon-separated list ---------------
 lib2="$fixture/library2"
@@ -277,7 +280,7 @@ exists "second-dir dupname intact"              yes "$lib2/dupname.png"
 if xattr_meta; then
 png1x1 "$lib/long-src.png" 0 0 0
 xattr -w theme.source "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bb.invalid/x" "$lib/long-src.png" 2>/dev/null
-pv_out=$(COLUMNS=60 run_nokitty "$lib" preview long-src 2>/dev/null)
+pv_out=$(COLUMNS=60 run_nokitty "$lib" preview -v long-src 2>/dev/null)
 if printf '%s' "$pv_out" | grep -q '^  SOURCE       aaaa'; then
     pass "the long source starts in the value column"
 else fail "the long source lost its label line"; fi
@@ -296,7 +299,7 @@ if printf '%s' "$lv_out" | grep -q 'aaaaaaaaa…  png'; then
 else fail "list -v SOURCE field shifted later columns"; fi
 png1x1 "$lib/ctrl-src.png" 0 0 0
 xattr -w theme.source "$(printf 'bad\nline\airl')" "$lib/ctrl-src.png" 2>/dev/null
-pv_out=$(COLUMNS=80 run_nokitty "$lib" preview ctrl-src 2>/dev/null)
+pv_out=$(COLUMNS=80 run_nokitty "$lib" preview -v ctrl-src 2>/dev/null)
 if printf '%s' "$pv_out" | grep -q 'SOURCE       badlineirl'; then
     pass "control bytes in the source xattr are stripped"
 else fail "control bytes reached the preview table"; fi
@@ -304,7 +307,7 @@ fi
 
 # --- OWNER: only populated fields render; hostile metadata xattrs are inert -
 png1x1 "$lib/bare-meta.png" 5 5 5
-pv_out=$(COLUMNS=80 run_nokitty "$lib" preview bare-meta 2>/dev/null)
+pv_out=$(COLUMNS=80 run_nokitty "$lib" preview -v bare-meta 2>/dev/null)
 if printf '%s' "$pv_out" | grep -qE '^  (ARTIST|PUBLISHED|CAMERA|PLACE|LICENSE)'; then
     fail "an empty metadata field rendered for a bare file"
 else pass "empty metadata fields are omitted, not rendered blank"; fi
@@ -315,7 +318,7 @@ if printf '%s' "$pv_out" | grep -q '^  TITLE        bare-meta' \
 else fail "preview lost a filesystem fact on a bare file"; fi
 if xattr_meta; then
 xattr -w theme.artist "$(printf 'Ev\033]52;c;steal\ail Artist')" "$lib/bare-meta.png" 2>/dev/null
-pv_out=$(COLUMNS=80 run_nokitty "$lib" preview bare-meta 2>/dev/null)
+pv_out=$(COLUMNS=80 run_nokitty "$lib" preview -v bare-meta 2>/dev/null)
 if printf '%s' "$pv_out" | grep -qF "$(printf '\033]')"; then
     fail "a metadata xattr smuggled terminal protocol into preview"
 else pass "hostile metadata cannot emit terminal protocol"; fi
@@ -913,7 +916,7 @@ run_get() { PATH="$urlbin:$PATH" THEME_WALLPAPER_DIR="$getlib" THEME_NO_APPLY=1 
     KITTY_WINDOW_ID='' COLUMNS=120 "$THEME" get "$@"; }
 getout=$(run_get https://img.invalid/get-me.png 2>&1)
 exists "get saves the download into the library"      yes "$getlib/get-me.png"
-if printf '%s\n' "$getout" | grep -q '^  TITLE ' && printf '%s\n' "$getout" | grep -q '^  LOCATION '; then
+if printf '%s\n' "$getout" | grep -q '^  TITLE ' && printf '%s\n' "$getout" | grep -q '^  COLORSCHEME'; then
     pass "get previews what it saved"
 else fail "get printed no preview block: $getout"; fi
 case "$getout" in
@@ -983,7 +986,7 @@ srccase() { # $1 description, $2 basename, $3 theme.source value, $4 expected la
     local got
     png1x1 "$lib/$2.png" 0 0 0
     xattr -w theme.source "$3" "$lib/$2.png" 2>/dev/null
-    got=$(COLUMNS=120 run_nokitty "$lib" preview "$2" 2>/dev/null | sed -n 's/^ *SOURCE  *//p')
+    got=$(COLUMNS=120 run_nokitty "$lib" preview -v "$2" 2>/dev/null | sed -n 's/^ *SOURCE  *//p')
     if [ "$got" = "$4" ]; then pass "$1"; else fail "$1 (got '$got', wanted '$4')"; fi
 }
 if xattr_meta; then
@@ -1670,7 +1673,7 @@ if [ "$upd_rc" = 0 ] && grep -qF 'brew upgrade snaraj/theme/theme' "$upd_out" \
 else fail "--version bypassed the keg route (rc=$upd_rc): $(cat "$upd_out")"; fi
 printf '  version "%s"\n' "$cur_ver" >"$tap_formula"
 upd_run
-if [ "$upd_rc" = 0 ] && grep -qF 'no Homebrew upgrade is available' "$upd_out" \
+if [ "$upd_rc" = 0 ] && [ "$(cat "$upd_out")" = "$(printf '==> Updating theme...\nAlready up-to-date.')" ] \
    && ! grep -qF 'brew upgrade snaraj/theme/theme' "$upd_out" && [ ! -s "$updlog" ] && upd_intact; then
     pass "a current local formula reports the unavailable Homebrew upgrade"
 else fail "stale formula still offers a no-op upgrade: $(cat "$upd_out")"; fi
@@ -2169,6 +2172,30 @@ for l in lines:
     if l and not l.startswith(' ') and not l.startswith(starters):
         sys.exit('column-0 line outside the known starters: %r' % l)
 EOS
+cat >"$fixture/ptyrun.py" <<'EOS'
+import fcntl, os, pty, struct, subprocess, sys, termios
+cols, out, cmd = int(sys.argv[1]), sys.argv[2], sys.argv[3:]
+m, s = pty.openpty()
+fcntl.ioctl(s, termios.TIOCSWINSZ, struct.pack('HHHH', 24, cols, 0, 0))
+env = dict(os.environ)
+env.pop('COLUMNS', None)
+p = subprocess.Popen(cmd, stdout=s, stderr=s, env=env)
+os.close(s)
+buf = b''
+while True:
+    try:
+        d = os.read(m, 65536)
+    except OSError:
+        break
+    if not d:
+        break
+    buf += d
+p.wait()
+os.close(m)
+open(out, 'wb').write(buf.replace(b'\r\n', b'\n'))
+sys.exit(p.returncode)
+EOS
+
 narrow_out="$fixture/narrow.out"
 narrow_run() { # $1 COLUMNS, rest: theme args
     local c="$1"
@@ -2180,7 +2207,7 @@ narrow_run() { # $1 COLUMNS, rest: theme args
     env COLUMNS="$c" KITTY_WINDOW_ID=1 PATH="$narrowbin:$sweepbin:$PATH" \
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
-        "$THEME" "$@" >"$narrow_out" 2>&1
+        python3 "$fixture/ptyrun.py" "$c" "$narrow_out" "$THEME" "$@"
     narrow_rc=$?
 }
 narrowck() { python3 "$fixture/narrowck.py" "$narrow_out" "$@" 2>&1; }
@@ -2221,29 +2248,6 @@ else fail "40-column search broke (rc=$narrow_rc): ${why:-$(tail -3 "$narrow_out
 # pin is the one that would have caught it: a genuine 42-column pty with
 # COLUMNS UNSET must stack. (The env-forced pins above stay: they pin the
 # pipe/test class, where COLUMNS is the explicit override.)
-cat >"$fixture/ptyrun.py" <<'EOS'
-import fcntl, os, pty, struct, subprocess, sys, termios
-cols, out, cmd = int(sys.argv[1]), sys.argv[2], sys.argv[3:]
-m, s = pty.openpty()
-fcntl.ioctl(s, termios.TIOCSWINSZ, struct.pack('HHHH', 24, cols, 0, 0))
-env = dict(os.environ)
-env.pop('COLUMNS', None)
-p = subprocess.Popen(cmd, stdout=s, stderr=s, env=env)
-os.close(s)
-buf = b''
-while True:
-    try:
-        d = os.read(m, 65536)
-    except OSError:
-        break
-    if not d:
-        break
-    buf += d
-p.wait()
-os.close(m)
-open(out, 'wb').write(buf.replace(b'\r\n', b'\n'))
-sys.exit(p.returncode)
-EOS
 narrow_pty() { # $1 cols, rest: theme args — a real tty answer, no COLUMNS
     local c="$1"
     shift

@@ -99,8 +99,8 @@ class Distribution(unittest.TestCase):
     def test_ci_and_postpublication_both_verify_installation(self):
         ci = (ROOT / ".github/workflows/ci.yml").read_text()
         release = (ROOT / ".github/workflows/release.yml").read_text().split("  distribution:\n", 1)[1]
+        self.assertIn(".github/scripts/prepared_release.py homebrew", ci)
         for workflow in (ci, release):
-            self.assertIn(".github/scripts/verify_distribution.py", workflow)
             self.assertIn("brew install snaraj/theme/theme", workflow)
             self.assertIn("brew test snaraj/theme/theme", workflow)
         self.assertIn('verify_distribution.py --tag "$TAG"', release)

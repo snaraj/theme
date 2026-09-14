@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Full base commit SHA for the performance comparison
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -23,6 +29,8 @@ jobs:
           fetch-depth: 0
       - run: python3 -I -B tests/release_policy_test.py
       - run: python3 -I -B tests/distribution_test.py
+      - run: python3 -I -B tests/prepared_release_test.py
+      - run: python3 -I -B tests/kitty_pixels_test.py
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -31,9 +39,10 @@ jobs:
       # users are on. It needs both binaries — the update sections drive the
       # debug build's THEME_CURL seam — and costs this job seconds.
       - run: cargo build --release --locked && cargo build --locked && THEME_BIN=target/release/theme tests/boundary.sh
+      - run: python3 -I -B tests/preview_cli_test.py target/release/theme
       - name: Compare command performance and rendering with the base commit
         env:
-          THEME_PERF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          THEME_PERF_BASE: ${{ github.event.pull_request.base.sha || github.event.before || inputs.baseline }}
         run: tests/performance-ci.sh
       - name: Publish command timing and rendering evidence
         id: performance_artifact
@@ -80,14 +89,15 @@ jobs:
           printf '%s  %s\n' "$KITTY_SHA256" "$RUNNER_TEMP/kitty.txz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/kitty"
           tar -xJf "$RUNNER_TEMP/kitty.txz" -C "$RUNNER_TEMP/kitty"
-      - run: cargo build --release --locked
-      - name: Press the browser's keys in a real Kitty
+      - run: cargo install --path . --locked --root target/installed --target-dir target
+      - run: sh tests/portable-smoke.sh "$PWD/target/installed/bin/theme"
+      - name: Verify installed previews and browser keys in a real Kitty
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
         run: |
           xvfb-run -a -s "-screen 0 1400x900x24" python3 -I -B tests/kitty_e2e.py \
             --kitty "$RUNNER_TEMP/kitty/bin/kitty" \
-            --theme target/release/theme --output target/kitty-e2e
+            --theme target/installed/bin/theme --output target/kitty-e2e
       - name: Publish the screenshots, screen dumps and kitty log
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -100,6 +110,9 @@ jobs:
   test-macos:
     runs-on: macos-latest
     timeout-minutes: 20 # a hung test must cost minutes of feedback, not 6h
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -115,20 +128,23 @@ jobs:
           brew trust --formula snaraj/theme/theme
           brew tap snaraj/theme "$GITHUB_WORKSPACE"
           brew style --formula snaraj/theme/theme
-      - name: Verify published downloads and install the reviewed formula
+      - name: Verify published or prepared downloads and install the reviewed formula
         env:
           GH_TOKEN: ${{ github.token }}
           HOMEBREW_NO_AUTO_UPDATE: '1'
           HOMEBREW_NO_INSTALL_CLEANUP: '1'
         run: |
-          python3 -I -B .github/scripts/verify_distribution.py
+          python3 -I -B .github/scripts/prepared_release.py homebrew
           brew install snaraj/theme/theme
           brew test snaraj/theme/theme
+          sh tests/portable-smoke.sh "$(brew --prefix)/bin/theme"
       - name: Verify browser commands and terminal layout
         run: |
-          cargo build --release --locked
-          python3 -I -B tests/browser_cli_test.py target/release/theme
-          python3 -I -B tests/mdls_cli_test.py target/release/theme
+          cargo install --path . --locked --root target/installed --target-dir target
+          sh tests/portable-smoke.sh "$PWD/target/installed/bin/theme"
+          python3 -I -B tests/browser_cli_test.py target/installed/bin/theme
+          python3 -I -B tests/mdls_cli_test.py target/installed/bin/theme
+          python3 -I -B tests/preview_cli_test.py target/installed/bin/theme
       # No real-Kitty step here, and it is not an omission: the hosted macOS
       # VM has no accelerated OpenGL, and GLFW's NSGL backend asks for an
       # accelerated pixel format unconditionally, so the pinned Kitty exits 1
@@ -138,11 +154,11 @@ jobs:
       # run 34644677010). The macOS key path is gated by the step above
       # instead: browser_cli_test.py drives the real binary through a real
       # pty, keys, terminal-mode restore and all. The real-Kitty driver runs
-      # hosted on Linux (browser-kitty) and on a Mac before release, with its
-      # assertion lines and screenshots in the pull request.
+      # hosted on Linux (browser-kitty). Physical macOS rendering and desktop
+      # Spaces still require a person on a Mac; hosted CI cannot establish them.
       - name: Compare command performance and rendering with the base commit
         env:
-          THEME_PERF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          THEME_PERF_BASE: ${{ github.event.pull_request.base.sha || github.event.before || inputs.baseline }}
         run: tests/performance-ci.sh
       - name: Publish command timing and rendering evidence
         id: performance_artifact
@@ -159,3 +175,67 @@ jobs:
           ARTIFACT_URL: ${{ steps.performance_artifact.outputs.artifact-url }}
         run: |
           printf '\n[Download command-performance-%s-%s](%s)\n\nOpen results.json, report.md, and rendering.html inside this downloaded artifact.\n' "$RUNNER_OS" "$RUNNER_ARCH" "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
+
+  test-linux-distros:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo build --release --locked
+      - name: Exercise the glibc build on supported distributions
+        run: |
+          for distro in ubuntu:22.04 debian:12-slim fedora:latest; do
+            printf 'Testing %s\n' "$distro"
+            docker run --rm --network=none --read-only --cap-drop=ALL \
+              --security-opt=no-new-privileges --user 65534:65534 --tmpfs /tmp \
+              -v "$PWD/target/release/theme:/opt/theme:ro" \
+              -v "$PWD/tests/portable-smoke.sh:/opt/smoke.sh:ro" \
+              "$distro" sh /opt/smoke.sh /opt/theme
+          done
+      - name: Build and exercise the musl build on Alpine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          docker run --rm --network=none --read-only --cap-drop=ALL \
+            --security-opt=no-new-privileges --user 65534:65534 --tmpfs /tmp \
+            -v "$PWD/target/x86_64-unknown-linux-musl/release/theme:/opt/theme:ro" \
+            -v "$PWD/tests/portable-smoke.sh:/opt/smoke.sh:ro" \
+            alpine:3 sh -c '
+              sh /opt/smoke.sh /opt/theme
+              if /opt/theme update > /tmp/update-output 2>&1; then exit 1; fi
+              grep -q "no published release build for this platform" /tmp/update-output
+            '
+
+  test-nixos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          enable_kvm: false
+          set_as_trusted_user: false
+          extra_nix_config: |
+            sandbox = true
+            system-features = nixos-test benchmark big-parallel kvm
+      - name: Allow only the Nix build group to use the VM accelerator
+        run: sudo setfacl -m g:nixbld:rw /dev/kvm
+      - name: Build, test and boot the NixOS package
+        shell: bash
+        run: |
+          mkdir -p target
+          nix-build tests/nixos.nix -o target/nixos-result 2>&1 | tee target/nixos.log
+      - name: Retain NixOS build and boot diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nixos-cli
+          path: target/nixos.log
+          if-no-files-found: error
+          retention-days: 30

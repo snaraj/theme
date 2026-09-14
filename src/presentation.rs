@@ -1,9 +1,9 @@
 //! One final-palette preparation path for preview and apply. Preview performs
-//! bounded reads and in-memory derivation only; specimens use SGR, never OSC.
+//! bounded reads and in-memory derivation only; swatches use SGR, never OSC.
 
 use crate::apply::{derive_options, schemes_dir};
 use crate::config::Config;
-use pigment::{Floored, ImageProfile, Palette, Readability, Rgb, effective_background};
+use pigment::{Floored, ImageProfile, Palette, Readability};
 use std::borrow::Cow;
 use std::fs;
 use std::io::Read;
@@ -16,6 +16,7 @@ pub struct PreparedPalette {
     pub contrast: f64,
     pub readability: Readability,
     pub profile: ImageProfile,
+    pub opacity_limited: bool,
 }
 
 /// A configured/explicit opacity, not a query of running Kitty windows.
@@ -197,8 +198,7 @@ pub fn prepare(palette: Palette, opacity: f64, contrast: f64) -> Result<Prepared
         return Err("contrast must be a finite ratio from 1 to 21".into());
     }
     let profile = palette.profile.clone();
-    let background = effective_background(palette.background(), opacity, palette.wallpaper_average);
-    let palette = palette.floor_against(background, contrast);
+    let (palette, achievable) = palette.floor_for_image(opacity, contrast);
     let readability = profile.readability(&palette, opacity, contrast);
     Ok(PreparedPalette {
         palette,
@@ -206,6 +206,7 @@ pub fn prepare(palette: Palette, opacity: f64, contrast: f64) -> Result<Prepared
         contrast,
         readability,
         profile,
+        opacity_limited: !achievable,
     })
 }
 
@@ -238,76 +239,32 @@ pub fn cached_preview(cfg: &Config, path: &Path) -> Result<PreparedPalette, Stri
     preview(cfg, path)
 }
 
-fn paint(fg: Rgb, bg: Rgb, text: &str, width: usize) -> String {
-    // Specimen strings are fixed ASCII. No path, metadata or shell input can
-    // supply escape sequences, and each painted span resets its own SGR.
-    let text: String = text.chars().take(width).collect();
-    format!(
-        "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m{text:width$}\x1b[0m",
-        fg.r, fg.g, fg.b, bg.r, bg.g, bg.b
-    )
-}
-
 impl PreparedPalette {
-    /// A terminal specimen with all 16 colors and interface/text samples.
+    /// Apply-only advice. Preview stays limited to the picture, name and colors.
+    pub fn readability_warning(&self) -> Option<String> {
+        (self.opacity_limited && self.opacity < 1.0).then(|| format!(
+            "text may be hard to read over this wallpaper at {:.0}% opacity; increase your terminal's background opacity and apply the theme again",
+            self.opacity * 100.0,
+        ))
+    }
+
+    /// All 16 final colors, wrapped to fit without changing terminal colors.
     /// Width is bounded; every line ends in SGR reset, with no OSC or cursor moves.
-    pub fn specimen(&self, width: usize) -> String {
-        let width = width.min(120);
+    pub fn swatches(&self, width: usize) -> String {
         if width == 0 {
             return String::new();
         }
-        let p = &self.palette;
-        let ui = p.interface();
-        let background = effective_background(p.background(), self.opacity, p.wallpaper_average);
-        let mut lines = vec![
-            paint(
-                ui.active_tab_foreground,
-                ui.active_tab_background,
-                "  editor.go  ",
-                width,
-            ),
-            paint(
-                ui.inactive_tab_foreground,
-                ui.inactive_tab_background,
-                "  logs  docs  ",
-                width,
-            ),
-            paint(
-                p.foreground,
-                background,
-                "sam@local ~/project $ go test ./...",
-                width,
-            ),
-            paint(p.colors[2], background, "PASS  all checks passed", width),
-            paint(p.colors[1], background, "error: example diagnostic", width),
-            paint(
-                p.colors[3],
-                background,
-                "warning: example diagnostic",
-                width,
-            ),
-            paint(
-                ui.selection_foreground,
-                ui.selection_background,
-                "selected text  Aa 0123456789",
-                width,
-            ),
-            paint(ui.cursor_text_color, p.cursor, "cursor", width),
-        ];
+        let mut lines = Vec::new();
         let per_row = (width / 4).clamp(1, 16);
-        for chunk in p.colors.chunks(per_row).enumerate() {
+        for chunk in self.palette.colors.chunks(per_row) {
             let mut line = String::new();
-            for (index, &color) in chunk.1.iter().enumerate() {
-                let fg = if Rgb::WHITE.contrast(color) >= Rgb::BLACK.contrast(color) {
-                    Rgb::WHITE
-                } else {
-                    Rgb::BLACK
-                };
-                line.push_str(&paint(
-                    fg,
-                    color,
-                    &format!(" {:02} ", chunk.0 * per_row + index),
-                    width.min(4),
+            for color in chunk {
+                line.push_str(&format!(
+                    "\x1b[48;2;{};{};{}m{}\x1b[0m",
+                    color.r,
+                    color.g,
+                    color.b,
+                    " ".repeat(width.min(4)),
                 ));
             }
             lines.push(line);
@@ -539,10 +496,22 @@ mod tests {
         assert!(!cfg.cache_dir.exists());
         assert!(!cfg.current.exists());
         for width in [0, 1, 3, 20, 80] {
-            let specimen = shown.specimen(width);
-            assert!(!specimen.contains("\x1b]"));
-            assert!(!specimen.contains("\x1bP"));
-            for line in specimen.lines() {
+            let swatches = shown.swatches(width);
+            assert_eq!(
+                swatches.matches("\x1b[48;2;").count(),
+                if width == 0 { 0 } else { 16 }
+            );
+            if width > 0 {
+                for color in shown.palette.colors {
+                    assert!(
+                        swatches
+                            .contains(&format!("\x1b[48;2;{};{};{}m", color.r, color.g, color.b))
+                    );
+                }
+            }
+            assert!(!swatches.contains("\x1b]"));
+            assert!(!swatches.contains("\x1bP"));
+            for line in swatches.lines() {
                 let mut visible = 0;
                 let mut rest = line;
                 while !rest.is_empty() {
@@ -558,6 +527,36 @@ mod tests {
                 assert!(line.ends_with("\x1b[0m"));
             }
         }
+        fs::remove_dir_all(&cfg.kitty_dir).unwrap();
+    }
+
+    #[test]
+    fn transparency_advice_is_plain_and_separate_from_preview() {
+        let cfg = config("contrast-warning");
+        let path = cfg.kitty_dir.join("mixed.png");
+        image::save_buffer(
+            &path,
+            &[0, 0, 0, 255, 255, 255],
+            2,
+            1,
+            image::ColorType::Rgb8,
+        )
+        .unwrap();
+        let raw = pigment::derive(&path, &derive_options()).unwrap();
+        let low = prepare(raw.clone(), 0.1, 7.0).unwrap();
+        assert!(low.opacity_limited);
+        let warning = low.readability_warning().unwrap();
+        assert!(warning.contains("10% opacity"));
+        assert!(warning.contains("increase your terminal's background opacity"));
+        assert!(!warning.contains("sample") && !warning.contains('\x1b'));
+        assert!(!low.swatches(80).contains("opacity"));
+        assert!(
+            prepare(raw, 1.0, 7.0)
+                .unwrap()
+                .readability_warning()
+                .is_none()
+        );
+        assert!(!cfg.current.exists());
         fs::remove_dir_all(&cfg.kitty_dir).unwrap();
     }
 }

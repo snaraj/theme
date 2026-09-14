@@ -47,42 +47,42 @@ pub(crate) fn load(path: &Path) -> Result<Decoded, Error> {
     let gw = w.min(GRID);
     let gh = h.min(GRID);
     let cells = (gw * gh) as usize;
-    let mut sums = vec![[0u64; 3]; cells];
-    let mut counts = vec![0u64; cells];
+    let mut pixels = Vec::with_capacity(cells);
     let mut total = [0u64; 3];
-    // Column membership is identical on every row; divide once per column.
-    let x_cells: Vec<usize> = (0..w)
-        .map(|x| (u64::from(x) * u64::from(gw) / u64::from(w)) as usize)
+    // Sum one rectangle at a time: each pixel contributes three additions,
+    // without updating a cell count and the whole-image totals per pixel.
+    // Ceil boundaries exactly invert floor(x * grid_width / image_width).
+    let edges: Vec<usize> = (0..=gw)
+        .map(|x| (x * w).div_ceil(gw) as usize * 3)
         .collect();
-
-    for (y, row) in rgb.rows().enumerate() {
-        let row_cell = (y as u64 * u64::from(gh) / u64::from(h)) as usize * gw as usize;
-        for (p, &bx) in row.zip(&x_cells) {
-            let cell = row_cell + bx;
-            let s = &mut sums[cell];
-            s[0] += u64::from(p[0]);
-            s[1] += u64::from(p[1]);
-            s[2] += u64::from(p[2]);
-            counts[cell] += 1;
-            total[0] += u64::from(p[0]);
-            total[1] += u64::from(p[1]);
-            total[2] += u64::from(p[2]);
+    let stride = w as usize * 3;
+    for by in 0..gh {
+        let top = (by * h).div_ceil(gh) as usize;
+        let bottom = ((by + 1) * h).div_ceil(gh) as usize;
+        for edge in edges.windows(2) {
+            let (left, right) = (edge[0], edge[1]);
+            let mut sum = [0u64; 3];
+            for y in top..bottom {
+                for pixel in rgb.as_raw()[y * stride + left..y * stride + right]
+                    .as_chunks::<3>()
+                    .0
+                {
+                    sum[0] += u64::from(pixel[0]);
+                    sum[1] += u64::from(pixel[1]);
+                    sum[2] += u64::from(pixel[2]);
+                }
+            }
+            for (all, part) in total.iter_mut().zip(sum) {
+                *all += part;
+            }
+            let count = ((right - left) / 3 * (bottom - top)) as u64;
+            let [r, g, b] = sum.map(|v| ((v + count / 2) / count) as u8);
+            pixels.push(Rgb { r, g, b });
         }
     }
 
     let n = u64::from(w) * u64::from(h);
     let avg = |t: u64| ((t + n / 2) / n) as u8;
-    let pixels: Vec<Rgb> = sums
-        .iter()
-        .zip(&counts)
-        .filter(|&(_, &c)| c > 0)
-        .map(|(s, &c)| Rgb {
-            r: ((s[0] + c / 2) / c) as u8,
-            g: ((s[1] + c / 2) / c) as u8,
-            b: ((s[2] + c / 2) / c) as u8,
-        })
-        .collect();
-
     Ok(Decoded {
         profile: ImageProfile::from_grid(w, h, gw as usize, gh as usize, &pixels),
         pixels,
