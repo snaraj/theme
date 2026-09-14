@@ -182,6 +182,12 @@ impl Palette {
     pub fn floor_for_image(mut self, opacity: f64, floor: f64) -> (Floored, bool) {
         let solid = self.background();
         let luminance = solid.luminance();
+        // Opaque windows have one background regardless of the image. Avoid
+        // blending and converting all 256 regions on every filtered row.
+        if opacity == 1.0 {
+            let achievable = (1.05 / (luminance + 0.05)).max((luminance + 0.05) / 0.05) >= floor;
+            return (self.floor_against(solid, floor), achievable);
+        }
         let range =
             self.profile
                 .colors
