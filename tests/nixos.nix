@@ -23,10 +23,10 @@ let
     # assertions here, then execute every test on the VM's real filesystem.
     checkPhase = ''
       runHook preCheck
-      cargo test --workspace --release --locked --offline --no-run --message-format=json > test-binaries.json
+      cargo test --workspace --release --locked --offline --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} --no-run --message-format=json > test-binaries.json
       runHook postCheck
     '';
-    postInstall = ''
+    postCheck = ''
       for name in theme pigment; do
         binary=$(jq -er --arg name "$name" 'select(.profile.test == true and .target.name == $name and .executable != null) | .executable' test-binaries.json)
         install -Dm755 "$binary" "$out/libexec/$name-tests"
