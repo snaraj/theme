@@ -93,6 +93,7 @@ class Publication(unittest.TestCase):
         self.assertIn("        shell: bash\n", logged)
         nix = (WORKFLOW.parents[2] / "tests/nixos.nix").read_text()
         self.assertIn("CI=true python3 -I -B checks/tests/browser_cli_test.py", nix)
+        self.assertIn("${theme}/libexec/pigment-tests && ${theme}/libexec/theme-tests", nix)
 
     def test_foreign_or_wrong_ci_is_refused(self):
         for field, value in (("event", "pull_request"), ("head_branch", "other"), ("head_sha", "b" * 40),

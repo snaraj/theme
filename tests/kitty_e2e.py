@@ -123,8 +123,12 @@ class Fixture:
     """A private library, cache, config and PATH: this test reads and writes
     nothing of the machine it runs on."""
 
-    def __init__(self, theme, kitty_bin):
-        self.root = Path(tempfile.mkdtemp(prefix="kitty-e2e-"))
+    def __init__(self, theme, kitty_bin, directory):
+        # Saving rejects world-writable ancestors, including Linux /tmp.
+        self.root = Path(tempfile.mkdtemp(prefix="fixture-", dir=directory))
+        # UNIX sockets have a short path limit; keep the controller separate
+        # from image storage so deeply nested checkouts remain usable.
+        self.socket_dir = Path(tempfile.mkdtemp(prefix="theme-socket-"))
         self.library = self.root / "library"
         for child in ("library", "cache", "config/kitty", "kitty-config", "tmp", "bin"):
             (self.root / child).mkdir(mode=0o700, parents=True)
@@ -168,6 +172,7 @@ class Fixture:
 
     def remove(self):
         shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self.socket_dir, ignore_errors=True)
 
 
 class Session:
@@ -179,7 +184,7 @@ class Session:
         self.kitten = self.kitty.parent / "kitten"
         if not self.kitten.is_file():
             raise Failure(f"no kitten next to {self.kitty}")
-        self.socket = fixture.root / "kitty.sock"
+        self.socket = fixture.socket_dir / "kitty.sock"
         self.log = (output / "kitty.log").open("wb")
         argv = [str(self.kitty), "--config", "NONE",
                 "-o", "allow_remote_control=socket-only", "-o", "font_size=11",
@@ -441,7 +446,7 @@ def main():
         summary["assertions"].append({"name": name, "ok": bool(ok), "detail": detail})
         print(f"{'OK  ' if ok else 'FAIL'} {name}{': ' + detail if detail else ''}", flush=True)
 
-    fixture = Fixture(theme, kitty.parent)
+    fixture = Fixture(theme, kitty.parent, output)
     session = None
     try:
         session = Session(args, fixture, output)
@@ -596,7 +601,7 @@ def main():
             check(name + " applies no palette", not (fixture.root / "cache/wal").exists())
             session.close()
             session = None
-    except (Failure, OSError, subprocess.SubprocessError) as error:
+    except (Failure, OSError, ValueError, subprocess.SubprocessError) as error:
         check("driver completed", False, str(error).splitlines()[0])
         summary["failure"] = str(error)
     finally:
