@@ -190,7 +190,7 @@ fn main() {
             } else {
                 urlcmd::fetch_url(&cfg, arg, &mut flags, sub.as_deref())
             };
-            report::cmd_preview(&cfg, Some(&saved.to_string_lossy()));
+            report::cmd_preview(&cfg, Some(&saved.to_string_lossy()), flags.verbose);
         }
         "url" => die("theme url was folded into theme set — run: theme set <link>"),
         "list" | "ls" => report::cmd_list(&cfg, flags.verbose, flags.list_n),
@@ -217,7 +217,7 @@ fn main() {
             } else {
                 Some(flags.wallpaper.as_str())
             };
-            report::cmd_preview(&cfg, by_flag.or(positional));
+            report::cmd_preview(&cfg, by_flag.or(positional), flags.verbose);
         }
         "status" => report::cmd_status(&cfg),
         "rename" => {

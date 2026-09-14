@@ -10,7 +10,7 @@ use crate::ui::{
 };
 use crate::{apply, report, search};
 use rustix::event::{PollFd, PollFlags, Timespec};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -60,7 +60,7 @@ no keys and applies no wallpaper. THEME_NO_APPLY also skips state writes.";
 /// The sheet's own reminder. It names the keys first, because the keys are
 /// what a person reaches for; every word wraps, so it survives 25 columns.
 const FOOTER: &str = "arrows move · Space/PgDn page · Home/End ends · \
-                      select ID · query TERMS · favorite ID · help · quit";
+                      select ID · query TERMS · favorite ID · apply · help · quit";
 
 fn prose_lines(text: &str, cols: usize) -> Vec<String> {
     let cols = cols.max(1);
@@ -268,6 +268,15 @@ impl Queue {
     }
 }
 
+struct CachedPicture {
+    id: usize,
+    identity: FileIdentity,
+    cols: usize,
+    rows: usize,
+    window: String,
+    picture: report::Preview,
+}
+
 struct Browser<'a> {
     cfg: &'a Config,
     options: Options,
@@ -277,7 +286,10 @@ struct Browser<'a> {
     identities: BTreeMap<usize, FileIdentity>,
     queue: Queue,
     page: usize,
+    interactive: bool,
     graphics: bool,
+    image_warning_shown: bool,
+    pictures: VecDeque<CachedPicture>,
 }
 
 fn identity(path: &std::path::Path) -> Option<FileIdentity> {
@@ -298,6 +310,61 @@ fn identity(path: &std::path::Path) -> Option<FileIdentity> {
 }
 
 impl Browser<'_> {
+    fn image_unavailable(&mut self, cols: usize) {
+        if self.interactive
+            && !self.image_warning_shown
+            && let Some(message) = report::preview_failure(cols)
+        {
+            note(message);
+            self.image_warning_shown = true;
+        }
+    }
+
+    fn picture(&mut self, id: usize, cols: usize, rows: usize) -> Option<report::Preview> {
+        let current = identity(&self.paths[id])?;
+        let window = report::preview_window_size();
+        if let Some(i) = self.pictures.iter().position(|p| {
+            p.id == id
+                && p.identity == current
+                && p.cols == cols
+                && p.rows == rows
+                && p.window == window
+        }) {
+            let cached = self.pictures.remove(i)?;
+            let picture = cached.picture.clone();
+            self.pictures.push_front(cached);
+            return Some(picture);
+        }
+        let picture = report::render_preview(&self.paths[id], cols, rows)?;
+        if identity(&self.paths[id])? != current {
+            return None;
+        }
+        self.pictures
+            .retain(|p| p.id != id || p.identity == current);
+        self.pictures.push_front(CachedPicture {
+            id,
+            identity: current,
+            cols,
+            rows,
+            window,
+            picture: picture.clone(),
+        });
+        // Session-local LRU: keep revisits fast without growing with the library.
+        while self.pictures.len() > 24
+            || self
+                .pictures
+                .iter()
+                .map(|p| {
+                    p.picture.apc.len() + p.picture.rows.iter().map(String::len).sum::<usize>()
+                })
+                .sum::<usize>()
+                > 16 * 1024 * 1024
+        {
+            self.pictures.pop_back();
+        }
+        Some(picture)
+    }
+
     fn measure(&mut self, id: usize) {
         let identity = identity(&self.paths[id]);
         if identity.is_none() {
@@ -408,12 +475,20 @@ impl Browser<'_> {
         // Redirected output is plain, stable text; it never contains graphics,
         // terminal escapes, image bytes, or a derived-palette side effect.
         if !self.graphics || cols < 8 {
+            self.image_unavailable(cols);
             for id in ids {
-                say(&format!(
-                    "{}  {}",
-                    id + 1,
-                    display_text(&self.paths[id].to_string_lossy())
-                ));
+                if self.interactive {
+                    say(&self.title(id, cols));
+                } else {
+                    say(&format!(
+                        "{}  {}",
+                        id + 1,
+                        display_text(&self.paths[id].to_string_lossy())
+                    ));
+                }
+            }
+            if self.interactive {
+                say(FOOTER);
             }
             return;
         }
@@ -423,9 +498,11 @@ impl Browser<'_> {
             let mut pictures = Vec::new();
             for id in row {
                 self.measure(*id);
-                let preview = report::render_preview(&self.paths[*id], width, 7);
+                let preview = self.picture(*id, width, 7);
                 if let Some(p) = &preview {
                     print!("{}", p.apc);
+                } else {
+                    self.image_unavailable(width);
                 }
                 pictures.push(preview);
             }
@@ -486,35 +563,23 @@ impl Browser<'_> {
         self.save();
         self.measure(id);
         let cols = term_cols().max(1);
-        say(&format!("\n{}", self.title(id, cols)));
-        say(&display_text(&self.paths[id].to_string_lossy()));
+        println!();
         if self.graphics
             && cols >= 8
-            && let Some(p) = report::render_preview(&self.paths[id], cols.min(80), 18)
+            && let Some(p) = self.picture(id, cols.min(80), 18)
         {
             print!("{}", p.apc);
             for line in p.rows {
                 println!("{line}");
             }
+        } else {
+            self.image_unavailable(cols);
         }
+        say(&self.title(id, cols));
         match &self.measured[&id] {
             Ok(p) => {
-                say(&format!(
-                    "{} x {}  | opacity {:.2} | target {:.2}:1",
-                    p.profile.width, p.profile.height, p.opacity, p.contrast
-                ));
-                say(&format!(
-                    "Sampled readability: worst {:.2}:1 | {:.1}% coverage | {} points",
-                    p.readability.worst,
-                    p.readability.coverage * 100.0,
-                    p.readability.samples
-                ));
-                say(&format!(
-                    "Measured image: brightness {:.3} | chroma {:.3} | texture {:.3}",
-                    p.profile.mean_luminance, p.profile.chroma, p.profile.texture
-                ));
-                print!("{}", p.specimen(cols));
-                say("Preview only. Type apply to set this wallpaper and its final palette.");
+                say("COLORSCHEME");
+                print!("{}", p.swatches(cols));
             }
             Err(e) => note(&format!("preview unavailable: {e}")),
         }
@@ -1078,7 +1143,7 @@ pub fn run(cfg: &Config, args: &[String]) {
         .collect();
     paths.sort();
     paths.dedup();
-    let graphics = interactive && std::env::var("KITTY_WINDOW_ID").is_ok_and(|v| !v.is_empty());
+    let graphics = interactive && report::in_kitty();
     let mut browser = Browser {
         cfg,
         options,
@@ -1088,7 +1153,10 @@ pub fn run(cfg: &Config, args: &[String]) {
         identities: BTreeMap::new(),
         queue: Queue::default(),
         page: 0,
+        interactive,
         graphics,
+        image_warning_shown: false,
+        pictures: VecDeque::new(),
     };
     browser.refresh();
     browser.sheet();
@@ -1307,14 +1375,14 @@ mod tests {
     }
 
     #[test]
-    fn help_paths_metrics_and_footer_fit_narrow_widths() {
+    fn help_names_and_footer_fit_narrow_widths() {
         for cols in [1, 8, 13, 25, 60] {
             for text in [
                 HELP,
                 "/library/a-very-long-unbroken-wallpaper-name.png",
                 "/library/中国山水中国山水中国山水中国山水中国山水.png",
                 "/library/e\u{301}toile-👩‍💻-👍🏽-🇺🇸-\u{f120}.png",
-                "Sampled readability: worst 7.02:1 | 99.7% coverage | 256 points",
+                "COLORSCHEME",
                 FOOTER,
             ] {
                 assert!(
@@ -1360,7 +1428,10 @@ mod tests {
             identities: BTreeMap::new(),
             queue: Queue::default(),
             page: 0,
+            interactive: false,
             graphics: false,
+            image_warning_shown: false,
+            pictures: VecDeque::new(),
         };
         browser.queue.replace(vec![0]);
         assert!(browser.command("apply"));

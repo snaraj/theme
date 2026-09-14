@@ -156,15 +156,21 @@ def pty_navigation(binary, env):
         term.leave(b"quit\n")
         text = term.screen()
         flat = " ".join(text.split())
-        # Browser navigation/specimens must fit. The existing shared dry-run
+        # Browser navigation and swatches must fit. The existing shared dry-run
         # apply announcement prints a full path and is outside browser layout.
         preview = text.split("[no-apply]", 1)[0]
         require(all(cells(line) <= 25 for line in preview.splitlines()),
                 f"interactive preview exceeds 25 columns: {preview!r}")
-        for wanted in ["Sampled readability:", "saved favorite", "Preview only.",
+        for wanted in ["COLORSCHEME", "saved favorite",
                        "[no-apply] would set the desktop wallpaper"]:
             require(wanted in flat, f"missing interactive result {wanted!r}: {flat[-3000:]!r}")
         require("unknown command" not in flat, "navigation command was rejected")
+        require(flat.count("image preview unavailable") == 1,
+                "unsupported terminal notice must appear once per session")
+        require("/library/" not in preview, "interactive browsing printed full paths")
+        for unwanted in ["Sampled readability", "Measured image", "opacity",
+                         "editor.go", "go test", "example diagnostic", "Preview only"]:
+            require(unwanted not in preview, f"preview contains unwanted detail: {unwanted}")
 
 
 def pty_keys(binary, env):
@@ -173,16 +179,17 @@ def pty_keys(binary, env):
     counter the assertion for every key."""
     with Terminal(binary, env, ["browse", "--all", "--page-size", "1"]) as term:
         term.expect("page 1/4")
-        # The title line names the picture the selection is on: only a
-        # preview prints it, so it is what proves the selection moved.
+        # Consume each previous frame's prompt before pressing the next key;
+        # a filename from the initial plain sheet cannot satisfy a selection.
         for keys, wanted in [(b"\x1b[C", "1 blue calm 01.png"), (b"\x1b[B", "page 2/4"),
                              (b"\x1b[6~", "page 3/4"), (b"\x1b[5~", "page 2/4"),
                              (b" ", "page 3/4"), (b"\x1b[H", "page 1/4"),
                              (b"\x1b[F", "page 4/4"), (b"\x1bOC", "2 blue calm 02.png"),
                              (b"\x1bOD", "1 blue calm 01.png"), (b"n\n", "2 blue calm 02.png"),
                              (b"p\n", "1 blue calm 01.png"), (b"?\n", "theme browse [terms...]")]:
+            term.expect("browse> ")
             term.press(keys, wanted)
-        require("Preview only" in term.screen(), "the arrow keys never previewed")
+        require("COLORSCHEME" in term.screen(), "the arrow keys never previewed")
         # Both ends are ends: a note, no wrap, no crash.
         term.press(b"\x1b[H", "page 1/4")
         term.press(b"\x1b[5~", "start of these")
@@ -222,13 +229,13 @@ def pty_boundaries(binary, env, piped_page):
         # A pasted control byte is dropped, and the line it poisoned is
         # refused whole rather than run with the byte quietly removed.
         term.press(b"sel\x1bect 1\n", "command contains")
-        require("Preview only" not in term.screen(), "a pasted control line was executed")
+        require("COLORSCHEME" not in term.screen(), "a pasted control line was executed")
         # An arrow mid-command navigates nothing; the line completes as typed.
         term.send(b"sel\x1b[C")
         term.drain(0.4)
-        require("page 2/4" not in term.screen() and "Preview only" not in term.screen(),
+        require("page 2/4" not in term.screen() and "COLORSCHEME" not in term.screen(),
                 "an arrow navigated while a command was being typed")
-        term.press(b"ect 1\n", "Preview only")
+        term.press(b"ect 1\n", "COLORSCHEME")
         # Space mid-command is a space, not a page turn.
         term.press(b"page 3\n", "page 3/4")
         # Invalid UTF-8 in a line is a bad command, never a panic.
@@ -262,7 +269,8 @@ def main():
         env.update(CONFIG_DIR=str(config), KITTY_CONFIG_DIRECTORY=str(kitty),
                    THEME_CACHE_DIR=str(fixture / "cache"), THEME_WALLPAPER_DIR=str(library),
                    THEME_NO_APPLY="1", THEME_NO_UPDATE_CHECK="1", THEME_OPACITY="0.8",
-                   THEME_CONTRAST="7", COLUMNS="25", THEME_FORMATS="png", THEME_EXCLUDE_FORMATS="")
+                   THEME_CONTRAST="7", COLUMNS="25", TERM="xterm-256color",
+                   THEME_FORMATS="png", THEME_EXCLUDE_FORMATS="")
 
         def run(args, code=0, stdin=b"", overrides=None):
             child_env = env | (overrides or {})
@@ -276,7 +284,7 @@ def main():
         eof, _ = run(["browse", "--all"])
         piped, _ = run(["surf", "--all"], stdin=b"select 1\napply\nquit\n")
         require(eof == piped, "non-TTY input was interpreted as browser commands")
-        require(b"would" not in piped and b"Sampled readability" not in piped,
+        require(b"would" not in piped and b"COLORSCHEME" not in piped,
                 "non-TTY browse entered selection/apply")
         help_text, _ = run(["browse", "--help"])
         for args in (["surf", "--help"], ["help", "browse"], ["help", "surf"]):

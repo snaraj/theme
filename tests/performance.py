@@ -167,7 +167,7 @@ def semantic_errors(command, data, oracle):
                   "version": ["version:", "github:https://github.com/snaraj/theme", "maintainer:SamuelNaranjo"],
                   "list": ["wallpapers", "TITLE", "COLORSCHEME"],
                   "list-v": ["wallpapers", "TITLE", "COLORSCHEME", "SOURCE", "FORMAT", "SIZE", "ADDED"],
-                  "preview": ["TITLE", "FORMAT", "SIZE", "COLORSCHEME", "LOCATION"],
+                  "preview": ["TITLE", "COLORSCHEME"],
                   "search-metadata": ["search:landscape"], "search-color": ["search:blue"],
                   "browse-all": ["Wallpaperbrowser", "matches", "Query:allwallpapers"],
                   "browse-filter": ["Wallpaperbrowser", "matches", "Query:allwallpapers"],
@@ -181,7 +181,7 @@ def semantic_errors(command, data, oracle):
         expected = {tuple(bytes.fromhex(color[1:])) for color in BASE_COLORS[:4]}
         require(expected <= set(visible_colors(raw)), "missing configured header palette colors")
     if command == "preview":
-        require(re.sub(r"\s+", "", oracle["preview_name"]) in compact, "wrong or missing selected preview image")
+        require(re.sub(r"\s+", "", Path(oracle["preview_name"]).stem) in compact, "wrong or missing selected preview image")
         require(len(visible_colors(raw)) >= swatches and len(set(visible_colors(raw))) >= 2, "missing preview palette")
     if not oracle["synthetic"]:
         return errors
@@ -190,10 +190,6 @@ def semantic_errors(command, data, oracle):
     rows = set(re.findall(r"fixture-\d+", compact))
     if command in ("bare", "help"):
         require("fixture-000" in compact, "wrong current wallpaper in header")
-    if command == "preview":
-        fact = oracle["files"]["fixture-000"]
-        require(f"{fact['width']}x{fact['height']}({fact['display_bytes']})" in compact and "png" in compact,
-                "missing selected image format/dimensions/byte size")
     if command in ("list", "list-v", "search-metadata", "search-color"):
         hits = (count + 1) // 2 if command == "search-metadata" else count
         shown = min(hits, 12 if command.startswith("search") else 10)
@@ -575,7 +571,7 @@ class Harness:
                     "Cache derivation/persistence is enabled. No desktop-mutating verbs or native Kitty graphics are invoked.",
                     "A known included header palette is configured. Every run must retain command text, identities, metadata, and visible palette swatches.",
                     "Synthetic fixture row/search/browser/index totals are checked independently; external-library checks are structural and verify the selected preview identity.",
-                    "Shared list/search fixture rows must retain their actual RGB palette content; previews independently require image identity/metadata/swatches but may change their final palette.",
+                    "Shared list/search fixture rows must retain their actual RGB palette content; previews independently require the selected name and swatches; metadata is opt-in with -v.",
                     "Width uses stdlib Unicode cell estimates; native font/emoji shaping is not covered.",
                     "Cold and warm costs and existing width overflows are reported; gates cover repeated timing and new/worse rendering regressions.",
                     "browse/index support is probed through --help. New commands have candidate-only timings, never before/after speed claims.",
@@ -983,7 +979,7 @@ class SelfTests(unittest.TestCase):
                    "version": "version: v1.2.3\ngithub: https://github.com/snaraj/theme\nmaintainer: Samuel Naranjo",
                    "list": "wallpapers\nTITLE COLORSCHEME\n" + rows(range(4)),
                    "list-v": "wallpapers\nTITLE COLORSCHEME SOURCE FORMAT SIZE ADDED\n" + rows(range(4), "png 1K 2023-11-14"),
-                   "preview": "TITLE fixture-000\nFORMAT png\nSIZE 256x160 (1K)\nCOLORSCHEME " + palette + "\nLOCATION /fixture-000.png",
+                   "preview": "TITLE fixture-000\nCOLORSCHEME " + palette,
                    "search-metadata": "search: landscape\n" + rows([0, 2], "shape: landscape") + "\n2 of 4 wallpapers match",
                    "search-color": "search: blue\n" + rows(range(4), "colors: blue") + "\n4 of 4 wallpapers match",
                    "browse-all": "Wallpaper browser | 4 matches | page 1/1\nQuery: all wallpapers\n" + rows(range(4)),
@@ -998,8 +994,8 @@ class SelfTests(unittest.TestCase):
                                  ("list-v", outputs["list-v"].replace("2023-11-14", "", 1)),
                                  ("list-v", outputs["list-v"].replace("1K", "")),
                                  ("list-v", outputs["list-v"].replace("1K", "2K", 1)),
-                                 ("preview", outputs["preview"].replace("fixture-000.png", "fixture-999.png")),
-                                 ("preview", outputs["preview"].replace("(1K)", "")),
+                                 ("preview", outputs["preview"].replace("fixture-000", "fixture-999")),
+                                 ("preview", SGR.sub("", outputs["preview"])),
                                  ("search-metadata", outputs["search-metadata"].replace("fixture-002", "fixture-001")),
                                  ("search-color", outputs["search-color"].replace("4 of 4", "3 of 4")),
                                  ("index", outputs["index"].replace("cached 4", "cached 3")),

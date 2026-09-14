@@ -47,9 +47,9 @@ class Publication(unittest.TestCase):
         self.run = {"repository": {"id": policy.REPOSITORY_ID}, "head_repository": {"id": policy.REPOSITORY_ID},
                     "event": "push", "head_branch": "main", "head_sha": self.source,
                     "path": ".github/workflows/ci.yml", "status": "completed", "conclusion": "success"}
-        self.jobs = {"total_count": 3, "jobs": [
+        self.jobs = {"total_count": 5, "jobs": [
             {"name": name, "head_sha": self.source, "status": "completed", "conclusion": "success"}
-            for name in ("lint-test", "test-macos", "browser-kitty")]}
+            for name in ("lint-test", "test-macos", "browser-kitty", "test-linux-distros", "test-nixos")]}
         self.branch = {"name": "main", "protected": True}
         self.comparison = {"status": "ahead", "merge_base_commit": {"sha": self.source}}
 
@@ -71,7 +71,7 @@ class Publication(unittest.TestCase):
             self.check()
 
     def test_truncated_or_extra_job_inventory_is_refused(self):
-        self.jobs["total_count"] = 4
+        self.jobs["total_count"] += 1
         with self.assertRaises(ValueError):
             self.check()
         self.jobs["jobs"].append(dict(self.jobs["jobs"][0], name="browser-ghostty"))
@@ -84,6 +84,15 @@ class Publication(unittest.TestCase):
         names = workflow_jobs(WORKFLOW)
         self.assertTrue(names, "no jobs parsed out of " + str(WORKFLOW))
         self.assertEqual(names, policy.CHECKS)
+
+    def test_nixos_failure_and_unavailable_pty_cannot_pass(self):
+        logged = WORKFLOW.read_text().split("- name: Build, test and boot the NixOS package\n", 1)[1]
+        logged = logged.split("\n      - ", 1)[0]
+        # Actions' explicit bash shell enables pipefail; its implicit shell
+        # does not. tee must never hide a failed Nix build or VM assertion.
+        self.assertIn("        shell: bash\n", logged)
+        nix = (WORKFLOW.parents[2] / "tests/nixos.nix").read_text()
+        self.assertIn("CI=true python3 -I -B checks/tests/browser_cli_test.py", nix)
 
     def test_foreign_or_wrong_ci_is_refused(self):
         for field, value in (("event", "pull_request"), ("head_branch", "other"), ("head_sha", "b" * 40),

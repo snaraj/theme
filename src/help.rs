@@ -55,7 +55,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             (
                 "browse, surf",
-                "browse wallpaper previews, colors, readability and favorites",
+                "browse wallpaper pictures, colors and favorites",
             ),
             (
                 "index",
@@ -67,7 +67,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ),
             (
                 "preview",
-                "one wallpaper up close: picture, colorscheme, title, location",
+                "one wallpaper up close: picture, name and colorscheme",
             ),
             (
                 "search",
@@ -411,14 +411,13 @@ pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
 "
         ),
         "preview" => print!(
-            "theme preview [name | -w <name>]
+            "theme preview [name | -w <name>] [-v]
 
-  One wallpaper up close: a picture (kitty only; skipped elsewhere) above
-  every fact the file actually has — title, artist, published date,
-  camera, place, license, source, format, size — empty fields are
-  omitted, never rendered blank. Long values wrap under their own
-  column. Colorscheme swatches and the location (~/path) close the
-  block, followed by sampled readability and a final-color text specimen.
+  One wallpaper up close: a picture (Kitty only) above
+  its name and final colorscheme swatches. Add -v for available metadata
+  such as artist, source, dimensions, and location. Long values wrap.
+  Other terminals show a notice instead of the picture. Piped output
+  omits images and the notice.
   With no name it previews the CURRENT wallpaper; a name
   (positional or -w/--wallpaper, truncated titles welcome) previews
   that one.

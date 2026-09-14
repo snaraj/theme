@@ -560,11 +560,12 @@ mod tests {
         let planted = planted.to_str().unwrap().to_string();
         assert_eq!(resolve_curl(&[&planted]), None, "planted curl resolved");
         assert_eq!(resolve_curl(&[]), None);
-        // The real system curl passes on every platform CI runs, and an
-        // invalid candidate listed first must not shadow it.
+        // NixOS has no FHS curl. Absence must fail closed there; where the
+        // system curl exists, an invalid candidate must not shadow it.
         let sys = std::path::PathBuf::from("/usr/bin/curl");
-        assert_eq!(resolve_curl(&["/usr/bin/curl"]), Some(sys.clone()));
-        assert_eq!(resolve_curl(&[&planted, "/usr/bin/curl"]), Some(sys));
+        let expected = sys.exists().then_some(sys);
+        assert_eq!(resolve_curl(&["/usr/bin/curl"]), expected);
+        assert_eq!(resolve_curl(&[&planted, "/usr/bin/curl"]), expected);
         let _ = std::fs::remove_dir_all(&d);
     }
     use std::net::TcpListener;

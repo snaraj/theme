@@ -23,10 +23,13 @@ fn columns() -> usize {
     crate::ui::term_cols()
 }
 
-fn in_kitty() -> bool {
-    std::env::var("KITTY_WINDOW_ID")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+pub(crate) fn in_kitty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+        && (std::env::var("KITTY_WINDOW_ID")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+            || std::env::var("TERM").is_ok_and(|v| v == "xterm-kitty"))
 }
 
 fn have(cmd: &str) -> bool {
@@ -34,6 +37,22 @@ fn have(cmd: &str) -> bool {
         return false;
     };
     std::env::split_paths(&path).any(|d| d.join(cmd).is_file())
+}
+
+/// Explain a missing requested picture to a person, without adding noise to pipes.
+pub(crate) fn preview_failure(cols: usize) -> Option<&'static str> {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        None
+    } else if !in_kitty() {
+        Some("image preview unavailable in this terminal; use Kitty to view pictures.")
+    } else if cols < 8 {
+        Some("image preview unavailable: this window is too narrow; widen it.")
+    } else if !have("kitten") {
+        Some("image preview unavailable: Kitty's kitten helper was not found on PATH.")
+    } else {
+        Some("image preview unavailable: Kitty's image renderer failed for this file.")
+    }
 }
 
 /// Where a wallpaper came from, as a short label: the `theme.source` xattr
@@ -324,9 +343,24 @@ pub fn backfill_schemes<'a, I: IntoIterator<Item = &'a PathBuf>>(
 /// flow with text. icat's own output positions absolutely, so the cursor
 /// choreography is stripped and each line of cells re-emitted with the
 /// image-id color reapplied.
+#[derive(Clone)]
 pub struct Preview {
     pub apc: String,
     pub rows: Vec<String>,
+}
+
+/// Use the caller's actual cell geometry, including after a resize. Some
+/// PTYs omit pixels; their fallback uses conventional 1:2 cells.
+pub(crate) fn preview_window_size() -> String {
+    let ws = rustix::termios::tcgetwinsize(std::io::stdout()).ok();
+    let cols = ws.as_ref().map_or(80, |w| w.ws_col.max(1));
+    let rows = ws.as_ref().map_or(24, |w| w.ws_row.max(1));
+    let (width, height) = ws
+        .filter(|w| w.ws_xpixel > 0 && w.ws_ypixel > 0)
+        .map_or((u32::from(cols) * 10, u32::from(rows) * 20), |w| {
+            (u32::from(w.ws_xpixel), u32::from(w.ws_ypixel))
+        });
+    format!("{cols},{rows},{width},{height}")
 }
 
 pub fn render_preview(img: &Path, cols: usize, rows: usize) -> Option<Preview> {
@@ -337,25 +371,56 @@ pub fn render_preview(img: &Path, cols: usize, rows: usize) -> Option<Preview> {
         .args([
             "icat",
             "--unicode-placeholder",
-            "--transfer-mode=file",
+            "--transfer-mode=stream",
             "--stdin=no",
             "--use-window-size",
-            "100,50,2000,1000",
+            &preview_window_size(),
             &format!("--place={cols}x{rows}@0x0"),
         ])
         .arg(img)
         .output()
         .ok()
         .filter(|o| o.status.success())?;
-    let out = String::from_utf8_lossy(&out.stdout).into_owned();
-    let st = out.find("\x1b\\")?;
-    let mut apc = out[..st + 2].to_string();
-    if let Some(stripped) = apc.strip_prefix('\r') {
-        apc = stripped.to_string();
+    parse_preview(std::str::from_utf8(&out.stdout).ok()?, cols, rows)
+}
+
+fn parse_preview(out: &str, cols: usize, rows: usize) -> Option<Preview> {
+    let out = out.trim_start_matches('\r');
+    let mut end = 0;
+    // A streamed picture can span several APCs. Keep every packet intact,
+    // including tmux's wrappers; its doubled ESC is not the wrapper's end.
+    loop {
+        let rest = &out[end..];
+        let wrapped = rest.starts_with("\x1bPtmux;");
+        if !wrapped && !rest.starts_with("\x1b_G") {
+            break;
+        }
+        let bytes = rest.as_bytes();
+        let mut i = if wrapped { 7 } else { 3 };
+        loop {
+            if i + 1 >= bytes.len() {
+                return None;
+            }
+            if bytes[i] == 0x1b {
+                if wrapped && bytes[i + 1] == 0x1b {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i + 1] == b'\\' {
+                    end += i + 2;
+                    break;
+                }
+            }
+            i += 1;
+        }
     }
-    let rest = &out[st + 2..];
+    if end == 0 {
+        return None;
+    }
+    let apc = out[..end].to_string();
+    let rest = &out[end..];
     // The per-line color that binds cells to the transmitted image id.
-    let color = find_color_intro(rest).unwrap_or_default();
+    let color = find_color_intro(rest)?;
     let cleaned = strip_choreography(rest);
     let w: usize = apc
         .split([',', ';'])
@@ -398,6 +463,45 @@ fn find_color_intro(s: &str) -> Option<String> {
         i = start + 4;
     }
     None
+}
+
+#[cfg(test)]
+mod graphics_tests {
+    use super::parse_preview;
+
+    const CELLS: &str = "\x1b[38:2:1:2:3m\x1b7\x1b[1;0H\u{10eeee}\u{305}\u{305}\n\x1b8";
+
+    #[test]
+    fn streamed_packets_and_placeholder_colours_survive() {
+        let packets = "\x1b_Ga=T,c=1,r=1,m=1;YWJj\x1b\\\x1b_Gm=0;ZA==\x1b\\";
+        let p = parse_preview(&format!("\r{packets}{CELLS}"), 3, 1).unwrap();
+        assert_eq!(p.apc, packets);
+        assert_eq!(
+            p.rows,
+            ["\x1b[38:2:1:2:3m\u{10eeee}\u{305}\u{305}  \x1b[39m"]
+        );
+    }
+
+    #[test]
+    fn tmux_wrappers_keep_their_escaped_inner_terminators() {
+        let packets = "\x1b_Ga=T,c=1,m=1;YWJj\x1b\\\x1b_Gm=0;ZA==\x1b\\";
+        let wrapped = format!("\x1bPtmux;{}\x1b\\", packets.replace('\x1b', "\x1b\x1b"));
+        let p = parse_preview(&format!("{wrapped}{CELLS}"), 1, 1).unwrap();
+        assert_eq!(p.apc, wrapped);
+        assert_eq!(p.rows.len(), 1);
+    }
+
+    #[test]
+    fn incomplete_graphics_never_become_placeholder_text() {
+        for output in [
+            CELLS,
+            "\x1b_Gm=1;YWJj",
+            "\x1bPtmux;\x1b\x1b_Gdata\x1b\x1b\\",
+            "\x1b_Ga=T;YWJj\x1b\\plain",
+        ] {
+            assert!(parse_preview(output, 3, 1).is_none());
+        }
+    }
 }
 
 /// Remove save/restore-cursor, absolute positioning, carriage returns,
@@ -769,7 +873,7 @@ fn preview_dimensions(
     }
 }
 
-pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
+pub fn cmd_preview(cfg: &Config, arg: Option<&str>, verbose: bool) {
     use std::fmt::Write as _;
     let img: PathBuf = match arg {
         Some(a) => resolve_local(cfg, a).unwrap_or_else(|| {
@@ -787,78 +891,45 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
     };
     let prepared = crate::presentation::cached_preview(cfg, &img);
     let name = display_text(img.file_stem().and_then(|s| s.to_str()).unwrap_or(""));
-    let mut loc = img.display().to_string();
-    if let Ok(home) = std::env::var("HOME")
-        && let Some(rest) = loc.strip_prefix(&home)
-        && rest.starts_with('/')
-    {
-        loc = format!("~{rest}");
-    }
-    let loc = display_text(&loc);
-    let src = wall_source(&img);
-    let dims = preview_dimensions(&img, prepared.as_ref());
-    let bytes = human_bytes(&img);
-    // Swatch geometry is width-aware (issue #19): 5 visible cells per
-    // swatch beside the label when the full row fits, else as many as fit
-    // on their own line under the label — truncated, never torn.
     let cols = columns();
-    let scheme: Vec<String> = prepared
-        .as_ref()
-        .map(|p| {
-            p.palette
-                .colors
-                .iter()
-                .map(|c| c.hex().trim_start_matches('#').to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    let sw_fit = |n: usize| {
-        let mut s = String::new();
-        for c in scheme.iter().take(n) {
-            if let Some((r, g, b)) = crate::ui::parse_hex6(c) {
-                s.push_str(&format!("\x1b[48;2;{r};{g};{b}m    \x1b[0m "));
+    let mut fields = vec![("TITLE", name)];
+    // Metadata remains available explicitly, without slowing ordinary previews
+    // with source lookups or crowding the picture and its final colors.
+    if verbose {
+        for (label, key) in [
+            ("ARTIST", "theme.artist"),
+            ("PUBLISHED", "theme.published"),
+            ("CAMERA", "theme.camera"),
+            ("PLACE", "theme.place"),
+            ("LICENSE", "theme.license"),
+        ] {
+            let value = wall_meta(&img, key);
+            if !value.is_empty() {
+                fields.push((label, value));
             }
         }
-        s
-    };
-
-    // Every field that HAS a value, and none that don't: an empty field is
-    // omitted, never rendered blank.
-    let mut fields: Vec<(&str, String)> = vec![("TITLE", name)];
-    for (label, key) in [
-        ("ARTIST", "theme.artist"),
-        ("PUBLISHED", "theme.published"),
-        ("CAMERA", "theme.camera"),
-        ("PLACE", "theme.place"),
-        ("LICENSE", "theme.license"),
-    ] {
-        let v = wall_meta(&img, key);
-        if !v.is_empty() {
-            fields.push((label, v));
+        let src = wall_source(&img);
+        if src != "-" {
+            fields.push(("SOURCE", src));
         }
+        if let Some(ext) = img.extension().and_then(|e| e.to_str()) {
+            fields.push(("FORMAT", ext.to_lowercase()));
+        }
+        let dims = preview_dimensions(&img, prepared.as_ref());
+        let dims = if dims.is_empty() { "?" } else { &dims };
+        fields.push(("SIZE", format!("{dims} ({})", human_bytes(&img))));
+        let mut loc = img.display().to_string();
+        if let Ok(home) = std::env::var("HOME")
+            && let Some(rest) = loc.strip_prefix(&home)
+            && rest.starts_with('/')
+        {
+            loc = format!("~{rest}");
+        }
+        fields.push(("LOCATION", display_text(&loc)));
     }
-    if src != "-" {
-        fields.push(("SOURCE", src));
-    }
-    if let Some(ext) = img.extension().and_then(|e| e.to_str()) {
-        fields.push(("FORMAT", ext.to_lowercase()));
-    }
-    let dims_disp = if dims.is_empty() {
-        "?".to_string()
-    } else {
-        dims
-    };
-    fields.push(("SIZE", format!("{dims_disp} ({bytes})")));
 
-    // Assemble this display before the stdout write, retaining the shared
-    // broken-pipe handling while avoiding a flush for every rendered line.
+    // One buffered frame: intact thumbnail rows above the name and swatches.
     let mut frame = String::with_capacity(4096);
-
-    // Thumbnail above, fields below — stacked, so a long value can never
-    // interleave with the image rows; values wrap with a hanging indent.
-    // The thumb clamps to the terminal (issue #19): narrower than its 24
-    // cells it shrinks, and below an 8-cell floor it is absent with
-    // dignity — torn is forbidden.
     let pw = cols.saturating_sub(2).min(24);
     if pw >= 8
         && let Some(p) = render_preview(&img, pw, 10)
@@ -868,44 +939,28 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>) {
             writeln!(frame, "  {r}").unwrap();
         }
         writeln!(frame).unwrap();
+    } else if let Some(message) = preview_failure(pw) {
+        for line in crate::ui::wrap_prefixed(message, cols, "  theme: ", "    ") {
+            writeln!(frame, "{line}").unwrap();
+        }
     }
     for (label, value) in &fields {
         for line in wrap_field(label, value, cols) {
             writeln!(frame, "{line}").unwrap();
         }
     }
-    if scheme.is_empty() {
-        writeln!(frame, "  {:<12} -", "COLORSCHEME").unwrap();
-    } else if cols >= 15 + 8 * 5 {
-        writeln!(frame, "  {:<12} {}", "COLORSCHEME", sw_fit(8)).unwrap();
-    } else {
-        writeln!(frame, "  COLORSCHEME").unwrap();
-        writeln!(frame, "    {}", sw_fit((cols.saturating_sub(4) / 5).max(1))).unwrap();
-    }
-    for line in wrap_field("LOCATION", &loc, cols) {
-        writeln!(frame, "{line}").unwrap();
-    }
     match prepared {
         Ok(p) => {
-            let value = format!(
-                "{:.2}:1 worst; {:.0}% of {} regions meet {:.1}:1; opacity {:.2}",
-                p.readability.worst,
-                p.readability.coverage * 100.0,
-                p.readability.samples,
-                p.contrast,
-                p.opacity
-            );
-            for line in wrap_field("READABILITY", &value, cols) {
+            for line in crate::ui::wrap_prefixed("COLORSCHEME", cols, "  ", "  ") {
                 writeln!(frame, "{line}").unwrap();
             }
-            writeln!(frame).unwrap();
-            for line in p.specimen(cols.saturating_sub(2)).lines() {
+            for line in p.swatches(cols.saturating_sub(2)).lines() {
                 writeln!(frame, "  {line}").unwrap();
             }
         }
         Err(e) => {
             for line in wrap_field(
-                "PALETTE",
+                "COLORSCHEME",
                 &format!("unavailable: {}", display_text(&e)),
                 cols,
             ) {

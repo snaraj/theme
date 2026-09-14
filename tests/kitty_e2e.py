@@ -23,6 +23,8 @@ presses `apply`, and THEME_NO_APPLY is set so it could not if it tried.
 
 import argparse
 import json
+import importlib.util
+import hashlib
 import os
 from pathlib import Path
 import platform
@@ -34,6 +36,11 @@ import sys
 import tempfile
 import time
 import zlib
+
+# -I deliberately omits the script directory from sys.path.
+_spec = importlib.util.spec_from_file_location("kitty_pixels", Path(__file__).with_name("kitty_pixels.py"))
+picture = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(picture)
 
 IMAGES = 14
 PAGE_SIZE = 6  # 14 images over 6 per page: three pages, the last one short
@@ -49,22 +56,6 @@ POLL = 0.2
 
 class Failure(Exception):
     """An assertion that did not hold, with the screen behind it."""
-
-
-def png(number, width, height):
-    """One deterministic picture: gradients in all three channels, so a
-    thumbnail of it cannot be mistaken for a flat background."""
-    def chunk(kind, body):
-        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
-    pixels = bytearray()
-    for y in range(height):
-        pixels.append(0)
-        for x in range(width):
-            pixels.extend(((x * 3 + number * 17) % 256, (y * 5 + number * 11) % 256,
-                           (128 + x + y + number * 7) % 256))
-    return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(bytes(pixels), 6)) + chunk(b"IEND", b""))
 
 
 def decode_png(data, max_rows=None):
@@ -128,30 +119,6 @@ def decode_png(data, max_rows=None):
             "rows": rows, "pixels": bytes(pixels)}
 
 
-def band_colours(image, top, bottom):
-    """Distinct colours and the non-background fraction in a horizontal band.
-    The background is whatever colour the decoded part of the screen has most
-    of — a terminal is mostly background, drawn or not."""
-    width, channels, pixels = image["width"], image["channels"], image["pixels"]
-    counts = {}
-    for offset in range(0, len(pixels), channels):
-        colour = pixels[offset:offset + 3]
-        counts[colour] = counts.get(colour, 0) + 1
-    background = max(counts, key=counts.get)
-    seen, foreground, total = set(), 0, 0
-    for y in range(top, min(bottom, image["rows"])):
-        row = y * width * channels
-        for x in range(width):
-            colour = pixels[row + x * channels:row + x * channels + 3]
-            seen.add(colour)
-            total += 1
-            if max(abs(a - b) for a, b in zip(colour, background)) > 12:
-                foreground += 1
-    return {"colours": len(seen), "pixels": total,
-            "foreground": round(foreground / total, 4) if total else 0.0,
-            "background": "#%02x%02x%02x" % tuple(background)}
-
-
 class Fixture:
     """A private library, cache, config and PATH: this test reads and writes
     nothing of the machine it runs on."""
@@ -163,17 +130,29 @@ class Fixture:
             (self.root / child).mkdir(mode=0o700, parents=True)
         self.sizes = {}
         for i in range(IMAGES):
-            # A distinct size per picture: the preview's dimensions line then
-            # names which picture the selection is on.
-            size = (240 + i * 8, 160 + i * 4)
-            (self.library / f"fixture-{i:03d}.png").write_bytes(png(i, *size))
+            # Distinct picture sizes exercise fitting throughout navigation.
+            size = ((360, 240), (240, 360), (480, 160))[i % 3]
+            (self.library / f"fixture-{i:03d}.png").write_bytes(picture.png(i, *size, texture=True))
             self.sizes[i] = size
+        # A real 24-megapixel JPEG exercises the decode/resize path users hit.
+        large = self.root / "large.png"
+        large.write_bytes(picture.png(20, 6000, 4000, texture=True))
+        subprocess.run(["convert", str(large), "-quality", "92", str(self.library / "large.jpg")],
+                       check=True, timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.sizes[20] = (6000, 4000)
+        # Only the existing download transport is replaced; theme get, saving,
+        # decoding, layout and the real kitten renderer all run unchanged.
+        curl = self.root / "bin/curl"
+        curl.write_text('#!/bin/sh\nset -eu\nout=\nwhile [ "$#" -gt 0 ]; do\n'
+                        '  if [ "$1" = -o ]; then shift; out=$1; fi\n  shift\ndone\n'
+                        '[ -n "$out" ]\ncp "$THEME_WALLPAPER_DIR/large.jpg" "$out"\n')
+        curl.chmod(0o500)
         stub = self.root / "bin/wallpaper"
         stub.write_text('#!/bin/sh\n[ "$#" -eq 1 ] && [ "$1" = get ] || exit 64\n'
                         f'printf "%s\\n" "{self.library}/fixture-000.png"\n')
         stub.chmod(0o500)
         self.env = {
-            "PATH": f"{kitty_bin}:{self.root / 'bin'}:/usr/bin:/bin",
+            "PATH": f"{self.root / 'bin'}:{kitty_bin}:/usr/bin:/bin",
             "HOME": str(self.root), "LANG": "C", "LC_ALL": "C", "TZ": "UTC",
             "THEME_WALLPAPER_DIR": str(self.library), "THEME_CACHE_DIR": str(self.root / "cache"),
             "CONFIG_DIR": str(self.root / "config"),
@@ -195,7 +174,7 @@ class Session:
     """A running Kitty with `theme browse` inside it, driven over its own
     private socket and read back with `kitten @ get-text`."""
 
-    def __init__(self, args, fixture, output):
+    def __init__(self, args, fixture, output, command=None):
         self.kitty, self.output, self.fixture = Path(args.kitty), output, fixture
         self.kitten = self.kitty.parent / "kitten"
         if not self.kitten.is_file():
@@ -203,7 +182,8 @@ class Session:
         self.socket = fixture.root / "kitty.sock"
         self.log = (output / "kitty.log").open("wb")
         argv = [str(self.kitty), "--config", "NONE",
-                "-o", "allow_remote_control=yes", "-o", "font_size=11",
+                "-o", "allow_remote_control=socket-only", "-o", "font_size=11",
+                "-o", "background=#000000", "-o", "foreground=#ffffff",
                 "-o", "placement_strategy=top-left", "-o", "window_padding_width=0",
                 "-o", "hide_window_decorations=yes", "-o", "confirm_os_window_close=0",
                 # macOS keeps the app alive with no windows by default, which
@@ -217,7 +197,14 @@ class Session:
         # capture and the cell grid share one origin on both platforms.
         argv += ["-o", f"initial_window_width={WINDOW[0]}",
                  "-o", f"initial_window_height={WINDOW[1]}"]
-        argv += ["--", str(args.theme), "browse", "--all", "--page-size", str(PAGE_SIZE)]
+        if command is None:
+            argv += ["--", str(args.theme), "browse", "--all", "--page-size", str(PAGE_SIZE)]
+        else:
+            # Hold only this test window after a one-shot command, preserving
+            # its exit status and visible frame for the controller.
+            argv += ["--", "/bin/sh", "-c",
+                     '\"$@\"; result=$?; printf "\\nTHEME_E2E_DONE=%s\\n" "$result"; read answer',
+                     "theme-e2e", str(args.theme), *command]
         self.argv = argv
         self.process = subprocess.Popen(argv, env=fixture.env, stdin=subprocess.DEVNULL,
                                         stdout=self.log, stderr=self.log)
@@ -357,32 +344,62 @@ def sheet_cards(screen, top):
     return re.findall(r"(\d+)\s+(fixture-\d{3}\.png)", row)
 
 
-def drawn_band(session, name, top, columns, lines):
-    """Capture the window until the thumbnail band holds pictures, or the
-    wait runs out. Transmitting an image and drawing it are not the same
-    instant: a hosted runner on software GL had the sheet's text on screen
-    with the pictures not yet painted, so one capture can race the paint. A
-    sheet that never draws them still fails at the deadline, which is the
-    whole point of the assertion, and the last capture is the one kept.
-    """
+def drawn_images(session, name, screen, top, bottom, expected, palette=None):
+    """Retry actual pixel matching until GL paints; keep every final result."""
     attempts, deadline = 0, time.monotonic() + ASSERT_WAIT
     while True:
         attempts += 1
         shot = session.screenshot(name)
         capture = shot.read_bytes()
-        # The cell grid comes from the capture's own size over the grid kitty
-        # reports, so a Retina capture needs no special case; only the rows
-        # this band needs are decoded.
         size = struct.unpack(">II", capture[16:24])
-        cell = {"width": size[0] // columns, "height": size[1] // lines}
-        image = decode_png(capture, max_rows=(top + THUMBNAIL_ROWS) * cell["height"] + 1)
-        band = band_colours(image, top * cell["height"], (top + THUMBNAIL_ROWS) * cell["height"])
-        drawn = band["colours"] >= 64 and band["foreground"] >= 0.05
+        cell = (size[0] // session.geometry["columns"], size[1] // session.geometry["lines"])
+        boxes = picture.rectangles(screen, top, bottom, cell)
+        image = decode_png(capture, max_rows=max(bottom, palette[0] + 1 if palette else 0) * cell[1])
+        matches = [picture.match(image, box, number, session.fixture.sizes[number])
+                   for box, number in zip(boxes, expected)]
+        palette_ok = palette is None or picture.swatches(image, *palette, cell)
+        drawn = bool(expected) and len(boxes) == len(expected) and all(item["ok"] for item in matches) and palette_ok
         if drawn or time.monotonic() >= deadline:
-            return {"file": shot.name, "width": image["width"], "height": image["height"],
-                    "decoded_rows": image["rows"], "cell": cell, "captures": attempts,
-                    "band_rows": [top, top + THUMBNAIL_ROWS], "thumbnails": band, "drawn": drawn}
+            return {"file": shot.name, "cell": cell, "captures": attempts,
+                    "boxes": boxes, "expected": expected, "matches": matches,
+                    "palette_drawn": palette_ok, "drawn": drawn}
         time.sleep(POLL)
+
+
+def selected_capture(session, name, screen, expected):
+    rows = screen.splitlines()
+    title = max(i for i, row in enumerate(rows) if re.fullmatch(r"\d+ fixture-\d{3}\.png", row))
+    top = title
+    while top and PLACEHOLDER in rows[top - 1]:
+        top -= 1
+    session.dump(name, screen)
+    palette_row = max(i for i, row in enumerate(rows) if row.strip() == "COLORSCHEME") + 1
+    palette = palette_for(session, expected[1])
+    capture = drawn_images(session, name, screen, top, title, [int(expected[1][8:11])],
+                           (palette_row, 0, palette))
+    capture["minimal"] = clean_preview("\n".join(rows[top:]), " ".join(expected))
+    return capture
+
+
+def palette_for(session, filename):
+    result = subprocess.run([session.fixture.env["THEME"], "preview", str(session.fixture.library / filename)],
+                            env=session.fixture.env, capture_output=True, check=True, timeout=30)
+    return [tuple(map(int, rgb)) for rgb in
+            re.findall(rb"\x1b\[48;2;(\d+);(\d+);(\d+)m", result.stdout)]
+
+
+def clean_preview(screen, title, saved=False):
+    rows = []
+    for row in screen.splitlines():
+        if PLACEHOLDER in row and all(c == PLACEHOLDER or c.isspace() or
+                                     picture.unicodedata.category(c) in ("Mn", "Me") for c in row):
+            continue
+        if row.strip() and row.strip() not in (PROMPT, "THEME_E2E_DONE=0"):
+            rows.append(" ".join(row.split()))
+    expected = [title, "COLORSCHEME"]
+    if saved:
+        expected.insert(0, "theme: saved download.jpg (6000x4000)")
+    return rows == expected
 
 
 def last_page(screen):
@@ -415,7 +432,7 @@ def main():
     version = subprocess.run([str(kitty), "--version"], stdout=subprocess.PIPE,
                              timeout=60).stdout.decode(errors="replace").strip()
     summary = {"kitty": version, "platform": platform.platform(), "theme": str(theme),
-               "images": IMAGES, "page_size": PAGE_SIZE, "assertions": []}
+               "sha256": hashlib.sha256(theme.read_bytes()).hexdigest(), "images": IMAGES, "page_size": PAGE_SIZE, "assertions": []}
     passed = True
 
     def check(name, ok, detail=""):
@@ -465,17 +482,13 @@ def main():
                         if PLACEHOLDER in row)
             check("every thumbnail row asks the terminal for an image",
                   asked == THUMBNAIL_ROWS, f"{asked}/{THUMBNAIL_ROWS} rows with image cells")
-            capture = drawn_band(session, "sheet", top, columns, lines)
-            summary["capture"] = capture
-            band = capture["thumbnails"]
-            check("thumbnail rows are pictures, not empty cells", capture["drawn"],
-                  f"{band['colours']} distinct colours, {band['foreground'] * 100:.1f}% "
-                  f"non-background (background {band['background']}), cell "
-                  f"{capture['cell']['width']}x{capture['cell']['height']}px, "
-                  f"{capture['captures']} capture(s)")
             cards = sheet_cards(screen, top)
-            check("the sheet names its cards", len(cards) >= 2,
-                  " · ".join(f"{n} {name}" for n, name in cards[:3]) or "no title row found")
+            check("the sheet names its cards", len(cards) >= 2, repr(cards))
+            capture = drawn_images(session, "sheet", screen, top, top + THUMBNAIL_ROWS,
+                                   [int(card[1][8:11]) for card in cards])
+            summary["capture"] = capture
+            check("sheet paints the named pictures at their source aspect ratios", capture["drawn"],
+                  json.dumps(capture["matches"]))
 
         # The keys a person presses, in the order a person presses them. Which
         # picture the queue starts on is the library's business, not this
@@ -486,9 +499,14 @@ def main():
         first, second = cards[0], cards[1]
         session.send(b"\x1b[C")
         try:
-            session.wait_until("Right previews the sheet's first card",
+            screen = session.wait_until("Right previews the sheet's first card",
                                lambda s: settled(s) and last_title(s) == first)
             check("Right previews the sheet's first card", True, f"title {' '.join(first)}")
+            capture = selected_capture(session, "selected-first", screen, first)
+            summary["selected_capture"] = capture
+            check("selected preview paints the first picture", capture["drawn"], json.dumps(capture["matches"]))
+            # Inspect only the latest frame, not earlier browser sheets.
+            check("selected preview is picture, name and colorscheme", capture["minimal"])
         except Failure as error:
             check("Right previews the sheet's first card", False, str(error).splitlines()[0])
 
@@ -511,12 +529,13 @@ def main():
                 turned = query_row(screen)
                 if turned is None:
                     raise Failure("the turned page printed no header to measure from")
-                capture = drawn_band(session, "page-change", turned + 1, columns, lines)
+                top = turned + 1
+                next_cards = sheet_cards(screen, top)
+                capture = drawn_images(session, "page-change", screen, top, top + THUMBNAIL_ROWS,
+                                       [int(card[1][8:11]) for card in next_cards])
                 summary["page_change_capture"] = capture
-                band = capture["thumbnails"]
-                check("the page that was turned to is pictures too", capture["drawn"],
-                      f"{band['colours']} distinct colours, {band['foreground'] * 100:.1f}% "
-                      f"non-background, {capture['captures']} capture(s)")
+                check("page change paints the newly named pictures", capture["drawn"],
+                      json.dumps(capture["matches"]))
 
         for keys, name, want in [(b"n\n", "n steps to the second card", second),
                                  (b"p\n", "p steps back to the first", first)]:
@@ -525,6 +544,10 @@ def main():
                 screen = session.wait_until(f"{name} ({want})",
                                             lambda s: settled(s) and last_title(s) == want)
                 check(name, True, f"title {' '.join(last_title(screen))}")
+                capture = selected_capture(session, name.split()[0], screen, want)
+                summary[name.split()[0] + "_capture"] = capture
+                check(name + " paints the correct picture", capture["drawn"], json.dumps(capture["matches"]))
+                check(name + " has only name and colorscheme text", capture["minimal"])
             except Failure as error:
                 check(name, False, str(error).splitlines()[0])
 
@@ -550,7 +573,30 @@ def main():
         check("q ends the session", session.ended(),
               f"kitty exited {session.process.returncode}" if session.process.poll() is not None
               else "no windows left" if session.ended() else "the browser is still running")
-    except Failure as error:
+        session.close()
+        session = None
+        for command in (["preview", "large.jpg"], ["get", "https://img.invalid/download.jpg"]):
+            name = command[0]
+            child = output / name
+            child.mkdir()
+            session = Session(args, fixture, child, command)
+            screen = session.wait_until(name + " completes", lambda s: "THEME_E2E_DONE=" in s)
+            session.dump(name, screen)
+            check(name + " exits successfully", "THEME_E2E_DONE=0" in screen)
+            stem = "large" if name == "preview" else "download"
+            check(name + " has minimal output", clean_preview(screen, "TITLE " + stem, saved=name == "get"))
+            palette_row = max(i for i, row in enumerate(screen.splitlines()) if row.strip() == "COLORSCHEME") + 1
+            capture = drawn_images(session, name, screen, 0, session.geometry["lines"], [20],
+                                   (palette_row, 2, palette_for(session, stem + ".jpg")))
+            summary[name + "_capture"] = capture
+            check(name + " paints the 6000x4000 JPEG", capture["drawn"], json.dumps(capture["matches"]))
+            if name == "get":
+                check("get saved the downloaded bytes", (fixture.library / "download.jpg").read_bytes()
+                      == (fixture.library / "large.jpg").read_bytes())
+            check(name + " applies no palette", not (fixture.root / "cache/wal").exists())
+            session.close()
+            session = None
+    except (Failure, OSError, subprocess.SubprocessError) as error:
         check("driver completed", False, str(error).splitlines()[0])
         summary["failure"] = str(error)
     finally:
