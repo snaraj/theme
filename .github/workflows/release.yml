@@ -1,7 +1,7 @@
 name: release
 
 # Standalone release chain: a release is an immutable v*.*.* tag on main,
-# published after successful CI with binaries, packages and checksums.
+# published after successful CI with prepared binaries, packages and checksums.
 # A dispatch on main uses the same source and CI proof. Other branch
 # dispatches build and install without publishing.
 
@@ -81,17 +81,17 @@ jobs:
           echo "$why" | tee -a "$GITHUB_STEP_SUMMARY"
 
   build:
+    name: build-${{ matrix.target }}
     needs: slot
-    # A dispatch off main is still the pre-tag proof; an already-published
-    # version on main stops at slot.
-    if: needs.slot.outputs.publish == 'true' || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main')
+    # Build once before review; main promotes the digest-pinned bytes unchanged.
+    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
     strategy:
       matrix:
         include:
           - target: aarch64-apple-darwin
             runner: macos-latest
           - target: x86_64-apple-darwin
-            runner: macos-latest
+            runner: macos-15-intel
           # The Linux legs build on the OLDEST image still offered, never
           # the newest: a glibc symbol version is a floor the binary
           # inherits from its build host, and 24.04 stamped an unflagged
@@ -106,13 +106,28 @@ jobs:
             deb: arm64
             rpm: aarch64
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ github.workspace }}/../theme-source
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.slot.outputs.source_sha }}
           persist-credentials: false
+      - name: Isolate compilation from generated release metadata and Git history
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir "$GITHUB_WORKSPACE/../theme-source"
+          git archive HEAD | tar --exclude=Formula/theme.rb --exclude=.github/release-preparation.json -xf - -C "$GITHUB_WORKSPACE/../theme-source"
+          if git -C "$GITHUB_WORKSPACE/../theme-source" rev-parse --show-toplevel >/dev/null 2>&1; then
+            echo "::error::exported source can still discover Git history"; exit 1
+          fi
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
+      - if: runner.os == 'macOS'
+        run: sh tests/portable-smoke.sh "$PWD/target/${{ matrix.target }}/release/theme"
       - run: tar -C target/${{ matrix.target }}/release -czf theme-${{ matrix.target }}.tar.gz theme
       # Distro packages beside the tarball, built by the runner's OWN distro
       # tools — nothing third-party sits in the packaging path. Their names
@@ -163,10 +178,11 @@ jobs:
         with:
           name: theme-${{ matrix.target }}
           path: |
-            theme-${{ matrix.target }}.tar.gz
-            theme_*.deb
-            theme-*.rpm
+            ${{ github.workspace }}/../theme-source/theme-${{ matrix.target }}.tar.gz
+            ${{ github.workspace }}/../theme-source/theme_*.deb
+            ${{ github.workspace }}/../theme-source/theme-*.rpm
           if-no-files-found: error
+          retention-days: 90
 
   # Nothing ships that has not been installed and run. The packages go in
   # through the real package managers — offline, artifact mounted
@@ -175,6 +191,7 @@ jobs:
   # in the release path, so each is pinned by manifest-list digest with the
   # tag it was resolved from beside it.
   smoke:
+    name: smoke-${{ matrix.target }}
     needs: [slot, build]
     permissions:
       contents: read
@@ -214,25 +231,31 @@ jobs:
           box ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc sh -c "$deb" # ubuntu:22.04
           box fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80 sh -c "$rpm" # fedora:latest
 
-  # Only source authorized against protected main and successful CI reaches
-  # this job. Build and smoke consume that exact source before tag creation.
+  # Exact-main CI remains the publication authority. The preparation receipt
+  # additionally proves matching source and the reviewed binary/package hashes.
   publish:
     if: needs.slot.outputs.publish == 'true'
-    needs: [slot, build, smoke]
+    needs: slot
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     env:
       TAG: v${{ needs.slot.outputs.version }}
       SOURCE_SHA: ${{ needs.slot.outputs.source_sha }}
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          merge-multiple: true
+          ref: ${{ needs.slot.outputs.source_sha }}
+          persist-credentials: false
+      - name: Verify the prepared source, containers, payloads and Homebrew pins
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -B .github/scripts/prepared_release.py verify --output prepared
       # Tarball names stay version-free: `releases/latest/download/<name>`
       # needs a stable name. One checksum file over EVERY asset — the deb
       # and the rpm carry no signature, so this over TLS is their integrity.
-      - run: sha256sum theme-*.tar.gz theme_*.deb theme-*.rpm > SHA256SUMS
+      - run: cd prepared && sha256sum --check SHA256SUMS
       # Resume-safe: a rerun after a failed release step finds its own tag
       # on this commit and goes on — the commits API peels the tag, so a
       # signed annotated tag pushed by hand counts too. A version that has
@@ -266,6 +289,7 @@ jobs:
           shipped && nothing
           echo "::error::$TAG already exists on a diverged commit: bump the version in Cargo.toml"; exit 1
       - if: steps.tag.outputs.go == 'true'
+        working-directory: prepared
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
@@ -273,8 +297,8 @@ jobs:
           --verify-tag --title "theme $TAG"
           --generate-notes theme-*.tar.gz theme_*.deb theme-*.rpm SHA256SUMS
 
-  # Runs after publication AND on a formula-only merge. A released binary
-  # with a stale tap is an incomplete delivery and keeps this workflow red.
+  # Verify public bytes and the same-merge formula after publication. An
+  # already-released version is rechecked without rebuilding or republishing.
   distribution:
     needs: [slot, publish]
     if: >-

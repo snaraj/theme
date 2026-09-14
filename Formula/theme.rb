@@ -4,9 +4,8 @@
 # install is: `brew trust --formula snaraj/theme/theme`, tap, then install.
 # Trust only this formula.
 #
-# Keep all four URLs and digests bound to a published release. CI downloads
-# every package, verifies SHA256SUMS, and installs/tests this formula.
-# The release workflow stays red until the matching formula change merges.
+# Keep all four URLs and digests bound to reviewed preparation artifacts.
+# Main publishes those same bytes after CI passes, then verifies installation.
 class Theme < Formula
   desc "Wallpaper and terminal palette driven by one command"
   homepage "https://github.com/snaraj/theme"

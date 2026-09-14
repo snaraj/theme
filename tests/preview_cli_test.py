@@ -115,6 +115,35 @@ sys.stdout.write("\\r\\x1b_Ga=T,c=1,r=1,m=1;YWJj\\x1b\\\\"
                     browser.require(b"\x1b_G" not in raw and "\U0010eeee".encode() not in raw,
                                     "an unavailable preview leaked graphics")
         browser.require(not (root / "cache").exists(), "dry-run navigation wrote a cache")
+        # Applying into disposable config/cache directories with NO helpers on
+        # PATH cannot change a desktop or contact a terminal. The Kitty marker
+        # also keeps OSC away from the process's controlling tty.
+        empty = root / "empty-bin"
+        empty.mkdir()
+        config = root / "config/kitty.conf"
+        apply_env = env | {"PATH": str(empty), "THEME_CONTRAST": "7"}
+        apply_env.pop("THEME_NO_APPLY", None)
+        apply_env.pop("THEME_OPACITY", None)
+        # Force a dark region too, retaining a known valid PNG fixture.
+        import struct
+        import zlib
+        def chunk(kind, data):
+            return struct.pack("!I", len(data)) + kind + data + struct.pack("!I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        picture.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack("!2I5B", 2, 1, 8, 2, 0, 0, 0))
+                            + chunk(b"IDAT", zlib.compress(b"\0\0\0\0\xff\xff\xff")) + chunk(b"IEND", b""))
+        for opacity in ("0.1", "1.0"):
+            config.write_text(f"background_opacity {opacity}\nmap ctrl+x no_op\n")
+            original = config.read_bytes()
+            result = subprocess.run([str(binary), "set", str(picture)], env=apply_env, capture_output=True, timeout=15)
+            browser.require(result.returncode == 0, result.stderr)
+            browser.require((result.stdout + result.stderr).count(b"text may be hard to read") == (1 if opacity == "0.1" else 0),
+                            "apply omitted, repeated, or unnecessarily emitted its opacity warning")
+            browser.require(config.read_bytes() == original, "apply changed opacity or key bindings")
+            palette = (root / "cache/colors-kitty.conf").read_text()
+            browser.require("background_opacity" not in palette, "palette changes opacity through its include")
+            preview = subprocess.run([str(binary), "preview", str(picture)], env=apply_env, capture_output=True, timeout=15)
+            browser.require(preview.returncode == 0 and b"text may be hard to read" not in preview.stdout + preview.stderr,
+                            "preview printed apply advice")
     print("preview CLI: PASS (pipes, notices, stream packets, geometry, reuse, invalidation, terminal restore)")
 
 

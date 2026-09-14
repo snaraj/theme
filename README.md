@@ -25,8 +25,10 @@ brew tap snaraj/theme https://github.com/snaraj/theme
 brew install snaraj/theme/theme
 ```
 
-The release workflow verifies published downloads and tests the Homebrew
-installation. Delivery stays incomplete until the matching formula PR merges.
+The release PR includes Homebrew's version and verified binary checksums.
+After that one merge, CI publishes the prepared binaries and packages and
+tests the Homebrew installation. Wait for the release workflow to finish
+before upgrading; the new download URLs are unavailable during publication.
 
 **Debian, Ubuntu, Fedora, RHEL** — take the `.deb` or `.rpm` for your
 architecture from the
@@ -189,6 +191,13 @@ worst text contrast and the fraction meeting `THEME_CONTRAST`. `--min-contrast 4
 the terminal; cropping, another window behind it, live opacity changes, and
 unsampled detail can affect the real result. It is not an every-pixel guarantee.
 
+Colour adjustment considers the range from dark to bright image regions and
+the solid terminal background, rather than just the image average. Very low
+opacity can make readable text impossible across that range. In that case,
+`theme set` warns that opacity needs increasing and keeps a coloured palette
+suited to the solid background. Theme does not change your opacity settings.
+Applications that choose their own RGB colours can also bypass the palette.
+
 Search facts are cached by configured roots, timezone files, image identity,
 and palette. Changed images or timezone files refresh automatically. Opening
 an unfiltered browser does not prepare the entire metadata index. The first index pass still
@@ -281,6 +290,23 @@ including `results.json`, all stdout/stderr captures, and `rendering.html` with
 the actual ANSI colors. These are headless renderings; native Kitty graphics,
 font shaping, desktop application, and network latency are outside this gate.
 The existing release workflow requires every exact-source CI job to pass.
+
+Release preparation happens before merge. After the branch's source is final,
+dispatch `release.yml` on that branch. It builds the four prebuilt targets and
+installs both Linux package formats. Record the successful run with:
+
+```sh
+python3 -I -B .github/scripts/prepared_release.py record --run RUN_ID \
+  --tag vX.Y.Z --output .github/release-preparation.json
+```
+
+Update `Formula/theme.rb` to that version and the four recorded tarball hashes,
+then commit both files in the release PR. CI verifies the source, producing
+run, artifact containers and all eight payload hashes; Homebrew installs the
+prepared download from its cache before public URLs exist. Main publishes
+those exact bytes after its own CI succeeds. Preparation expires after 90 days;
+missing artifacts or any source change beyond those two generated files requires
+a new preparation, never an unchecked rebuild using old checksums.
 
 Reproduce from a feature branch (the output directory must be empty):
 

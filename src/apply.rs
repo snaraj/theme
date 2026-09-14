@@ -363,9 +363,11 @@ pub fn set_palette(cfg: &Config, img: &Path) {
     };
     // The identical preparation path powers preview and apply. Metrics remain
     // sampled estimates; emitters accept only the contrast-adjusted palette.
-    let pal = crate::presentation::from_palette(cfg, pal)
-        .unwrap_or_else(|error| die(&error))
-        .palette;
+    let prepared = crate::presentation::from_palette(cfg, pal).unwrap_or_else(|error| die(&error));
+    if let Some(warning) = prepared.readability_warning() {
+        note(&warning);
+    }
+    let pal = prepared.palette;
 
     if fs::create_dir_all(&cfg.cache_dir).is_err() {
         die(&format!("cannot write {}", cfg.cache_dir.display()));

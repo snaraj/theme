@@ -3,7 +3,7 @@
 
 use crate::apply::{derive_options, schemes_dir};
 use crate::config::Config;
-use pigment::{Floored, ImageProfile, Palette, Readability, effective_background};
+use pigment::{Floored, ImageProfile, Palette, Readability};
 use std::borrow::Cow;
 use std::fs;
 use std::io::Read;
@@ -16,6 +16,7 @@ pub struct PreparedPalette {
     pub contrast: f64,
     pub readability: Readability,
     pub profile: ImageProfile,
+    pub opacity_limited: bool,
 }
 
 /// A configured/explicit opacity, not a query of running Kitty windows.
@@ -197,8 +198,7 @@ pub fn prepare(palette: Palette, opacity: f64, contrast: f64) -> Result<Prepared
         return Err("contrast must be a finite ratio from 1 to 21".into());
     }
     let profile = palette.profile.clone();
-    let background = effective_background(palette.background(), opacity, palette.wallpaper_average);
-    let palette = palette.floor_against(background, contrast);
+    let (palette, achievable) = palette.floor_for_image(opacity, contrast);
     let readability = profile.readability(&palette, opacity, contrast);
     Ok(PreparedPalette {
         palette,
@@ -206,6 +206,7 @@ pub fn prepare(palette: Palette, opacity: f64, contrast: f64) -> Result<Prepared
         contrast,
         readability,
         profile,
+        opacity_limited: !achievable,
     })
 }
 
@@ -239,6 +240,14 @@ pub fn cached_preview(cfg: &Config, path: &Path) -> Result<PreparedPalette, Stri
 }
 
 impl PreparedPalette {
+    /// Apply-only advice. Preview stays limited to the picture, name and colors.
+    pub fn readability_warning(&self) -> Option<String> {
+        (self.opacity_limited && self.opacity < 1.0).then(|| format!(
+            "text may be hard to read over this wallpaper at {:.0}% opacity; increase your terminal's background opacity and apply the theme again",
+            self.opacity * 100.0,
+        ))
+    }
+
     /// All 16 final colors, wrapped to fit without changing terminal colors.
     /// Width is bounded; every line ends in SGR reset, with no OSC or cursor moves.
     pub fn swatches(&self, width: usize) -> String {
@@ -518,6 +527,36 @@ mod tests {
                 assert!(line.ends_with("\x1b[0m"));
             }
         }
+        fs::remove_dir_all(&cfg.kitty_dir).unwrap();
+    }
+
+    #[test]
+    fn transparency_advice_is_plain_and_separate_from_preview() {
+        let cfg = config("contrast-warning");
+        let path = cfg.kitty_dir.join("mixed.png");
+        image::save_buffer(
+            &path,
+            &[0, 0, 0, 255, 255, 255],
+            2,
+            1,
+            image::ColorType::Rgb8,
+        )
+        .unwrap();
+        let raw = pigment::derive(&path, &derive_options()).unwrap();
+        let low = prepare(raw.clone(), 0.1, 7.0).unwrap();
+        assert!(low.opacity_limited);
+        let warning = low.readability_warning().unwrap();
+        assert!(warning.contains("10% opacity"));
+        assert!(warning.contains("increase your terminal's background opacity"));
+        assert!(!warning.contains("sample") && !warning.contains('\x1b'));
+        assert!(!low.swatches(80).contains("opacity"));
+        assert!(
+            prepare(raw, 1.0, 7.0)
+                .unwrap()
+                .readability_warning()
+                .is_none()
+        );
+        assert!(!cfg.current.exists());
         fs::remove_dir_all(&cfg.kitty_dir).unwrap();
     }
 }
