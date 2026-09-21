@@ -80,6 +80,23 @@ def verify_formula(formula, tag, digests):
     require(routes == expected, "Homebrew routes or checksums differ from the verified release")
 
 
+def collect(tag, formula, directory):
+    """Retain the verified bytes for installation as well as digest checks."""
+    names = asset_names(tag) | {"SHA256SUMS"}
+    release = api("releases/tags/" + tag)
+    inventory(release, tag)
+    command = ["gh", "release", "download", tag, "--repo", REPOSITORY, "--dir", str(directory)]
+    for name in sorted(names):
+        command += ["--pattern", name]
+    subprocess.run(command, check=True, timeout=180)
+    digests = verify_bytes(release, tag, directory)
+    require(snapshot(api("releases/tags/" + tag)) == snapshot(release), "release changed during verification")
+    print(f"PUBLISHED_ASSETS=PASS tag={tag} assets={len(names)}", flush=True)
+    verify_formula(formula, tag, digests)
+    print(f"HOMEBREW_DISTRIBUTION=PASS tag={tag}")
+    return digests
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag", help="require this published release; defaults to the formula version")
@@ -88,19 +105,8 @@ def main():
     versions = re.findall(r'^  version "([0-9]+\.[0-9]+\.[0-9]+)"$', formula, re.M)
     require(len(versions) == 1, "formula must declare exactly one stable version")
     tag = args.tag or "v" + versions[0]
-    names = asset_names(tag) | {"SHA256SUMS"}
-    release = api("releases/tags/" + tag)
-    inventory(release, tag)
     with tempfile.TemporaryDirectory(prefix="theme-distribution-") as directory:
-        command = ["gh", "release", "download", tag, "--repo", REPOSITORY, "--dir", directory]
-        for name in sorted(names):
-            command += ["--pattern", name]
-        subprocess.run(command, check=True, timeout=180)
-        digests = verify_bytes(release, tag, Path(directory))
-    require(snapshot(api("releases/tags/" + tag)) == snapshot(release), "release changed during verification")
-    print(f"PUBLISHED_ASSETS=PASS tag={tag} assets={len(names)}", flush=True)
-    verify_formula(formula, tag, digests)
-    print(f"HOMEBREW_DISTRIBUTION=PASS tag={tag}")
+        collect(tag, formula, Path(directory))
 
 
 if __name__ == "__main__":

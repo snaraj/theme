@@ -43,6 +43,7 @@ mod apply;
 mod browse;
 mod browse_state;
 mod commands;
+mod completions;
 mod config;
 mod help;
 mod imaging;
@@ -82,6 +83,10 @@ pub fn timestamp() -> String {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().is_some_and(|arg| arg == "completions") {
+        completions::run(&argv[1..]);
+        return;
+    }
     let cfg = Config::from_env();
     // `update` owns its argv end-to-end: its grammar parses the RAW argv,
     // BEFORE the global flag pass could swallow anything, and --version

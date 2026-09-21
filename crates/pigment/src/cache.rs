@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bumped whenever derivation or the cache format changes meaning.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const MAX_CACHE_BYTES: u64 = 8192;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -413,7 +413,7 @@ mod tests {
         let lines: Vec<_> = valid.lines().collect();
         let file = dir.join(format!("{}.palette", cache_key(&img, &opts).unwrap()));
         let mut invalid = vec![
-            valid.replace("pigment2", "pigment1"),
+            valid.replace("pigment3", "pigment2"),
             valid.clone() + "extra\n",
         ];
         for (line, replacement) in [

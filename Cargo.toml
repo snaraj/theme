@@ -14,7 +14,7 @@ unsafe_code = "deny"
 
 [package]
 name = "theme"
-version = "0.3.11"
+version = "0.3.12"
 description = "One command that owns the desktop wallpaper and the terminal palette together"
 edition.workspace = true
 license.workspace = true
@@ -24,6 +24,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+httpdate = "1.0.3"
 # Terminal cells and grapheme boundaries keep wide glyphs and icons inside panes.
 unicode-width = { version = "0.2.2", default-features = false }
 unicode-segmentation = "1.13.3"

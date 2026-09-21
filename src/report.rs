@@ -3,7 +3,7 @@
 //! provenance labels decided by the parsed hostname, and the kitty-graphics
 //! inline previews.
 
-use crate::apply::{derive_options, schemes_dir, wallpaper_get, wallpaper_to_print};
+use crate::apply::{derive_options, schemes_dir, wallpaper_to_print};
 use crate::config::Config;
 use crate::imaging::img_size;
 use crate::library::{all_images, resolve_local};
@@ -780,7 +780,10 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
         verbose.then(|| wall_sources(&rows.iter().map(PathBuf::as_path).collect::<Vec<_>>()));
 
     let cols = columns();
-    let pv_ok = verbose && in_kitty() && have("kitten");
+    let stacked = cols < if verbose { 87 } else { 44 };
+    let indent = if cols < 16 { "" } else { "  " };
+    let continuation = if cols < 16 { "" } else { "    " };
+    let pv_ok = verbose && !stacked && cols >= 96 && in_kitty() && have("kitten");
     let pvw = if pv_ok { 9 } else { 0 };
     let mut namew = if verbose {
         cols.saturating_sub(71 + pvw)
@@ -790,7 +793,11 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
     namew = namew.clamp(16, 44);
 
     println!("wallpapers\n");
-    if verbose {
+    if stacked {
+        for line in crate::ui::wrap_prefixed("TITLE / COLORSCHEME", cols, indent, indent) {
+            println!("{line}");
+        }
+    } else if verbose {
         let pic = if pv_ok {
             format!("{:<9}", "PICTURE")
         } else {
@@ -805,9 +812,51 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
     }
     for f in &rows {
         let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stacked {
+            let width = cols.saturating_sub(2).max(1);
+            println!("  {}", truncate_ellipsis(&display_text(stem), width));
+            let colors = schemes.get(f).map(Vec::as_slice).unwrap_or_default();
+            if colors.is_empty() {
+                println!("  -");
+            } else {
+                for row in colors.chunks((width / 3).clamp(1, 8)) {
+                    println!("  {}", swatch_cells(row).0);
+                }
+            }
+            if verbose {
+                let source = sources
+                    .as_ref()
+                    .and_then(|s| s.get(f))
+                    .map(String::as_str)
+                    .unwrap_or("-");
+                for (label, value) in [
+                    ("SOURCE", source.to_string()),
+                    (
+                        "FORMAT",
+                        f.extension()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ),
+                    ("SIZE", human_bytes(f)),
+                    ("ADDED", added_date(f)),
+                ] {
+                    for line in crate::ui::wrap_prefixed(
+                        &format!("{label}  {}", display_text(&value)),
+                        cols,
+                        indent,
+                        continuation,
+                    ) {
+                        println!("{line}");
+                    }
+                }
+            }
+            println!();
+            continue;
+        }
         // Sanitize BEFORE measuring: a stripped byte must not count against
         // the column, and the row must never carry disk bytes as protocol.
-        let name = truncate_ellipsis(&display_text(stem), namew);
+        let name = crate::ui::pad_cells(&display_text(stem), namew);
         let mut pv2 = String::new();
         if pv_ok {
             match render_preview(f, PREVIEW_COLS, 2) {
@@ -823,7 +872,7 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
                 None => print!("  {:<7}", ""),
             }
         }
-        print!("  {name:<namew$}  ");
+        print!("  {name}  ");
         let (sw, n) = schemes.get(f).map(|s| swatch_cells(s)).unwrap_or_default();
         print!("{sw}");
         if n == 0 {
@@ -839,11 +888,7 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
                 .and_then(|sources| sources.get(f))
                 .cloned()
                 .unwrap_or_else(|| "-".into());
-            let src = if src.chars().count() > 10 {
-                truncate_ellipsis(&src, 10)
-            } else {
-                src
-            };
+            let src = crate::ui::pad_cells(&src, 10);
             let fmt = f.extension().and_then(|e| e.to_str()).unwrap_or("");
             print!(
                 "  {src:<10}  {fmt:<6}  {:<7}  {}",
@@ -857,7 +902,15 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
         }
     }
     if shown < total {
-        println!("\n  newest {shown} of {total} — more: theme list -n <count>, or --all");
+        println!();
+        for line in crate::ui::wrap_prefixed(
+            &format!("newest {shown} of {total} — more: theme list -n <count>, or --all"),
+            cols,
+            indent,
+            indent,
+        ) {
+            println!("{line}");
+        }
     }
 }
 
@@ -882,9 +935,9 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>, verbose: bool) {
                 cfg.wallpaper_dirs_display
             ))
         }),
-        // The helper, ALWAYS: this path opens the file it is handed and
-        // renders its bytes, and the desktop record is print-only.
-        None => match wallpaper_get().filter(|p| p.is_file()) {
+        None => match wallpaper_to_print(cfg, crate::apply::desktop_cache(cfg).as_ref())
+            .filter(|p| p.is_file())
+        {
             Some(p) => p,
             None => die("no current wallpaper to preview — name one: theme preview <wallpaper>"),
         },
@@ -1051,7 +1104,7 @@ pub fn cmd_status(cfg: &Config) {
     };
     let current = fs::read_to_string(cfg.cache_dir.join("wal")).unwrap_or_default();
     let current = current.trim().to_string();
-    let desk = wallpaper_to_print(cfg)
+    let desk = wallpaper_to_print(cfg, crate::apply::desktop_cache(cfg).as_ref())
         .map(|p| p.display().to_string())
         .unwrap_or_default();
 

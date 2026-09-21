@@ -1,6 +1,5 @@
-//! One registry of scratch files, swept on EVERY exit path — `die` calls
-//! [`cleanup`] before the process exits, so a failure mid-transform leaves
-//! nothing behind (the shell's one top-level EXIT trap, made explicit).
+//! One registry of scratch files, swept explicitly at normal command exit,
+//! `die`, and broken stdout. Panics and external termination do not sweep it.
 //!
 //! Every scratch file lives inside a per-process directory created 0700 and
 //! owned by us. Because no other user can traverse or create entries in it,
@@ -75,4 +74,32 @@ pub fn cleanup() {
     {
         let _ = std::fs::remove_dir_all(&d);
     }
+}
+
+#[test]
+fn paused_transaction_modules_cannot_print_or_exit() {
+    for source in [include_str!("spaces.rs"), include_str!("save.rs")] {
+        for line in source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+        {
+            // These modules may not acquire the process-exiting stdout shim.
+            for forbidden in [
+                "print!",
+                "println!",
+                "print !",
+                "println !",
+                "ui::out(",
+                "process::exit(",
+            ] {
+                assert!(
+                    !line.contains(forbidden),
+                    "printing/exit in a transaction module: {line}"
+                );
+            }
+        }
+    }
+    // spaces itself must propagate errors so Paused::drop/finish always runs.
+    let spaces = include_str!("spaces.rs");
+    assert!(!spaces.contains("ui::die(") && !spaces.contains("ui::note("));
 }

@@ -71,9 +71,8 @@ const ASSET_HOSTS: [&str; 3] = [
     "release-assets.githubusercontent.com",
     "objects.githubusercontent.com",
 ];
-/// SHA256SUMS is a few lines and the redirect answer's body is empty;
-/// both are capped far below the binary cap so a wrong asset cannot
-/// masquerade as either.
+/// SHA256SUMS is a few lines, capped far below the binary download.
+/// The latest-release HEAD request has no body and does not use this cap.
 const SUMS_CAP: u64 = 64 * 1024;
 
 /// The published release targets. A platform outside this set gets an
@@ -254,6 +253,43 @@ fn route(exe: &Path) -> bool {
     true
 }
 
+/// Inspect executable identities only: a shadowed PATH program is never run.
+fn other_installs(running: &Path, path: &std::ffi::OsStr) -> Vec<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(active) = std::fs::metadata(running) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::from([(active.dev(), active.ino())]);
+    std::env::split_paths(path)
+        .filter_map(|dir| {
+            let candidate = dir.join("theme");
+            let md = std::fs::metadata(&candidate).ok()?;
+            if !md.is_file() || md.mode() & 0o111 == 0 || !seen.insert((md.dev(), md.ino())) {
+                return None;
+            }
+            std::fs::canonicalize(candidate).ok()
+        })
+        .collect()
+}
+
+fn note_other_installs(running: &Path) {
+    let Some(path) = std::env::var_os("PATH") else {
+        return;
+    };
+    let others = other_installs(running, &path);
+    if !others.is_empty() {
+        let names = others
+            .iter()
+            .map(|p| display_text(&p.display().to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "theme: multiple installations: running {}; other PATH copies: {names}. They update separately; remove the unwanted copy or adjust PATH.",
+            display_text(&running.display().to_string())
+        );
+    }
+}
+
 pub fn cmd_update(cfg: &Config, want: &str, binary: Option<&str>) {
     // WHO OWNS THESE BYTES comes first — before the platform check, before
     // the transport check, before any network. A keg or a distro package
@@ -266,6 +302,7 @@ pub fn cmd_update(cfg: &Config, want: &str, binary: Option<&str>) {
     let running = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .unwrap_or_else(|_| die("cannot resolve the running binary's path"));
+    note_other_installs(&running);
     if binary.is_none() && route(&running) {
         return;
     }
@@ -328,9 +365,7 @@ pub fn cmd_update(cfg: &Config, want: &str, binary: Option<&str>) {
     let sums_file = scratch::new();
     fetch_asset(&asset_url(&tag, "SHA256SUMS"), &sums_file, SUMS_CAP).unwrap_or_else(|e| {
         die(&match e {
-            Fetch::Missing => {
-                format!("no release {tag} — see https://github.com/snaraj/theme/releases")
-            }
+            Fetch::Missing { cdn } => missing_sums(&tag, want_tag.is_some(), cdn),
             Fetch::Failed(why) => format!("SHA256SUMS download failed: {why}"),
         })
     });
@@ -346,8 +381,11 @@ pub fn cmd_update(cfg: &Config, want: &str, binary: Option<&str>) {
             // The check the API's asset list used to give for free: if
             // SHA256SUMS names a tarball the release does not publish, the
             // built URL 404s and nothing is installed.
-            Fetch::Missing => {
+            Fetch::Missing { cdn: false } => {
                 format!("SHA256SUMS names '{asset_name}' but release {tag} has no such asset")
+            }
+            Fetch::Missing { cdn: true } => {
+                format!("GitHub's asset CDN has no '{asset_name}' for release {tag}")
             }
             Fetch::Failed(why) => format!("release download failed: {why}"),
         })
@@ -428,8 +466,11 @@ fn latest_tag_remote(budget: &str) -> Result<String, String> {
             LATEST_URL,
         ],
     )
-    .ok_or_else(|| format!("could not reach github.com within {budget}s"))?;
-    let head = String::from_utf8_lossy(&head);
+    .map_err(|_| "could not start or read trusted curl".to_string())?;
+    if !head.status.success() {
+        return Err(curl_failure(head.status.code(), budget));
+    }
+    let head = String::from_utf8_lossy(&head.stdout);
     let (status, loc) = parse_head(&head);
     match status {
         301 | 302 | 303 | 307 | 308 => loc
@@ -442,6 +483,37 @@ fn latest_tag_remote(budget: &str) -> Result<String, String> {
             "github.com answered HTTP {s} for {LATEST_URL}{}",
             limit_note(&head)
         )),
+    }
+}
+
+fn curl_failure(code: Option<i32>, budget: &str) -> String {
+    let why = match code {
+        Some(5) => "proxy name lookup failed",
+        Some(6) => "name lookup failed",
+        Some(7) => "connection failed",
+        Some(28) => return format!("github.com request timed out after {budget}s (curl exit 28)"),
+        Some(35 | 51 | 58 | 59 | 60 | 64 | 66 | 77 | 80 | 82 | 83 | 90 | 91) => {
+            "TLS verification or handshake failed"
+        }
+        Some(1) => "protocol refused",
+        Some(63) => "download exceeded its byte cap",
+        _ => "transfer failed",
+    };
+    match code {
+        Some(code) => format!("github.com request {why} (curl exit {code})"),
+        None => "github.com request interrupted (curl terminated by a signal)".into(),
+    }
+}
+
+fn missing_sums(tag: &str, explicit: bool, cdn: bool) -> String {
+    if cdn {
+        format!("GitHub's asset CDN has no SHA256SUMS for release {tag}")
+    } else if explicit {
+        format!(
+            "no release {tag}, or it publishes no SHA256SUMS — see https://github.com/snaraj/theme/releases"
+        )
+    } else {
+        format!("release {tag} publishes no SHA256SUMS")
     }
 }
 
@@ -466,18 +538,28 @@ fn asset_url(tag: &str, name: &str) -> String {
 }
 
 /// The rate-limit half of a refusal, when the answer carries one: GitHub
-/// says so with `Retry-After` (seconds) or with a spent
+/// says so with `Retry-After` (seconds or HTTP-date) or with a spent
 /// `x-ratelimit-remaining` beside an epoch `x-ratelimit-reset`. Empty
 /// otherwise, so the caller's message stays one sentence either way.
 fn limit_note(head: &str) -> String {
+    limit_note_at(head, std::time::SystemTime::now())
+}
+
+fn limit_note_at(head: &str, now: std::time::SystemTime) -> String {
     let mins = |secs: u64| secs.div_ceil(60).max(1);
-    if let Some(after) = header_value(head, "retry-after").and_then(|v| v.parse::<u64>().ok()) {
+    if let Some(after) = header_value(head, "retry-after").and_then(|v| {
+        v.parse::<u64>().ok().or_else(|| {
+            httpdate::parse_http_date(&v)
+                .ok()
+                .map(|date| date.duration_since(now).unwrap_or_default().as_secs())
+        })
+    }) {
         return format!(" — rate limited, retry in {} min", mins(after));
     }
     if header_value(head, "x-ratelimit-remaining").as_deref() != Some("0") {
         return String::new();
     }
-    let now = std::time::SystemTime::now()
+    let now = now
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
@@ -493,7 +575,7 @@ fn limit_note(head: &str) -> String {
 /// The kill switch, read in one place: THEME_NO_UPDATE_CHECK non-empty
 /// disables every update check — the footer's, and `theme version`'s
 /// closing line with it.
-fn check_off() -> bool {
+pub(crate) fn check_off() -> bool {
     std::env::var("THEME_NO_UPDATE_CHECK")
         .map(|v| !v.is_empty())
         .unwrap_or(false)
@@ -507,13 +589,11 @@ fn check_off() -> bool {
 /// (THEME_NO_UPDATE_CHECK, non-empty) is set, custody refuses the cache
 /// dir, or the cache is stale or malformed. Only an explicit version/update
 /// request refreshes it. Reads retain [`check_dir`]'s fail-closed custody.
-pub fn latest_tag(cfg: &Config) -> Option<(u64, u64, u64)> {
+fn latest_tag_at(dirfd: Option<&rustix::fd::OwnedFd>) -> Option<(u64, u64, u64)> {
     if check_off() {
         return None;
     }
-    // Custody first: a refused directory gets no read and no answer.
-    let dirfd = check_dir(cfg)?;
-    let (fresh, cached) = read_check(&dirfd);
+    let (fresh, cached) = read_check(dirfd?);
     if !fresh {
         return None;
     }
@@ -525,12 +605,11 @@ pub fn latest_tag(cfg: &Config) -> Option<(u64, u64, u64)> {
 /// The deliberate question's answer (`theme version`, issue #42): the
 /// cache's freshness is never consulted and one bounded request runs on
 /// EVERY call — under a 2s cap because the caller is waiting. A usable tag
-/// stamps the shared cache so the footer benefits; a failed one stamps NOTHING —
-/// overwriting a good stamp with a failure would silence the footer for a
-/// whole TTL window.
+/// stamps the shared cache so the footer benefits, including a shape-valid
+/// nonnumeric tag. A transport or invalid-redirect failure preserves the stamp.
 ///
 /// Err carries the REASON, so the closing line can name it instead of
-/// leaving the reader to guess which of five things happened (#51). Two
+/// leaving the reader to guess what happened (#51). Two
 /// of those reasons never make a request, and say so. The kill switch is
 /// the CALLER's check — `cmd_version` returns before reaching here.
 fn latest_live(cfg: &Config) -> Result<(u64, u64, u64), String> {
@@ -552,9 +631,9 @@ fn current_v3() -> Option<(u64, u64, u64)> {
 /// and printed ONLY when the latest is strictly newer than this build. Both
 /// printed values are RECONSTRUCTED from the parsed numbers, so a
 /// remote-supplied string or URL is never echoed.
-pub fn maybe_note(cfg: &Config) {
+pub fn maybe_note(dirfd: Option<&rustix::fd::OwnedFd>) {
     let Some(cur) = current_v3() else { return };
-    if let Some((a, b, c)) = latest_tag(cfg).filter(|l| *l > cur) {
+    if let Some((a, b, c)) = latest_tag_at(dirfd).filter(|l| *l > cur) {
         println!(
             "\nupdate to the latest theme version: v{a}.{b}.{c} -> https://github.com/snaraj/theme/releases/tag/v{a}.{b}.{c}"
         );
@@ -594,6 +673,9 @@ pub fn cmd_version_plain() {
 /// echoed from the answer.
 pub fn cmd_version(cfg: &Config) {
     print_facts();
+    if let Ok(running) = std::env::current_exe().and_then(std::fs::canonicalize) {
+        note_other_installs(&running);
+    }
     // Insurance, not the mechanism: std's stdout is a LineWriter, so the
     // three lines are already out at the newline for every sink this has —
     // the explicit flush is what keeps that true if the sink ever stops
@@ -890,7 +972,8 @@ fn pick_from_sums(sums: &str, target: &str) -> Result<(String, String), String> 
 /// case-insensitively, empty values not counting. The status line is
 /// skipped so a request line can never be read as a header.
 fn header_value(hdr: &str, name: &str) -> Option<String> {
-    hdr.lines()
+    response_head(hdr)
+        .lines()
         .skip(1)
         .map(|l| l.trim_end_matches('\r'))
         .find_map(|l| {
@@ -900,15 +983,38 @@ fn header_value(hdr: &str, name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// First line + Location of a `curl -D` header dump.
+/// Ignore informational responses; headers belong only to the final block.
+fn response_head(mut hdr: &str) -> &str {
+    loop {
+        let status = head_status(hdr);
+        let (block, rest) = hdr
+            .split_once("\r\n\r\n")
+            .or_else(|| hdr.split_once("\n\n"))
+            .unwrap_or((hdr, ""));
+        if !(100..200).contains(&status) {
+            return block;
+        }
+        hdr = rest;
+    }
+}
+
+fn head_status(hdr: &str) -> u16 {
+    let mut fields = hdr.lines().next().unwrap_or("").split_whitespace();
+    if !matches!(
+        fields.next(),
+        Some("HTTP/1.0" | "HTTP/1.1" | "HTTP/2" | "HTTP/3")
+    ) {
+        return 0;
+    }
+    fields.next().and_then(|c| c.parse().ok()).unwrap_or(0)
+}
+
+/// Final status + Location of a `curl -D` header dump.
 fn parse_head(hdr: &str) -> (u16, Option<String>) {
-    let status = hdr
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(0);
-    (status, header_value(hdr, "location"))
+    (
+        head_status(response_head(hdr)),
+        header_value(hdr, "location"),
+    )
 }
 
 fn hop_host_ok(url: &str) -> bool {
@@ -923,7 +1029,7 @@ fn hop_host_ok(url: &str) -> bool {
 /// transport complaint — and it is the check the API's asset list used to
 /// give for free, now made by the server that owns the file.
 enum Fetch {
-    Missing,
+    Missing { cdn: bool },
     Failed(String),
 }
 
@@ -976,11 +1082,16 @@ fn fetch_asset(url: &str, dest: &Path, cap: u64) -> Result<(), Fetch> {
         .arg(dest)
         .arg("--url")
         .arg(&here);
-        let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+        let status = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         let head = std::fs::read_to_string(&hdr).unwrap_or_default();
         scratch::done(&hdr);
-        if !ok {
-            return Err("transfer failed or exceeded its byte cap".into());
+        match status {
+            Ok(status) if status.success() => {}
+            Ok(status) => return Err(Fetch::Failed(curl_failure(status.code(), "300"))),
+            Err(_) => return Err("could not start or read trusted curl".into()),
         }
         let (status, loc) = parse_head(&head);
         match status {
@@ -988,7 +1099,7 @@ fn fetch_asset(url: &str, dest: &Path, cap: u64) -> Result<(), Fetch> {
             301 | 302 | 303 | 307 | 308 => {
                 here = loc.ok_or("redirect without a Location")?;
             }
-            404 => return Err(Fetch::Missing),
+            404 => return Err(Fetch::Missing { cdn: here != url }),
             s => return Err(Fetch::Failed(format!("unexpected HTTP status {s}"))),
         }
     }
@@ -1430,6 +1541,115 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
             header_value("retry-after: 9\r\nx: y\r\n", "retry-after"),
             None
         );
+    }
+
+    #[test]
+    fn informational_headers_cannot_supply_the_final_location_or_limit() {
+        let head = "HTTP/1.1 103 Early Hints\r\nLocation: https://evil.invalid/\r\nRetry-After: 9\r\n\r\nHTTP/2 302\r\nLocation: https://github.com/snaraj/theme/releases/tag/v0.3.12\r\n\r\n";
+        assert_eq!(
+            parse_head(head),
+            (302, Some(format!("{TAG_PREFIX}v0.3.12")))
+        );
+        assert_eq!(limit_note(head), "");
+        assert_eq!(parse_head("HTTP/2 103\r\n\r\n"), (0, None));
+        assert_eq!(
+            parse_head("HTTP/1.1 100 Continue\n\nHTTP/2 200\n\n"),
+            (200, None)
+        );
+        assert_eq!(
+            header_value("HTTP/2 200\r\n\r\nLocation: evil", "location"),
+            None
+        );
+    }
+
+    #[test]
+    fn retry_dates_are_parsed_without_echoing_remote_text() {
+        let now = httpdate::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        for date in [
+            "Sun, 06 Nov 1994 08:51:37 GMT",
+            "Sunday, 06-Nov-94 08:51:37 GMT",
+            "Sun Nov  6 08:51:37 1994",
+        ] {
+            assert_eq!(
+                limit_note_at(&format!("HTTP/2 429\r\nRetry-After: {date}\r\n"), now),
+                " — rate limited, retry in 2 min"
+            );
+        }
+        assert_eq!(
+            limit_note_at("HTTP/2 429\r\nRetry-After: hostile\x1b]52;x\x07\r\n", now),
+            ""
+        );
+        assert_eq!(
+            limit_note_at(
+                "HTTP/2 429\r\nRetry-After: Sun, 06 Nov 1994 08:49:00 GMT\r\n",
+                now
+            ),
+            " — rate limited, retry in 1 min"
+        );
+    }
+
+    #[test]
+    fn transport_and_missing_asset_reasons_are_distinct() {
+        for (code, why) in [
+            (5, "proxy name"),
+            (6, "name lookup"),
+            (7, "connection"),
+            (28, "timed out after 2s"),
+            (35, "TLS"),
+            (60, "TLS"),
+            (1, "protocol"),
+            (63, "byte cap"),
+            (99, "transfer failed"),
+        ] {
+            let reason = curl_failure(Some(code), "2");
+            assert!(reason.contains(why), "{reason}");
+            assert!(reason.contains(&format!("curl exit {code}")));
+            assert_eq!(reason.contains("timed out"), code == 28);
+        }
+        assert!(curl_failure(None, "2").contains("signal"));
+        assert_eq!(
+            missing_sums("v1.2.3", false, false),
+            "release v1.2.3 publishes no SHA256SUMS"
+        );
+        assert!(missing_sums("v1.2.3", true, false).starts_with("no release v1.2.3, or"));
+        assert!(missing_sums("v1.2.3", true, true).starts_with("GitHub's asset CDN"));
+    }
+
+    #[test]
+    fn duplicate_install_scan_deduplicates_inodes_and_never_runs_candidates() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempdir();
+        for name in ["active", "alias", "hardlink", "other", "not-executable"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        let active = root.join("active/theme");
+        std::fs::write(&active, "unused").unwrap();
+        std::fs::set_permissions(&active, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&active, root.join("alias/theme")).unwrap();
+        std::fs::hard_link(&active, root.join("hardlink/theme")).unwrap();
+        let other = root.join("other/theme");
+        std::fs::write(&other, "#!/bin/sh\nexit 42\n").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(root.join("not-executable/theme"), "unused").unwrap();
+        let aliases = std::env::join_paths([
+            root.join("active"),
+            root.join("alias"),
+            root.join("hardlink"),
+        ])
+        .unwrap();
+        assert!(other_installs(&active, &aliases).is_empty());
+        let paths = std::env::join_paths([
+            root.join("active"),
+            root.join("other"),
+            root.join("other"),
+            root.join("not-executable"),
+        ])
+        .unwrap();
+        assert_eq!(
+            other_installs(&active, &paths),
+            [std::fs::canonicalize(other).unwrap()]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

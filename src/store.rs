@@ -101,11 +101,16 @@ pub fn read(cfg: &Config, name: &str, max: usize) -> Option<Vec<u8>> {
         return None;
     }
     let dir = crate::update::check_dir(cfg)?;
-    if !private_directory(&dir) {
+    read_at(&dir, name, max)
+}
+
+/// The caller retains the audited directory for multiple records in one screen.
+pub(crate) fn read_at(dir: &rustix::fd::OwnedFd, name: &str, max: usize) -> Option<Vec<u8>> {
+    if !valid_name(name) || !private_directory(dir) {
         return None;
     }
     let fd = rustix::fs::openat(
-        &dir,
+        dir,
         name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
@@ -143,7 +148,14 @@ pub fn write(cfg: &Config, name: &str, bytes: &[u8]) -> Result<(), String> {
         return Ok(());
     }
     let dir = crate::update::check_dir(cfg).ok_or("cache directory is not private and trusted")?;
-    if !private_directory(&dir) {
+    write_at(&dir, name, bytes)
+}
+
+pub(crate) fn write_at(dir: &rustix::fd::OwnedFd, name: &str, bytes: &[u8]) -> Result<(), String> {
+    if !valid_name(name) || bytes.len() > LIMIT {
+        return Err("invalid or oversized cache record".into());
+    }
+    if !private_directory(dir) {
         return Err("cache directory ACL privacy could not be established".into());
     }
     let temp = format!(
@@ -152,13 +164,13 @@ pub fn write(cfg: &Config, name: &str, bytes: &[u8]) -> Result<(), String> {
         SERIAL.fetch_add(1, Ordering::Relaxed)
     );
     let fd = rustix::fs::openat(
-        &dir,
+        dir,
         temp.as_str(),
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
         Mode::from_raw_mode(0o600),
     )
     .map_err(|e| format!("cannot create cache record: {e}"))?;
-    finish_write(&dir, &temp, name, fd, bytes)
+    finish_write(dir, &temp, name, fd, bytes)
 }
 
 fn finish_write(
@@ -274,6 +286,37 @@ mod tests {
         write(&cfg, "history-v1", b"replacement").unwrap();
         assert_eq!(read(&cfg, "history-v1", 100).unwrap(), b"replacement");
         assert_eq!(std::fs::read_dir(&cfg.cache_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn audited_descriptor_rejects_hostile_record_replacements() {
+        let fixture = Fixture::new();
+        let cfg = fixture.config();
+        write(&cfg, "desktop", b"private").unwrap();
+        let dir = crate::update::check_dir(&cfg).unwrap();
+        let path = cfg.cache_dir.join("desktop");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_at(&dir, "desktop", 100).is_none());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let target = fixture.0.join("outside-record");
+        std::fs::rename(&path, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read_at(&dir, "desktop", 100).is_none());
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(read_at(&dir, "desktop", 100).is_none());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_at(&dir, "desktop", 100).is_none());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&target, &path).unwrap();
+        assert_eq!(read_at(&dir, "desktop", 100).unwrap(), b"private");
     }
 
     #[cfg(target_os = "macos")]

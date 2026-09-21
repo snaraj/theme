@@ -489,22 +489,25 @@ pub fn trusted_curl() -> Option<std::path::PathBuf> {
 /// (CURL_CA_BUNDLE/SSL_CERT_*) and loader (LD_*/DYLD_*) channels too.
 /// `--noproxy '*'` stays on the argv as belt-and-braces; callers put `-q`
 /// FIRST in `args` — no curlrc.
-pub fn curl_config_trusted(program: &Path, config: &str, args: &[&str]) -> Option<Vec<u8>> {
+pub fn curl_config_trusted(
+    program: &Path,
+    config: &str,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
     let mut child = crate::save::trusted_spawn(program)
         .args(args)
         .args(["--noproxy", "*"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    child.stdin.take()?.write_all(config.as_bytes()).ok()?;
-    let out = child.wait_with_output().ok()?;
+        .spawn()?;
+    // Reap even when the child stops reading its config early.
+    let sent = child.stdin.take().unwrap().write_all(config.as_bytes());
+    let out = child.wait_with_output()?;
     if out.status.success() {
-        Some(out.stdout)
-    } else {
-        None
+        sent?;
     }
+    Ok(out)
 }
 
 /// `file -b --mime-type` — content-typed, never extension-typed.
@@ -533,7 +536,9 @@ mod tests {
     #[test]
     fn the_trusted_config_spawn_is_env_cleared() {
         assert!(std::env::var_os("PATH").is_some());
-        let body = curl_config_trusted(Path::new("/bin/sh"), "", &["-c", "/usr/bin/env"]).unwrap();
+        let body = curl_config_trusted(Path::new("/bin/sh"), "", &["-c", "/usr/bin/env"])
+            .unwrap()
+            .stdout;
         // The shell manufactures PWD/SHLVL/_ for itself; NOTHING inherited
         // may appear beside them — not PATH, not HOME, not a hostile var.
         for line in String::from_utf8_lossy(&body).lines() {

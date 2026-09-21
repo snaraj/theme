@@ -40,7 +40,8 @@ sys.stdout.write("\\r\\x1b_Ga=T,c=1,r=1,m=1;YWJj\\x1b\\\\"
 ''')
         helper.chmod(0o700)
         calls = root / "calls.jsonl"
-        env = os.environ | {"PATH": f"{root / 'bin'}:/usr/bin:/bin", "CONFIG_DIR": str(root / "config"),
+        env = os.environ | {"PATH": f"{root / 'bin'}:/usr/bin:/bin", "HOME": str(root), "KITTY_LISTEN_ON": "",
+            "CONFIG_DIR": str(root / "config"),
             "KITTY_CONFIG_DIRECTORY": str(root / "config"), "THEME_CACHE_DIR": str(root / "cache"),
             "THEME_WALLPAPER_DIR": str(root / "library"), "THEME_NO_APPLY": "1",
             "THEME_NO_UPDATE_CHECK": "1", "THEME_OPACITY": "0.8", "THEME_CONTRAST": "4.5",
@@ -135,7 +136,8 @@ sys.stdout.write("\\r\\x1b_Ga=T,c=1,r=1,m=1;YWJj\\x1b\\\\"
             config.write_text(f"background_opacity {opacity}\nmap ctrl+x no_op\n")
             original = config.read_bytes()
             result = subprocess.run([str(binary), "set", str(picture)], env=apply_env, capture_output=True, timeout=15)
-            browser.require(result.returncode == 0, result.stderr)
+            browser.require(result.returncode == 1 and b"Kitty colors were not applied" in result.stderr,
+                            "a missing Kitty socket silently succeeded: " + repr(result.stderr))
             browser.require((result.stdout + result.stderr).count(b"text may be hard to read") == (1 if opacity == "0.1" else 0),
                             "apply omitted, repeated, or unnecessarily emitted its opacity warning")
             browser.require(config.read_bytes() == original, "apply changed opacity or key bindings")
@@ -144,6 +146,18 @@ sys.stdout.write("\\r\\x1b_Ga=T,c=1,r=1,m=1;YWJj\\x1b\\\\"
             preview = subprocess.run([str(binary), "preview", str(picture)], env=apply_env, capture_output=True, timeout=15)
             browser.require(preview.returncode == 0 and b"text may be hard to read" not in preview.stdout + preview.stderr,
                             "preview printed apply advice")
+        wallpaper = root / "bin/wallpaper"
+        wallpaper.write_text(f'#!/bin/sh\nprintf "%s\\n" "$2" > "{root}/desktop-called"\n')
+        wallpaper.chmod(0o700)
+        broken = root / "library/broken.png"
+        broken.write_bytes(b"invalid image")
+        blocked = root / "blocked-cache"
+        blocked.write_text("not a directory")
+        for image, overrides in [(broken, {}), (picture, {"THEME_CACHE_DIR": str(blocked)})]:
+            result = subprocess.run([str(binary), "set", str(image)],
+                env=apply_env | {"PATH": env["PATH"]} | overrides, capture_output=True, timeout=15)
+            browser.require(result.returncode == 1 and not (root / "desktop-called").exists(),
+                            "failed palette preparation changed the desktop")
     print("preview CLI: PASS (pipes, notices, stream packets, geometry, reuse, invalidation, terminal restore)")
 
 
