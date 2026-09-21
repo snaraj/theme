@@ -242,7 +242,11 @@ class Preparation(unittest.TestCase):
         calls = []
         def git(command, **kwargs):
             calls.append(command)
-            if command[:2] == ["git", "fetch"]:
+            self.assertEqual(kwargs["cwd"] == prepared.ROOT, not published)
+            if command == ["git", "init", "--bare"]:
+                self.assertTrue(published)
+                data = b""
+            elif command[:2] == ["git", "fetch"]:
                 self.assertTrue(published)
                 self.assertEqual(command[2:], ["--no-tags", "--depth=1", "https://github.com/snaraj/theme.git", source])
                 if bad == "fetch":

@@ -1,4 +1,4 @@
-//! Image loading: one decode, one pass, one in-memory downsample.
+//! Image loading: one decode, exact channel bounds, one in-memory downsample.
 
 use crate::{Error, ImageProfile, Rgb};
 use std::path::Path;
@@ -49,7 +49,7 @@ pub(crate) fn load(path: &Path) -> Result<Decoded, Error> {
     let cells = (gw * gh) as usize;
     let mut pixels = Vec::with_capacity(cells);
     let mut total = [0u64; 3];
-    let mut bounds = [[255u8; 3], [0u8; 3]];
+    let bounds = channel_bounds(rgb.as_raw());
     // Sum one rectangle at a time: each pixel contributes three additions,
     // without updating a cell count and the whole-image totals per pixel.
     // Ceil boundaries exactly invert floor(x * grid_width / image_width).
@@ -62,30 +62,23 @@ pub(crate) fn load(path: &Path) -> Result<Decoded, Error> {
         let bottom = ((by + 1) * h).div_ceil(gh) as usize;
         for edge in edges.windows(2) {
             let (left, right) = (edge[0], edge[1]);
-            let mut sum = [0u64; 3];
-            let (mut low, mut high) = ([255u8; 3], [0u8; 3]);
+            // MAX_EDGE / GRID caps each cell at 128x128 pixels; u32 sums
+            // are exact and avoid wide arithmetic in the full-resolution pass.
+            let mut sum = [0u32; 3];
             for y in top..bottom {
                 for pixel in rgb.as_raw()[y * stride + left..y * stride + right]
                     .as_chunks::<3>()
                     .0
                 {
-                    sum[0] += u64::from(pixel[0]);
-                    sum[1] += u64::from(pixel[1]);
-                    sum[2] += u64::from(pixel[2]);
-                    for channel in 0..3 {
-                        low[channel] = low[channel].min(pixel[channel]);
-                        high[channel] = high[channel].max(pixel[channel]);
-                    }
+                    sum[0] += u32::from(pixel[0]);
+                    sum[1] += u32::from(pixel[1]);
+                    sum[2] += u32::from(pixel[2]);
                 }
             }
             for (all, part) in total.iter_mut().zip(sum) {
-                *all += part;
+                *all += u64::from(part);
             }
-            for channel in 0..3 {
-                bounds[0][channel] = bounds[0][channel].min(low[channel]);
-                bounds[1][channel] = bounds[1][channel].max(high[channel]);
-            }
-            let count = ((right - left) / 3 * (bottom - top)) as u64;
+            let count = ((right - left) / 3 * (bottom - top)) as u32;
             let [r, g, b] = sum.map(|v| ((v + count / 2) / count) as u8);
             pixels.push(Rgb { r, g, b });
         }
@@ -95,7 +88,7 @@ pub(crate) fn load(path: &Path) -> Result<Decoded, Error> {
     let avg = |t: u64| ((t + n / 2) / n) as u8;
     Ok(Decoded {
         profile: ImageProfile::from_grid(w, h, gw as usize, gh as usize, &pixels)
-            .with_bounds(bounds.map(|[r, g, b]| Rgb { r, g, b }))
+            .with_bounds(bounds)
             .unwrap(),
         pixels,
         average: Rgb {
@@ -106,10 +99,70 @@ pub(crate) fn load(path: &Path) -> Result<Decoded, Error> {
     })
 }
 
+// Independent lanes let the compiler reduce full RGB blocks with portable
+// vector instructions; the tail and final lane fold retain exact channel bounds.
+fn channel_bounds(rgb: &[u8]) -> [Rgb; 2] {
+    let (blocks, tail) = rgb.as_chunks::<48>();
+    let (mut low, mut high) = ([255u8; 48], [0u8; 48]);
+    for block in blocks {
+        for ((lo, hi), value) in low.iter_mut().zip(&mut high).zip(block) {
+            *lo = (*lo).min(*value);
+            *hi = (*hi).max(*value);
+        }
+    }
+    let mut bounds = [[255u8; 3], [0u8; 3]];
+    let [lower, upper] = &mut bounds;
+    for (channel, (minimum, maximum)) in lower.iter_mut().zip(upper).enumerate() {
+        *minimum = low
+            .iter()
+            .skip(channel)
+            .step_by(3)
+            .chain(tail.iter().skip(channel).step_by(3))
+            .copied()
+            .min()
+            .unwrap();
+        *maximum = high
+            .iter()
+            .skip(channel)
+            .step_by(3)
+            .chain(tail.iter().skip(channel).step_by(3))
+            .copied()
+            .max()
+            .unwrap();
+    }
+    bounds.map(|[r, g, b]| Rgb { r, g, b })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn channel_bounds_preserve_sparse_extrema_in_every_lane_and_tail() {
+        for count in 2..=65 {
+            for position in 0..count {
+                let mut pixels = vec![[40, 100, 180]; count];
+                pixels[position] = [2, 140, 160];
+                assert_eq!(
+                    channel_bounds(pixels.as_flattened()),
+                    [
+                        Rgb {
+                            r: 2,
+                            g: 100,
+                            b: 160
+                        },
+                        Rgb {
+                            r: 40,
+                            g: 140,
+                            b: 180
+                        },
+                    ],
+                    "count={count} position={position}",
+                );
+            }
+        }
+    }
 
     fn write_png(name: &str, w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 3]) -> PathBuf {
         let mut buf = Vec::with_capacity((w * h * 3) as usize);

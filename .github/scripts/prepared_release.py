@@ -176,28 +176,31 @@ def export_tests(destination, tag, published):
     """After byte verification, bind installed expectations to their source version."""
     require(not destination.exists(), "test destination already exists")
     require(re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag), "invalid test source tag")
-    def git(*args):
-        return subprocess.run(["git", *args], cwd=ROOT, check=True, capture_output=True, timeout=60).stdout
-    if published:
-        require(api("releases/tags/" + tag).get("immutable") is True, "test source release is not immutable")
-        source = api("commits/" + tag).get("sha", "")
-        require(re.fullmatch(r"[0-9a-f]{40}", source), "invalid test source commit")
-        git("fetch", "--no-tags", "--depth=1", "https://github.com/snaraj/theme.git", source)
-        require(api("commits/" + tag).get("sha") == source, "test source tag moved")
-    else:
-        # The caller's verify() already bound the current tree and artifacts.
-        source = git("rev-parse", "HEAD").decode().strip()
-        require(re.fullmatch(r"[0-9a-f]{40}", source), "invalid prepared test source commit")
-    cargo = git("show", source + ":Cargo.toml").decode()
-    require(re.findall(r'^version = "([^"]+)"$', cargo, re.M) == [tag[1:]], "test source version differs")
-    scripts = {}
-    for name in INSTALLED_TESTS:
-        path = "tests/" + name
-        entry = git("ls-tree", "-z", source, "--", path).decode().rstrip("\0")
-        require(re.fullmatch(r"100(?:644|755) blob [0-9a-f]{40}\t" + re.escape(path), entry),
-                "missing or nonregular installed test: " + name)
-        scripts[name] = git("cat-file", "blob", entry.split()[2])
-        require(0 < len(scripts[name]) <= 4 * 1024 * 1024, "invalid installed test size")
+    with tempfile.TemporaryDirectory(prefix="theme-test-source-") as temporary:
+        repository = Path(temporary) if published else ROOT
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=repository, check=True, capture_output=True, timeout=60).stdout
+        if published:
+            git("init", "--bare")
+            require(api("releases/tags/" + tag).get("immutable") is True, "test source release is not immutable")
+            source = api("commits/" + tag).get("sha", "")
+            require(re.fullmatch(r"[0-9a-f]{40}", source), "invalid test source commit")
+            git("fetch", "--no-tags", "--depth=1", "https://github.com/snaraj/theme.git", source)
+            require(api("commits/" + tag).get("sha") == source, "test source tag moved")
+        else:
+            # The caller's verify() already bound the current tree and artifacts.
+            source = git("rev-parse", "HEAD").decode().strip()
+            require(re.fullmatch(r"[0-9a-f]{40}", source), "invalid prepared test source commit")
+        cargo = git("show", source + ":Cargo.toml").decode()
+        require(re.findall(r'^version = "([^"]+)"$', cargo, re.M) == [tag[1:]], "test source version differs")
+        scripts = {}
+        for name in INSTALLED_TESTS:
+            path = "tests/" + name
+            entry = git("ls-tree", "-z", source, "--", path).decode().rstrip("\0")
+            require(re.fullmatch(r"100(?:644|755) blob [0-9a-f]{40}\t" + re.escape(path), entry),
+                    "missing or nonregular installed test: " + name)
+            scripts[name] = git("cat-file", "blob", entry.split()[2])
+            require(0 < len(scripts[name]) <= 4 * 1024 * 1024, "invalid installed test size")
     destination.mkdir(parents=True)
     for name, data in scripts.items():
         (destination / name).write_bytes(data)
