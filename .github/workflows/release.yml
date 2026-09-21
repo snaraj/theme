@@ -331,11 +331,12 @@ jobs:
           python3 -I -B .github/scripts/verify_distribution.py --tag "$TAG"
           brew trust --formula snaraj/theme/theme
           brew tap snaraj/theme "$GITHUB_WORKSPACE"
+          python3 -I -B .github/scripts/prepared_release.py homebrew --tests-output target/release-tests
           brew install snaraj/theme/theme
           brew test snaraj/theme/theme
-          sh tests/portable-smoke.sh "$(brew --prefix)/bin/theme"
-          python3 -I -B tests/browser_cli_test.py "$(brew --prefix)/bin/theme"
-          python3 -I -B tests/mdls_cli_test.py "$(brew --prefix)/bin/theme"
-          python3 -I -B tests/preview_cli_test.py "$(brew --prefix)/bin/theme"
-          python3 -I -B tests/cli_maintenance_test.py "$(brew --prefix)/bin/theme"
+          sh target/release-tests/portable-smoke.sh "$(brew --prefix)/bin/theme"
+          python3 -I -B target/release-tests/browser_cli_test.py "$(brew --prefix)/bin/theme"
+          python3 -I -B target/release-tests/mdls_cli_test.py "$(brew --prefix)/bin/theme"
+          python3 -I -B target/release-tests/preview_cli_test.py "$(brew --prefix)/bin/theme"
+          python3 -I -B target/release-tests/cli_maintenance_test.py "$(brew --prefix)/bin/theme"
           echo "PUBLISHED_DELIVERY=PASS $TAG" >> "$GITHUB_STEP_SUMMARY"

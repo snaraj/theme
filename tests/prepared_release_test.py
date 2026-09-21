@@ -216,14 +216,17 @@ class Preparation(unittest.TestCase):
                      patch.object(prepared.subprocess, "run", side_effect=answers), \
                      patch.dict(prepared.DISTRIBUTION, collect=lambda *args: None), \
                      patch.object(prepared, "verify") as verify, \
-                     patch.object(prepared, "install_tar", return_value=binary) as unpack:
+                     patch.object(prepared, "install_tar", return_value=binary) as unpack, \
+                     patch.object(prepared, "export_tests") as scripts:
                     if version.startswith("version: v1.2.3\n"):
-                        prepared.install(prepared.TARGETS[0], self.directory / "new")
+                        prepared.install(prepared.TARGETS[0], self.directory / "new", self.directory / "tests")
                         self.assertEqual(verify.call_count, int(not published))
                         self.assertEqual(unpack.call_count, 1)
+                        scripts.assert_called_once_with(self.directory / "tests", "v1.2.3", published)
                     else:
                         with self.assertRaisesRegex(ValueError, "installed release version differs"):
-                            prepared.install(prepared.TARGETS[0], self.directory / "new")
+                            prepared.install(prepared.TARGETS[0], self.directory / "new", self.directory / "tests")
+                        scripts.assert_not_called()
         with patch.object(prepared, "ROOT", self.directory), \
              patch.object(prepared.subprocess, "run", return_value=SimpleNamespace(returncode=1, stderr="(HTTP 403)")), \
              patch.object(prepared, "verify") as verify, patch.object(prepared, "install_tar") as unpack:
@@ -231,6 +234,64 @@ class Preparation(unittest.TestCase):
                 prepared.install(prepared.TARGETS[0], self.directory / "new")
             verify.assert_not_called()
             unpack.assert_not_called()
+
+    def export_tests(self, published, bad=None):
+        source = ("a" if published else "b") * 40
+        payload = b"release expectation" if published else b"current expectation"
+        destination = self.directory / "tests"
+        calls = []
+        def git(command, **kwargs):
+            calls.append(command)
+            if command[:2] == ["git", "fetch"]:
+                self.assertTrue(published)
+                self.assertEqual(command[2:], ["--no-tags", "--depth=1", "https://github.com/snaraj/theme.git", source])
+                if bad == "fetch":
+                    raise prepared.subprocess.CalledProcessError(1, command)
+                data = b""
+            elif command == ["git", "rev-parse", "HEAD"]:
+                self.assertFalse(published, "published expectations must never come from HEAD")
+                data = source.encode()
+            elif command == ["git", "show", source + ":Cargo.toml"]:
+                data = b'version = "1.2.2"\n' if bad == "version" else b'version = "1.2.3"\n'
+            elif command[:4] == ["git", "ls-tree", "-z", source]:
+                mode = "120000" if bad == "symlink" else "100644"
+                data = b"" if bad == "missing" else f'{mode} blob {"c" * 40}\t{command[-1]}\0'.encode()
+            elif command == ["git", "cat-file", "blob", "c" * 40]:
+                data = b"x" * (4 * 1024 * 1024 + 1) if bad == "size" else payload
+            else:
+                raise AssertionError(command)
+            return SimpleNamespace(stdout=data)
+        count = 0
+        def api(path):
+            nonlocal count
+            if path == "releases/tags/v1.2.3":
+                return {"immutable": bad != "mutable"}
+            self.assertEqual(path, "commits/v1.2.3")
+            count += 1
+            return {"sha": "d" * 40 if bad == "moved" and count == 2 else source}
+        with patch.object(prepared.subprocess, "run", side_effect=git), patch.object(prepared, "api", side_effect=api):
+            prepared.export_tests(destination, "v1.2.3", published)
+        manifest = prepared.json.loads((destination / "manifest.json").read_text())
+        self.assertEqual(manifest["source_sha"], source)
+        self.assertEqual(set(manifest["scripts"]), set(prepared.INSTALLED_TESTS))
+        self.assertEqual(manifest["published"], published)
+        for name, digest in manifest["scripts"].items():
+            self.assertEqual((destination / name).read_bytes(), payload)
+            self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
+
+    def test_published_expectations_come_from_exact_tag_and_prepared_expectations_from_head(self):
+        self.export_tests(True)
+        prepared.shutil.rmtree(self.directory / "tests")
+        self.export_tests(False)
+
+    def test_installed_expectations_never_fall_back_or_accept_wrong_sources(self):
+        for bad in ("fetch", "version", "missing", "symlink", "size", "mutable", "moved"):
+            with self.subTest(bad=bad), self.assertRaises((ValueError, prepared.subprocess.CalledProcessError)):
+                self.export_tests(True, bad)
+            self.assertFalse((self.directory / "tests").exists())
+        (self.directory / "tests").mkdir()
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            prepared.export_tests(self.directory / "tests", "v1.2.3", True)
 
     def test_workflow_isolates_preparation_and_requires_verification_before_publish(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()

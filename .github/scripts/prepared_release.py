@@ -21,6 +21,9 @@ RECEIPT = ROOT / ".github/release-preparation.json"
 EXCLUDED = {"Formula/theme.rb", ".github/release-preparation.json"}
 REPO_ID = 1353261670
 MAX_FILE = 64 * 1024 * 1024
+INSTALLED_TESTS = ("portable-smoke.sh", "browser_cli_test.py", "mdls_cli_test.py",
+                   "preview_cli_test.py", "cli_maintenance_test.py", "kitty_e2e.py",
+                   "kitty_pixels.py", "kitty_controller.py", "kitty_mutation_test.py")
 
 
 def fingerprint(entries):
@@ -169,7 +172,42 @@ def verify(destination):
     return result
 
 
-def homebrew():
+def export_tests(destination, tag, published):
+    """After byte verification, bind installed expectations to their source version."""
+    require(not destination.exists(), "test destination already exists")
+    require(re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag), "invalid test source tag")
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=ROOT, check=True, capture_output=True, timeout=60).stdout
+    if published:
+        require(api("releases/tags/" + tag).get("immutable") is True, "test source release is not immutable")
+        source = api("commits/" + tag).get("sha", "")
+        require(re.fullmatch(r"[0-9a-f]{40}", source), "invalid test source commit")
+        git("fetch", "--no-tags", "--depth=1", "https://github.com/snaraj/theme.git", source)
+        require(api("commits/" + tag).get("sha") == source, "test source tag moved")
+    else:
+        # The caller's verify() already bound the current tree and artifacts.
+        source = git("rev-parse", "HEAD").decode().strip()
+        require(re.fullmatch(r"[0-9a-f]{40}", source), "invalid prepared test source commit")
+    cargo = git("show", source + ":Cargo.toml").decode()
+    require(re.findall(r'^version = "([^"]+)"$', cargo, re.M) == [tag[1:]], "test source version differs")
+    scripts = {}
+    for name in INSTALLED_TESTS:
+        path = "tests/" + name
+        entry = git("ls-tree", "-z", source, "--", path).decode().rstrip("\0")
+        require(re.fullmatch(r"100(?:644|755) blob [0-9a-f]{40}\t" + re.escape(path), entry),
+                "missing or nonregular installed test: " + name)
+        scripts[name] = git("cat-file", "blob", entry.split()[2])
+        require(0 < len(scripts[name]) <= 4 * 1024 * 1024, "invalid installed test size")
+    destination.mkdir(parents=True)
+    for name, data in scripts.items():
+        (destination / name).write_bytes(data)
+    (destination / "manifest.json").write_text(json.dumps(dict(tag=tag, source_sha=source,
+        published=published, scripts={name: hashlib.sha256(data).hexdigest() for name, data in scripts.items()}),
+        indent=2, sort_keys=True) + "\n")
+    print(f"INSTALLED_TEST_SOURCE=PASS {tag} source={source}")
+
+
+def homebrew(tests_output=None):
     """Published releases use normal URLs; an unpublished version uses verified cache bytes."""
     formula = (ROOT / "Formula/theme.rb").read_text()
     versions = re.findall(r'^  version "([0-9]+\.[0-9]+\.[0-9]+)"$', formula, re.M)
@@ -179,6 +217,8 @@ def homebrew():
                              capture_output=True, text=True, timeout=30)
     if release.returncode == 0:
         subprocess.run(["python3", "-I", "-B", str(ROOT / ".github/scripts/verify_distribution.py")], check=True)
+        if tests_output is not None:
+            export_tests(tests_output, tag, True)
         return
     require("(HTTP 404)" in release.stderr, "cannot determine publication status: " + release.stderr)
     with tempfile.TemporaryDirectory(prefix="theme-homebrew-") as temporary:
@@ -190,6 +230,8 @@ def homebrew():
         require(len(matches) == 1 and cache.is_absolute(), "unexpected Homebrew cache path")
         cache.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(matches[0], cache)
+        if tests_output is not None:
+            export_tests(tests_output, tag, False)
 
 
 def install_tar(archive, destination):
@@ -207,7 +249,7 @@ def install_tar(archive, destination):
     return binary
 
 
-def install(target, destination):
+def install(target, destination, tests_output=None):
     formula = (ROOT / "Formula/theme.rb").read_text()
     versions = re.findall(r'^  version "([0-9]+\.[0-9]+\.[0-9]+)"$', formula, re.M)
     require(len(versions) == 1 and target in TARGETS, "invalid release installation")
@@ -224,6 +266,8 @@ def install(target, destination):
         binary = install_tar(directory / f"theme-{target}.tar.gz", destination)
     version = subprocess.run([str(binary), "-V"], check=True, capture_output=True, text=True).stdout
     require(version.splitlines()[:1] == [f"version: {tag}"], "installed release version differs")
+    if tests_output is not None:
+        export_tests(tests_output, tag, release.returncode == 0)
     print(f"INSTALLED_RELEASE=PASS {tag} binary_sha256={hashlib.sha256(binary.read_bytes()).hexdigest()}")
 
 
@@ -234,12 +278,13 @@ def main():
     parser.add_argument("--tag")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--target", choices=TARGETS)
+    parser.add_argument("--tests-output", type=Path)
     args = parser.parse_args()
     if args.mode == "homebrew":
-        homebrew()
+        homebrew(args.tests_output)
     elif args.mode == "install":
         require(args.target and args.output and not args.output.exists(), "install needs --target and a new --output")
-        install(args.target, args.output.resolve())
+        install(args.target, args.output.resolve(), args.tests_output)
     elif args.mode == "record":
         require(args.run and args.tag and args.output, "record needs --run, --tag and --output")
         with tempfile.TemporaryDirectory(prefix="theme-preparation-") as temporary:

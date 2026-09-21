@@ -189,8 +189,10 @@ dumps and the kitty log are published as `kitty-e2e-<OS>-<architecture>`
 artifacts, pass or fail. macOS CI cannot host that test — the runner has no
 accelerated OpenGL, so Kitty exits before it opens a window — so there the
 keys and unsupported-terminal notices are checked through a real pty. CI tests
-both the current source and verified published or prepared release in Kitty, and the reviewed Homebrew
-installation's commands on macOS. The Linux apply test switches images and
+both the current source and verified published or prepared release in Kitty, and
+the reviewed Homebrew installation's commands on macOS. Installed expectations
+come from that release's immutable tag, or the verified preparation's source;
+the evidence records the test commit and script hashes. The Linux apply test switches images and
 replaces one in place, checks every live and inherited color, and records the
 desktop helper's selected path. Its production socket allows only `set-colors`;
 the test controller holds a separate capability. Dropped graphics or color

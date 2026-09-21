@@ -106,28 +106,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 -I -B .github/scripts/prepared_release.py install \
-            --target x86_64-unknown-linux-gnu --output target/installed/bin
-          sh tests/portable-smoke.sh "$PWD/target/installed/bin/theme"
+            --target x86_64-unknown-linux-gnu --output target/installed/bin --tests-output target/release-tests
+          sh target/release-tests/portable-smoke.sh "$PWD/target/installed/bin/theme"
       - name: Verify installed previews and browser keys in a real Kitty
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
         run: |
-          xvfb-run -a -s "-screen 0 1400x900x24" python3 -I -B tests/kitty_e2e.py \
+          xvfb-run -a -s "-screen 0 1400x900x24" python3 -I -B target/release-tests/kitty_e2e.py \
             --kitty "$RUNNER_TEMP/kitty/bin/kitty" \
-            --theme target/installed/bin/theme --output target/kitty-e2e/installed
+            --theme "$PWD/target/installed/bin/theme" --output target/kitty-e2e/installed
       - name: Prove dropped graphics and colors fail the same terminal oracle
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
         run: |
-          xvfb-run -a -s "-screen 0 1400x900x24" python3 -I -B tests/kitty_mutation_test.py \
+          xvfb-run -a -s "-screen 0 1400x900x24" python3 -I -B target/release-tests/kitty_mutation_test.py \
             --kitty "$RUNNER_TEMP/kitty/bin/kitty" \
-            --theme target/installed/bin/theme --output target/kitty-e2e/mutations
+            --theme "$PWD/target/installed/bin/theme" --output target/kitty-e2e/mutations
       - name: Publish the screenshots, screen dumps and kitty log
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: kitty-e2e-${{ runner.os }}-${{ runner.arch }}
-          path: target/kitty-e2e/
+          path: |
+            target/kitty-e2e/
+            target/release-tests/manifest.json
           if-no-files-found: error
           retention-days: 30
 
@@ -158,13 +160,13 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: '1'
           HOMEBREW_NO_INSTALL_CLEANUP: '1'
         run: |
-          python3 -I -B .github/scripts/prepared_release.py homebrew
+          python3 -I -B .github/scripts/prepared_release.py homebrew --tests-output target/release-tests
           brew install snaraj/theme/theme
           brew test snaraj/theme/theme
-          sh tests/portable-smoke.sh "$(brew --prefix)/bin/theme"
-          python3 -I -B tests/browser_cli_test.py "$(brew --prefix)/bin/theme"
-          python3 -I -B tests/mdls_cli_test.py "$(brew --prefix)/bin/theme"
-          python3 -I -B tests/preview_cli_test.py "$(brew --prefix)/bin/theme"
+          sh target/release-tests/portable-smoke.sh "$(brew --prefix)/bin/theme"
+          python3 -I -B target/release-tests/browser_cli_test.py "$(brew --prefix)/bin/theme"
+          python3 -I -B target/release-tests/mdls_cli_test.py "$(brew --prefix)/bin/theme"
+          python3 -I -B target/release-tests/preview_cli_test.py "$(brew --prefix)/bin/theme"
       - name: Verify browser commands and terminal layout
         run: |
           cargo install --path . --locked --root target/installed --target-dir target
