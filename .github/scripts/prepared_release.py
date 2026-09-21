@@ -8,6 +8,7 @@ import runpy
 import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
 import zipfile
 
@@ -191,15 +192,54 @@ def homebrew():
         shutil.copyfile(matches[0], cache)
 
 
+def install_tar(archive, destination):
+    """Read one bounded regular executable, never extract archive paths."""
+    with tarfile.open(archive, "r:gz") as tar:
+        member = tar.next()
+        require(member is not None and member.name == "theme" and member.isfile()
+                and 0 < member.size <= MAX_FILE, "invalid release executable")
+        data = tar.extractfile(member).read(MAX_FILE + 1)
+        require(len(data) == member.size and tar.next() is None, "unexpected release contents")
+    destination.mkdir(parents=True)
+    binary = destination / "theme"
+    binary.write_bytes(data)
+    binary.chmod(0o755)
+    return binary
+
+
+def install(target, destination):
+    formula = (ROOT / "Formula/theme.rb").read_text()
+    versions = re.findall(r'^  version "([0-9]+\.[0-9]+\.[0-9]+)"$', formula, re.M)
+    require(len(versions) == 1 and target in TARGETS, "invalid release installation")
+    tag = "v" + versions[0]
+    release = subprocess.run(["gh", "api", "repos/snaraj/theme/releases/tags/" + tag],
+                             capture_output=True, text=True, timeout=30)
+    with tempfile.TemporaryDirectory(prefix="theme-install-") as temporary:
+        directory = Path(temporary)
+        if release.returncode == 0:
+            DISTRIBUTION["collect"](tag, formula, directory)
+        else:
+            require("(HTTP 404)" in release.stderr, "cannot determine publication status: " + release.stderr)
+            verify(directory)
+        binary = install_tar(directory / f"theme-{target}.tar.gz", destination)
+    version = subprocess.run([str(binary), "-V"], check=True, capture_output=True, text=True).stdout
+    require(version.splitlines()[:1] == [f"version: {tag}"], "installed release version differs")
+    print(f"INSTALLED_RELEASE=PASS {tag} binary_sha256={hashlib.sha256(binary.read_bytes()).hexdigest()}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("record", "verify", "homebrew"))
+    parser.add_argument("mode", choices=("record", "verify", "homebrew", "install"))
     parser.add_argument("--run", type=int)
     parser.add_argument("--tag")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--target", choices=TARGETS)
     args = parser.parse_args()
     if args.mode == "homebrew":
         homebrew()
+    elif args.mode == "install":
+        require(args.target and args.output and not args.output.exists(), "install needs --target and a new --output")
+        install(args.target, args.output.resolve())
     elif args.mode == "record":
         require(args.run and args.tag and args.output, "record needs --run, --tag and --output")
         with tempfile.TemporaryDirectory(prefix="theme-preparation-") as temporary:

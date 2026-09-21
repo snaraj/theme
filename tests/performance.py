@@ -204,7 +204,8 @@ def semantic_errors(command, data, oracle):
             if command == "list-v":
                 fact = oracle["files"].get(start.group())
                 row_text = re.sub(r"\s+", "", SGR.sub("", row))
-                require(fact is not None and "png" + fact["display_bytes"] in row_text,
+                require(fact is not None and ("png" + fact["display_bytes"] in row_text
+                        or "FORMATpngSIZE" + fact["display_bytes"] + "ADDED" in row_text),
                         "verbose row lost its actual format/byte size")
                 require(bool(re.search(r"\d{4}-\d{2}-\d{2}", row_text)), "verbose row lost date metadata")
         if command == "list-v":

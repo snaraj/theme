@@ -174,11 +174,13 @@ impl std::ops::Deref for Floored {
 }
 
 impl Palette {
-    /// Adjust text across the luminance range of the blended image regions
+    /// Adjust text across the conservative luminance range of all image pixels
     /// and the solid background used by applications. The boolean says whether
     /// that range can meet the target. If not, retain a colored palette safe on
     /// the solid background; collapsing every accent to white/black would still
-    /// leave the translucent view unreadable. Regional means are estimates.
+    /// leave the translucent view unreadable. Per-channel extrema preserve
+    /// small highlights that regional averages hide; blending and luminance
+    /// are monotone in each channel, so these bound the full image.
     pub fn floor_for_image(mut self, opacity: f64, floor: f64) -> (Floored, bool) {
         let solid = self.background();
         let luminance = solid.luminance();
@@ -190,7 +192,7 @@ impl Palette {
         }
         let range =
             self.profile
-                .colors
+                .bounds
                 .iter()
                 .fold((luminance, luminance), |(low, high), &region| {
                     let value = effective_background(solid, opacity, region).luminance();
@@ -200,11 +202,56 @@ impl Palette {
         if !achievable {
             return (self.floor_against(solid, floor), false);
         }
-        for color in self.colors[1..]
+        let originals: Vec<_> = self.colors[1..]
+            .iter()
+            .chain([&self.foreground, &self.cursor])
+            .copied()
+            .collect();
+        let mut adjusted: Vec<_> = originals
+            .iter()
+            .map(|&c| floor_range(c, range, floor))
+            .collect();
+        // Independent minimum adjustments can collapse distinct grayscale
+        // tones onto the same threshold. Lift each such group together so
+        // its original differences survive while every member meets target.
+        let mut grouped = [false; 17];
+        for i in 0..adjusted.len() {
+            if grouped[i] {
+                continue;
+            }
+            let group: Vec<_> = (i..adjusted.len())
+                .filter(|&j| adjusted[j] == adjusted[i])
+                .collect();
+            for &j in &group {
+                grouped[j] = true;
+            }
+            if group.iter().all(|&j| originals[j] == originals[i]) {
+                continue;
+            }
+            let lift = [Rgb::WHITE, Rgb::BLACK]
+                .into_iter()
+                .filter_map(|target| {
+                    group
+                        .iter()
+                        .try_fold(0.0f64, |mix, &j| {
+                            solve(originals[j], target, range, floor)
+                                .map(|(needed, _)| mix.max(needed))
+                        })
+                        .map(|mix| (mix, target))
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            if let Some((mix, target)) = lift {
+                for j in group {
+                    adjusted[j] = originals[j].mix(target, mix);
+                }
+            }
+        }
+        for (color, adjusted) in self.colors[1..]
             .iter_mut()
             .chain([&mut self.foreground, &mut self.cursor])
+            .zip(adjusted)
         {
-            *color = floor_range(*color, range, floor);
+            *color = adjusted;
         }
         (
             Floored {
@@ -237,6 +284,32 @@ impl Palette {
 mod tests {
     use super::*;
     use crate::{Mode, Palette};
+
+    #[test]
+    fn translucent_floor_keeps_distinct_source_tones() {
+        let gray = |v| Rgb { r: v, g: v, b: v };
+        let mut raw = crate::derive::palette(&[], gray(30), crate::ModePref::Dark);
+        raw.colors = std::array::from_fn(|i| gray(20 + i as u8 * 12));
+        raw.profile = crate::ImageProfile::new(2, 1, 2, 1, vec![Rgb::BLACK, Rgb::WHITE]).unwrap();
+        let (palette, achievable) = raw.floor_for_image(0.7, 4.5);
+        assert!(achievable);
+        let unique = palette
+            .colors
+            .iter()
+            .enumerate()
+            .filter(|(i, color)| !palette.colors[..*i].contains(color))
+            .count();
+        assert!(
+            unique >= 12,
+            "distinct source tones collapsed to {unique} colors"
+        );
+        for shade in 0..=255 {
+            let background = effective_background(palette.background(), 0.7, gray(shade));
+            for color in &palette.colors[1..] {
+                assert!(color.contrast(background) >= 4.5);
+            }
+        }
+    }
 
     #[test]
     fn interval_interior_is_not_mistaken_for_readable_endpoints() {

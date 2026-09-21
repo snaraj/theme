@@ -24,6 +24,9 @@ pub struct ImageProfile {
     pub(crate) columns: usize,
     pub(crate) rows: usize,
     pub(crate) colors: Vec<Rgb>,
+    /// Per-channel bounds from the original pixels, before downsampling.
+    /// These conservatively bound every blended background luminance.
+    pub(crate) bounds: [Rgb; 2],
 }
 
 /// Readability across every sampled region and all default/ANSI text colors.
@@ -63,6 +66,7 @@ impl ImageProfile {
             return None;
         }
         let count = colors.len() as f64;
+        let bounds = Self::color_bounds(&colors);
         let luminance: Vec<_> = colors.iter().map(Rgb::luminance).collect();
         let mean_luminance = luminance.iter().sum::<f64>() / count;
         let (mut signature, mut chroma, mut texture, mut edges) = ([0.0; 3], 0.0, 0.0, 0);
@@ -95,7 +99,44 @@ impl ImageProfile {
             columns,
             rows,
             colors,
+            bounds,
         })
+    }
+
+    pub(crate) fn color_bounds(colors: &[Rgb]) -> [Rgb; 2] {
+        colors
+            .iter()
+            .fold([Rgb::WHITE, Rgb::BLACK], |[low, high], c| {
+                [
+                    Rgb {
+                        r: low.r.min(c.r),
+                        g: low.g.min(c.g),
+                        b: low.b.min(c.b),
+                    },
+                    Rgb {
+                        r: high.r.max(c.r),
+                        g: high.g.max(c.g),
+                        b: high.b.max(c.b),
+                    },
+                ]
+            })
+    }
+
+    pub(crate) fn with_bounds(mut self, bounds: [Rgb; 2]) -> Option<Self> {
+        if self.colors.iter().any(|&c| !Self::bounds_cover(bounds, c)) {
+            return None;
+        }
+        self.bounds = bounds;
+        Some(self)
+    }
+
+    pub(crate) fn bounds_cover([low, high]: [Rgb; 2], c: Rgb) -> bool {
+        c.r >= low.r
+            && c.r <= high.r
+            && c.g >= low.g
+            && c.g <= high.g
+            && c.b >= low.b
+            && c.b <= high.b
     }
 
     /// Summarize the existing analysis grid without decoding the image again.

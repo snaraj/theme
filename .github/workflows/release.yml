@@ -206,6 +206,10 @@ jobs:
             runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.slot.outputs.source_sha }}
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: theme-${{ matrix.target }}
@@ -220,6 +224,7 @@ jobs:
           theme version
           theme version | grep -qx "version: v$VER"
           theme help >/dev/null
+          sh "$(dirname "$0")/tests/portable-smoke.sh" "$(command -v theme)"
           EOF
           sudo apt-get install -y ./theme_*.deb
           dpkg -s theme | grep -qx "Version: $VER"
@@ -231,6 +236,7 @@ jobs:
           box() { docker run --rm --network none -e VER="$VER" -e DEBIAN_FRONTEND=noninteractive -v "$PWD:/pkg:ro" "$@"; }
           box debian:12@sha256:6ebd97fa83deb272194a2cf015b3d26a4d538e9ad3a7a79d544c8af5b0a01443 sh -c "$deb" # debian:12
           box ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc sh -c "$deb" # ubuntu:22.04
+          box ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 sh -c "$deb" # ubuntu:24.04
           box fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80 sh -c "$rpm" # fedora:latest
 
   # Exact-main CI remains the publication authority. The preparation receipt
@@ -327,4 +333,9 @@ jobs:
           brew tap snaraj/theme "$GITHUB_WORKSPACE"
           brew install snaraj/theme/theme
           brew test snaraj/theme/theme
+          sh tests/portable-smoke.sh "$(brew --prefix)/bin/theme"
+          python3 -I -B tests/browser_cli_test.py "$(brew --prefix)/bin/theme"
+          python3 -I -B tests/mdls_cli_test.py "$(brew --prefix)/bin/theme"
+          python3 -I -B tests/preview_cli_test.py "$(brew --prefix)/bin/theme"
+          python3 -I -B tests/cli_maintenance_test.py "$(brew --prefix)/bin/theme"
           echo "PUBLISHED_DELIVERY=PASS $TAG" >> "$GITHUB_STEP_SUMMARY"

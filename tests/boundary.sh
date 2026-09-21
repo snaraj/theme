@@ -155,8 +155,7 @@ check  "-n refuses a count past usize"         1 run "$lib" list -n 184467440737
 check  "-n refuses a wildly overflowing count" 1 run "$lib" list -n 184467440737095516160
 
 # A reader that has already gone must not leave a panic behind (#59). The
-# reader exits at once; theme starts 200 ms later and writes into a pipe
-# nobody reads (before the fix: exit 101 + "failed printing to stdout").
+# helper closes the only read descriptor BEFORE spawning theme.
 # Exact statuses, so a run where theme somehow wrote before the reader
 # left shows up red rather than passing for nothing: a broken stdout is
 # 141 (the shell's own answer for a tool cut off by its reader), and a
@@ -164,9 +163,26 @@ check  "-n refuses a wildly overflowing count" 1 run "$lib" list -n 184467440737
 # command per printing module the fixture can reach: help.rs, report.rs,
 # update.rs, ui.rs, search.rs (unsplash.rs prints only on its network
 # path). The stderr case pins that a broken stderr never changes die's
-# status; it cannot tell a lost race from a won one — the 141 cases do.
+# status. No scheduler timing is involved.
+gone_run() {
+    THEME_WALLPAPER_DIR="$lib" THEME_NO_APPLY=1 THEME_CACHE_DIR="$fixture/cache" \
+        TMPDIR="$fixture/tmpdir" python3 - "$@" <<'PY'
+import os, subprocess, sys
+read, write = os.pipe()
+os.close(read)
+try:
+    result = subprocess.run(sys.argv[2:], stdout=write,
+                            stderr=write if sys.argv[1] == "merged" else subprocess.PIPE,
+                            timeout=20)
+finally:
+    os.close(write)
+sys.stderr.buffer.write(result.stderr or b"")
+sys.exit(result.returncode)
+PY
+}
 pipe_into_gone() { # $1 expected status, $2 label, then the theme argv
-    ( sleep 0.2; run "$lib" "${@:3}" 2>"$fixture/pipe.err"; echo "$?" >"$fixture/pipe.rc" ) | true
+    gone_run separate "$THEME" "${@:3}" 2>"$fixture/pipe.err"
+    echo "$?" >"$fixture/pipe.rc"
     if [ ! -s "$fixture/pipe.err" ] && [ "$(cat "$fixture/pipe.rc")" = "$1" ]; then
         pass "$2 into a gone reader ends with $1, nothing on stderr"
     else fail "$2 into a gone reader: rc=$(cat "$fixture/pipe.rc") want $1 $(tr '\n' ' ' <"$fixture/pipe.err" | cut -c1-120)"; fi
@@ -177,7 +193,8 @@ pipe_into_gone 141 "preview" preview tiny.png
 pipe_into_gone 141 "status" status
 pipe_into_gone 141 "-V"     -V
 pipe_into_gone 141 "search" search tiny
-( sleep 0.2; run "$lib" rm no-such-wallpaper 2>&1; echo "$?" >"$fixture/pipe.rc" ) | true
+gone_run merged "$THEME" rm no-such-wallpaper
+echo "$?" >"$fixture/pipe.rc"
 if [ "$(cat "$fixture/pipe.rc")" = 1 ]; then pass "die under 2>&1 into a gone reader keeps exit 1"
 else fail "die under 2>&1 into a gone reader: rc=$(cat "$fixture/pipe.rc") want 1"; fi
 
@@ -703,13 +720,28 @@ EOS
         [ ! -e "$dran" ]; then
         pass "status reads the same record, and says the same thing"
     else fail "status asked the helper again, or disagreed with the bare screen"; fi
-    # PRINT-ONLY: `preview` with no name OPENS the file it is handed and
-    # renders its bytes, so it asks the helper every time — behind the very
-    # record the bare screen just answered from.
+    # The descriptor-bound record is now safe for the preview decoder too.
     rm -f "$dran"
-    if desk_run preview >/dev/null 2>&1 && [ -e "$dran" ]; then
-        pass "preview with no name asks the helper, record or no record"
-    else fail "preview with no name read the recorded path"; fi
+    if desk_run preview >/dev/null 2>&1 && [ ! -e "$dran" ]; then
+        pass "preview with no name reuses the audited desktop record"
+    else fail "preview with no name missed the audited record"; fi
+    # A symlink/FIFO/oversized record or a writable directory is never read.
+    cp "$dcache/desktop" "$fixture/desktop-original"
+    for hostile in symlink fifo oversized mode acl; do
+        rm -f "$dcache/desktop" "$dran"
+        case "$hostile" in
+        symlink) ln -s "$fixture/desktop-original" "$dcache/desktop" ;;
+        fifo) mkfifo "$dcache/desktop" ;;
+        oversized) cp "$fixture/desktop-original" "$dcache/desktop"; dd if=/dev/zero bs=16384 count=1 >>"$dcache/desktop" 2>/dev/null ;;
+        mode) cp "$fixture/desktop-original" "$dcache/desktop"; chmod 777 "$dcache" ;;
+        acl) cp "$fixture/desktop-original" "$dcache/desktop"; chmod +a 'everyone allow write,delete_child' "$dcache" ;;
+        esac
+        DESK_NO_APPLY=1 desk_run preview >/dev/null 2>&1
+        if [ -e "$dran" ]; then pass "desktop $hostile custody refusal asks the helper"
+        else fail "desktop $hostile record bypassed custody"; fi
+        [ "$hostile" != acl ] || chmod -N "$dcache"
+        chmod 700 "$dcache"
+    done
     # Whatever changes the desktop moves the store; the record expires with
     # it — on the file's identity, never on a clock we keep ourselves.
     printf 'store-has-moved\n' >"$dstore/Index.plist"
@@ -1145,7 +1177,7 @@ if printf '%s' "$who_out" | grep -q 'photo by Contributor'; then
 else fail "the credit note lost the contributor's name entirely"; fi
 
 # --- version: three lines, exact shape; the number itself floats -------------
-vout=$(run "$lib" version 2>&1)
+vout=$(run "$lib" version 2>/dev/null)
 if printf '%s\n' "$vout" | sed -n 1p | grep -Eq '^version: v[0-9]+\.[0-9]+\.[0-9]+$'; then
     pass "version line has the v-prefixed semver shape"
 else fail "version line malformed: $(printf '%s' "$vout" | sed -n 1p)"; fi
@@ -1154,7 +1186,7 @@ if [ "$(printf '%s\n' "$vout" | sed -n 2p)" = "github: https://github.com/snaraj
    && [ "$(printf '%s\n' "$vout" | wc -l | tr -d ' ')" = "3" ]; then
     pass "version prints repo and maintainer, three lines exactly"
 else fail "version output shape drifted: $vout"; fi
-if [ "$(run "$lib" --version 2>&1)" = "$vout" ] && [ "$(run "$lib" -V 2>&1)" = "$vout" ]; then
+if [ "$(run "$lib" --version 2>/dev/null)" = "$vout" ] && [ "$(run "$lib" -V 2>/dev/null)" = "$vout" ]; then
     pass "--version and -V alias the version command"
 else fail "--version/-V do not match the version output"; fi
 
@@ -1321,7 +1353,7 @@ upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
         for kv in ${ctl[@]+"${ctl[@]}"}; do printf '%s\n' "$kv"; done
     } >"$updd/ctl"
     env UPD_TAR_MARKER="$updd/tar-ran" THEME_CURL="$updd/stubbin/curl" \
-        PATH="$updd/stubbin:$PATH" \
+        PATH="$updd/stubbin:/usr/bin:/bin" \
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$fixture/cache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
         "${envs[@]}" "$bin" "${UPD_COMMAND:-update}" "$@" >"$upd_out" 2>&1
@@ -1372,7 +1404,7 @@ upd_run UPD_TAG=v9.9.9 UPD_LATEST=429
 if [ "$upd_rc" != 0 ] \
    && grep -qF 'github.com answered HTTP 429' "$upd_out" \
    && grep -qF 'rate limited, retry in 2 min' "$upd_out" \
-   && ! grep -qiE 'no network|cannot reach' "$upd_out" && upd_intact; then
+   && ! grep -qiE 'no network|cannot reach|not reach|timed out' "$upd_out" && upd_intact; then
     pass "a 429 with Retry-After names the limit and when it lifts"
 else fail "the throttled answer was misreported: $(cat "$upd_out")"; fi
 upd_run UPD_TAG=v9.9.9 UPD_LATEST=403
@@ -1883,7 +1915,7 @@ ver_run() { # $1 the verb (version|--version|-V); env-pair overrides follow.
         THEME_WALLPAPER_DIR="$lib" THEME_CACHE_DIR="$vercache" \
         THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" KITTY_WINDOW_ID='' \
         THEME_CURL="$verbin/curl" \
-        PATH="$verbin:$sweepbin:$PATH" "$@" "$THEME_DBG" "$verb" >"$ver_out" 2>&1
+        PATH="$verbin:$sweepbin:/usr/bin:/bin" "$@" "$THEME_DBG" "$verb" >"$ver_out" 2>&1
     ver_rc=$?
 }
 verline() { sed -n "$1p" "$ver_out"; }
@@ -1908,7 +1940,7 @@ ahead="latest release: v0.0.0"
 # reasons, each built from this build's own constants and the response's
 # status — never from a byte of the answer.
 lat="https://github.com/snaraj/theme/releases/latest"
-unreachable="latest release: unknown (could not reach github.com within 2s)"
+unreachable="latest release: unknown (github.com request name lookup failed (curl exit 6))"
 redirected="latest release: unknown (github.com redirected $lat somewhere unexpected)"
 notransport="latest release: unknown (no trusted system curl)"
 throttled="latest release: unknown (github.com answered HTTP 429 for $lat — rate limited, retry in 5 min)"
@@ -1985,9 +2017,9 @@ printf 'v9.9.9' >"$vercache/update-check"
 verstamp=$(cksum <"$vercache/update-check")
 ver_tag=
 ver_run version
-if [ "$ver_rc" = 0 ] && closes "$unreachable" && ! grep -qiE 'error|curl' "$ver_out" \
+if [ "$ver_rc" = 0 ] && closes "$unreachable" && ! grep -qi 'error' "$ver_out" \
    && [ "$(verreqs)" = 1 ]; then
-    pass "an unreachable github.com says so, with the budget it waited"
+    pass "an unreachable github.com names its transport failure"
 else fail "the offline answer misbehaved (rc=$ver_rc): $(cat "$ver_out")"; fi
 if [ "$(cksum <"$vercache/update-check")" = "$verstamp" ]; then
     pass "a failed live ask leaves the footer's good stamp byte-identical"

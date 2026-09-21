@@ -1,10 +1,12 @@
 """Offline preparation receipts: source changes and substituted artifacts fail closed."""
 import copy
 import hashlib
+import io
 import importlib.util
 from pathlib import Path
 import stat
 import tempfile
+import tarfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -137,6 +139,33 @@ class Preparation(unittest.TestCase):
         with patch.object(prepared, "MAX_FILE", 1), self.assertRaises(ValueError):
             prepared.unpack(archive, artifact, "v1.2.3", self.directory)
 
+    def test_executable_install_rejects_links_paths_extras_and_oversize(self):
+        archive = self.directory / "binary.tar.gz"
+        for name, kind, extra, limit in [("theme", tarfile.REGTYPE, False, prepared.MAX_FILE),
+                ("../theme", tarfile.REGTYPE, False, prepared.MAX_FILE),
+                ("theme", tarfile.SYMTYPE, False, prepared.MAX_FILE),
+                ("theme", tarfile.LNKTYPE, False, prepared.MAX_FILE),
+                ("theme", tarfile.REGTYPE, True, prepared.MAX_FILE),
+                ("theme", tarfile.REGTYPE, False, 1)]:
+            with tarfile.open(archive, "w:gz") as tar:
+                entry = tarfile.TarInfo(name)
+                entry.type, entry.size, entry.linkname = kind, 7, "outside"
+                tar.addfile(entry, io.BytesIO(b"payload"))
+                if extra:
+                    tar.addfile(tarfile.TarInfo("extra"))
+            destination = self.directory / "install"
+            with patch.object(prepared, "MAX_FILE", limit):
+                if name == "theme" and kind == tarfile.REGTYPE and not extra and limit > 1:
+                    binary = prepared.install_tar(archive, destination)
+                    self.assertEqual(binary.read_bytes(), b"payload")
+                    self.assertEqual(stat.S_IMODE(binary.stat().st_mode), 0o755)
+                    binary.unlink()
+                    destination.rmdir()
+                else:
+                    with self.assertRaisesRegex(ValueError, "unexpected release contents" if extra else "invalid release executable"):
+                        prepared.install_tar(archive, destination)
+                    self.assertFalse(destination.exists())
+
     def test_receipt_attempt_source_and_payload_substitution_refuse(self):
         source = [dict(type="blob", mode="100644", sha="a" * 40, path="src/main.rs")]
         files = {n: "c" * 64 for n in prepared.DISTRIBUTION["asset_names"]("v1.2.3")}
@@ -172,6 +201,36 @@ class Preparation(unittest.TestCase):
                 return api(path)
             with patch.object(prepared, "api", side_effect=raced), self.assertRaises(ValueError):
                 prepared.collect(7, "v1.2.3", self.directory, receipt)
+
+    def test_install_checks_version_and_uses_only_verified_release_or_preparation(self):
+        (self.directory / "Formula").mkdir()
+        (self.directory / "Formula/theme.rb").write_text('  version "1.2.3"\n')
+        binary = self.directory / "theme"
+        binary.write_bytes(b"verified binary")
+        for published in (True, False):
+            for version in ("version: v1.2.3\ngithub: https://github.com/snaraj/theme\nmaintainer: Samuel Naranjo\n",
+                            "version: v1.2.2\n", "", "extra\nversion: v1.2.3\n"):
+                answers = [SimpleNamespace(returncode=0 if published else 1, stderr="(HTTP 404)"),
+                           SimpleNamespace(stdout=version)]
+                with patch.object(prepared, "ROOT", self.directory), \
+                     patch.object(prepared.subprocess, "run", side_effect=answers), \
+                     patch.dict(prepared.DISTRIBUTION, collect=lambda *args: None), \
+                     patch.object(prepared, "verify") as verify, \
+                     patch.object(prepared, "install_tar", return_value=binary) as unpack:
+                    if version.startswith("version: v1.2.3\n"):
+                        prepared.install(prepared.TARGETS[0], self.directory / "new")
+                        self.assertEqual(verify.call_count, int(not published))
+                        self.assertEqual(unpack.call_count, 1)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "installed release version differs"):
+                            prepared.install(prepared.TARGETS[0], self.directory / "new")
+        with patch.object(prepared, "ROOT", self.directory), \
+             patch.object(prepared.subprocess, "run", return_value=SimpleNamespace(returncode=1, stderr="(HTTP 403)")), \
+             patch.object(prepared, "verify") as verify, patch.object(prepared, "install_tar") as unpack:
+            with self.assertRaisesRegex(ValueError, "cannot determine publication status"):
+                prepared.install(prepared.TARGETS[0], self.directory / "new")
+            verify.assert_not_called()
+            unpack.assert_not_called()
 
     def test_workflow_isolates_preparation_and_requires_verification_before_publish(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()

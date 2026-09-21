@@ -13,8 +13,8 @@ the background image as the driver.
 
 Every release ships prebuilt binaries for macOS and Linux (arm64 and x86_64)
 with a `SHA256SUMS` to verify against — everything below resolves to those
-same four tarballs. The Linux builds need glibc 2.34 or newer, and are
-verified on Ubuntu 22.04 and 24.04, Debian 12, Fedora 44 and Arch.
+same four tarballs. Supported systems and the checks behind each support claim
+are listed in the [OS matrix](#supported-operating-systems).
 
 **Homebrew** — macOS and Linux. Homebrew 6 requires a third-party tap to be
 trusted; grant trust to this one formula before adding the tap:
@@ -69,37 +69,38 @@ path directly or place its directory first in `PATH`. For subsequent updates,
 run `~/.local/bin/theme update`. `--version vX.Y.Z` selects a specific release.
 Updates never elevate, and package-managed files remain owned by their manager.
 
-### Compatibility
+### Supported operating systems
 
-| Platform | glibc | Prebuilt binary | From source |
+This matrix is the release support contract. Update it with any target, package,
+runner, or desktop integration change. “Release” checks run against the prepared
+binaries that publication promotes unchanged; source checks alone do not prove a
+release download works.
+
+| OS / architecture | Installation | Required automated validation | Visual / desktop coverage |
 | --- | --- | --- | --- |
-| macOS (Apple Silicon, Intel) | — | yes | yes |
-| Ubuntu 24.04 | 2.39 | yes | yes |
-| Fedora 44 | 2.43 | yes | yes |
-| Arch | 2.44 | yes | yes |
-| Debian 12 | 2.36 | yes | yes |
-| Ubuntu 22.04 | 2.35 | yes | yes |
-| Alpine 3 (musl) | — | no | yes |
+| macOS, Apple Silicon | Homebrew, arm64 tarball, source | Native release smoke; reviewed Homebrew install and command/PTY suites; Rust tests | Disposable native Kitty validation; physical Spaces checked separately |
+| macOS, Intel | Homebrew, x86_64 tarball, source | Native Intel release build and command smoke | Native Kitty requires a Mac; hosted runner has no accelerated OpenGL |
+| Ubuntu 22.04, arm64 / x86_64 | `.deb`, tarball, source | Both release packages installed natively and in pinned containers | Real Kitty, software GL and Xvfb on the Linux CI runner |
+| Ubuntu 24.04, arm64 / x86_64 | `.deb`, tarball, source | Both release packages installed in pinned Ubuntu containers | Same Kitty protocol; physical desktop integration depends on helper |
+| Debian 12, arm64 / x86_64 | `.deb`, tarball, source | Both release packages installed in pinned Debian containers | Command, image, palette and browser smoke |
+| Fedora, arm64 / x86_64 | `.rpm`, tarball, source | Both release packages installed in the pinned Fedora container | Command, image, palette and browser smoke |
+| Arch Linux, x86_64 | Tarball, source | Explicit current-release container matrix (`IMAGES=archlinux:latest`) | Command smoke; not a required hosted release gate |
+| Alpine 3, x86_64 | Source (musl) | Independently compiled musl binary in Alpine CI; glibc updater refusal | Command, image, palette and browser smoke |
+| NixOS, x86_64 | Nix package from source | Booted NixOS VM; installed binary and unit/PTY tests; all four completion shells | Browser keys and terminal output; desktop needs local integration |
 
-The prebuilt Linux binaries inherit the glibc floor of the runner that
-builds them, which is why they are built on the oldest image GitHub still
-offers: the floor is 2.34, below every glibc row above, so only musl
-systems build from source. (Releases before v0.3.0 were built on 24.04 and
-still want 2.39.) Every Linux row was checked on 2026-09-03 in a
-container on x86_64 and arm64 (Arch on x86_64, the only architecture it
-publishes an image for): the release tarball for the prebuilt column, a
-source build and the whole `tests/boundary.sh` fixture for the other.
-`tests/linux-matrix.sh` re-runs the prebuilt half against the current
-release.
+The Linux release builds use Ubuntu 22.04; each `.deb` records the minimum glibc
+version read from its binary, and RPM derives its shared-library requirements.
+Alpine needs a musl source build. NixOS uses its Nix build and package manager;
+`theme update` directs the user back to Nix. Windows, Snap and Flatpak are not
+supported. Linux Homebrew uses the same verified tarballs; the release gate's
+Homebrew installation runs on macOS.
 
-Source CI also exercises command output, image decoding, palettes, search,
-browsing and dry-run application in Ubuntu, Debian and Fedora containers.
-An independently compiled musl binary runs those checks in Alpine; musl
-builds refuse the glibc-only self-update download. The NixOS job builds from
-`Cargo.lock`, boots a NixOS VM, and tests the installed package and browser
-keys as an ordinary user. Run that job locally on an x86_64 Linux host with
-Nix and KVM using `nix-build tests/nixos.nix`. This tests CLI compatibility;
-desktop integration still depends on the desktop and terminal in use.
+Run `tests/linux-matrix.sh` for the published release, or `nix-build tests/nixos.nix`
+on an x86_64 Linux host with Nix and KVM for the NixOS gate. The real-Kitty job
+checks images, key navigation, successive palette changes and colors inherited
+by new windows. Its wallpaper helper records the requested image without
+changing the host desktop. Physical desktop and macOS Spaces behavior remain
+separate from terminal rendering evidence.
 
 ## Use
 
@@ -121,6 +122,21 @@ every Space on every display and seeds the all-Spaces fallback, so Spaces you
 create later inherit it too. Your screensaver choices are left alone.
 
 ## Browse wallpapers
+
+Shell completions are generated offline by `theme completions <shell>`:
+
+```sh
+# Bash
+source <(theme completions bash)
+# Zsh, after compinit
+source <(theme completions zsh)
+# Fish
+theme completions fish | source
+```
+
+For Nushell, save `theme completions nushell` to a file and source that file
+from your Nushell configuration. Definitions complete commands and their flags;
+they never start Theme or make network requests while completing.
 
 ```sh
 theme browse                         # resume the saved query
@@ -173,10 +189,13 @@ dumps and the kitty log are published as `kitty-e2e-<OS>-<architecture>`
 artifacts, pass or fail. macOS CI cannot host that test — the runner has no
 accelerated OpenGL, so Kitty exits before it opens a window — so there the
 keys and unsupported-terminal notices are checked through a real pty. CI tests
-an installed candidate on both platforms, and exercises the published Homebrew
-installation's commands on macOS. Physical macOS rendering needs a person on a
-Mac. Applying a wallpaper, the
-macOS Spaces store and the desktop itself stay outside it.
+both the current source and verified published or prepared release in Kitty, and the reviewed Homebrew
+installation's commands on macOS. The Linux apply test switches images and
+replaces one in place, checks every live and inherited color, and records the
+desktop helper's selected path. Its production socket allows only `set-colors`;
+the test controller holds a separate capability. Dropped graphics or color
+delivery must fail the same tests. Physical macOS rendering, the macOS Spaces
+store and the desktop itself still require a person on a Mac.
 
 ```sh
 python3 -I -B tests/kitty_e2e.py --kitty "$(command -v kitty)" \
@@ -188,15 +207,24 @@ colors and Kitty's selection, border, and tab accents. Optional readability
 filters sample a 16-by-16 image grid at the configured opacity to calculate
 worst text contrast and the fraction meeting `THEME_CONTRAST`. `--min-contrast 4.5` and
 `--coverage 0.9` filter those measurements. Sampling models the wallpaper behind
-the terminal; cropping, another window behind it, live opacity changes, and
-unsampled detail can affect the real result. It is not an every-pixel guarantee.
+the terminal using an sRGB-channel blend. Compositor and color-space differences,
+cropping, another window behind it, live opacity changes, and unsampled detail
+can affect the real result. Kitty's background-image tint uses a different blend;
+it is not a substitute for desktop opacity. These estimates are not an every-pixel
+display guarantee.
 
-Colour adjustment considers the range from dark to bright image regions and
-the solid terminal background, rather than just the image average. Very low
+Colour adjustment uses conservative channel bounds from every original pixel
+and the solid terminal background, preserving small highlights that region
+averages hide. Distinct tones that would converge at the contrast threshold
+are adjusted together to retain their separation where possible. Very low
 opacity can make readable text impossible across that range. In that case,
 `theme set` warns that opacity needs increasing and keeps a coloured palette
 suited to the solid background. Theme does not change your opacity settings.
 Applications that choose their own RGB colours can also bypass the palette.
+Each apply prepares and exports the new image's colors before setting the
+desktop. Cached images are adjusted again for the current opacity and contrast;
+image edits and replacements invalidate the cache. Failed Kitty color delivery
+returns an error so a wallpaper change cannot silently claim successful recoloring.
 
 Search facts are cached by configured roots, timezone files, image identity,
 and palette. Changed images or timezone files refresh automatically. Opening
@@ -224,6 +252,11 @@ splits without adding or replacing key mappings.
   terminal.
 
 ## Environment
+
+Exit status: `0` on success, `1` on refusal, `141` when stdout's reader has closed.
+`theme version` and `theme update` warn when PATH contains another executable
+copy; they inspect files without running them. `theme -V` stays a local version
+banner with no PATH scan or network request.
 
 - `THEME_WALLPAPER_DIR` — the wallpaper library; a colon-separated list is
   allowed (every directory searched, downloads land in the first).

@@ -48,22 +48,14 @@ pub fn wallpaper_get() -> Option<PathBuf> {
 /// what used to happen anyway. `THEME_NO_APPLY` can read an existing record
 /// but never writes one.
 ///
-/// The record is a plain file in the cache dir and carries none of the
-/// custody the update stamp gets, so the rule that keeps it honest is who
-/// may act on it: the mutating verbs (`rm`, `rename`) keep asking the
-/// desktop directly, and `preview` with no name — which opens the file it
-/// is given and renders its bytes — asks the helper too. A record is fast
-/// enough to print by, and in kitty to hand the header's thumbnail renderer
-/// (which opens the file, as `status` already does with the `wal` record);
-/// never enough to delete by or to feed an in-process decoder. Issue #47
-/// routes it through the same audited dirfd the update stamp uses, once
-/// S1.4 has made that custody cheap.
+/// Reads and atomic writes share the update stamp's audited directory fd.
+/// Preview may reuse it; destructive verbs still ask the desktop directly.
 #[cfg(target_os = "macos")]
-pub fn wallpaper_to_print(cfg: &Config) -> Option<PathBuf> {
+pub fn wallpaper_to_print(cfg: &Config, dir: Option<&rustix::fd::OwnedFd>) -> Option<PathBuf> {
     let stamp = desktop_stamp();
-    let record = cfg.cache_dir.join("desktop");
     if let Some(s) = &stamp
-        && let Ok(text) = fs::read_to_string(&record)
+        && let Some(bytes) = dir.and_then(|dir| crate::store::read_at(dir, "desktop", 16 * 1024))
+        && let Ok(text) = String::from_utf8(bytes)
         && let Some((head, path)) = text.split_once('\n')
         && head == s
         && !path.is_empty()
@@ -78,8 +70,13 @@ pub fn wallpaper_to_print(cfg: &Config) -> Option<PathBuf> {
     let got = wallpaper_get()?;
     if !cfg.no_apply
         && let Some(s) = &stamp
+        && let Some(dir) = dir
     {
-        let _ = fs::write(&record, format!("{s}\n{}\n", got.display()));
+        let _ = crate::store::write_at(
+            dir,
+            "desktop",
+            format!("{s}\n{}\n", got.display()).as_bytes(),
+        );
     }
     Some(got)
 }
@@ -97,8 +94,18 @@ fn desktop_stamp() -> Option<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn wallpaper_to_print(_cfg: &Config) -> Option<PathBuf> {
+pub fn wallpaper_to_print(_cfg: &Config, _dir: Option<&rustix::fd::OwnedFd>) -> Option<PathBuf> {
     wallpaper_get()
+}
+
+/// Linux has no desktop record; macOS opens one audited directory per screen.
+pub fn desktop_cache(cfg: &Config) -> Option<rustix::fd::OwnedFd> {
+    #[cfg(target_os = "macos")]
+    if desktop_stamp().is_some() {
+        return crate::update::check_dir(cfg);
+    }
+    let _ = cfg;
+    None
 }
 
 fn have(cmd: &str) -> bool {
@@ -182,32 +189,44 @@ pub fn settle(desktop: Result<(), String>) {
 }
 
 /// One terminal emitter. The palette files are already on disk when these
-/// run; an impl pushes colors to its terminal, best-effort.
+/// run; a failed delivery must not be reported as a successful theme change.
 trait Terminal {
-    fn apply(&self, cfg: &Config);
+    fn apply(&self, cfg: &Config) -> Result<(), String>;
 }
 
 /// Recolor every RUNNING kitty over its capability-scoped remote-control
 /// socket (`remote_control_password "" set-colors`: a passwordless client
 /// may call set-colors and nothing else). `--configured` updates the stored
 /// config too, so future windows inherit the palette. An instance no socket
-/// reaches keeps its old palette; its next window reads the include.
+/// reaches keeps its old palette, which must be reported to the caller.
 struct Kitty;
 impl Terminal for Kitty {
-    fn apply(&self, cfg: &Config) {
+    fn apply(&self, cfg: &Config) -> Result<(), String> {
         let colors = cfg.cache_dir.join("colors-kitty.conf");
-        let Ok(rd) = fs::read_dir("/tmp") else { return };
         let me = rustix::process::getuid().as_raw();
-        for e in rd.flatten() {
-            let name = e.file_name();
-            let Some(n) = name.to_str() else { continue };
-            if !n.starts_with("kitty-samuel-") {
-                continue;
+        let current = std::env::var("KITTY_LISTEN_ON")
+            .ok()
+            .and_then(|s| s.strip_prefix("unix:").map(PathBuf::from));
+        let mut sockets = Vec::new();
+        if let Ok(rd) = fs::read_dir("/tmp") {
+            for e in rd.flatten() {
+                if e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("kitty-samuel-"))
+                {
+                    sockets.push(e.path());
+                }
             }
-            let p = e.path();
-            if !own_socket(&p, me) {
-                continue;
-            }
+        }
+        if let Some(p) = &current {
+            sockets.push(p.clone());
+        }
+        sockets.sort();
+        sockets.dedup();
+        sockets.retain(|p| own_socket(p, me));
+        let inside = std::env::var("KITTY_WINDOW_ID").is_ok_and(|v| !v.is_empty());
+        let mut failed = inside && current.as_ref().is_none_or(|p| !sockets.contains(p));
+        for p in sockets {
             let child = Command::new("kitten")
                 .arg("@")
                 .arg("--to")
@@ -218,12 +237,13 @@ impl Terminal for Kitty {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn();
-            if let Ok(child) = child {
-                // A rogue same-uid socket can accept the request and never
-                // answer; a theme apply must not hang on a terminal. Cap each
-                // child, kill and reap on expiry — best-effort, never fatal.
-                wait_capped(child, Duration::from_secs(3));
-            }
+            // Bound a peer that accepts the connection but never answers.
+            failed |= !child.is_ok_and(|child| wait_capped(child, Duration::from_secs(3)));
+        }
+        if failed {
+            Err("palette saved, but Kitty colors were not applied to every window; check listen_on and allow_remote_control=password with remote_control_password \"\" set-colors, then apply again".into())
+        } else {
+            Ok(())
         }
     }
 }
@@ -240,18 +260,22 @@ fn own_socket(p: &Path, me: u32) -> bool {
 
 /// Wait for a child up to `limit`, then kill and reap it. Polls rather than
 /// blocking so a stalled peer cannot pin the call open.
-fn wait_capped(mut child: std::process::Child, limit: Duration) {
+fn wait_capped(mut child: std::process::Child, limit: Duration) -> bool {
     let deadline = Instant::now() + limit;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(status)) => return status.success(),
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return;
+                return false;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => return,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
         }
     }
 }
@@ -261,18 +285,20 @@ fn wait_capped(mut child: std::process::Child, limit: Duration) {
 /// when that dir exists — and the user imports it once from alacritty.toml.
 struct Alacritty;
 impl Terminal for Alacritty {
-    fn apply(&self, cfg: &Config) {
+    fn apply(&self, cfg: &Config) -> Result<(), String> {
         let dir = cfg
             .kitty_dir
             .parent()
             .map(|p| p.join("alacritty"))
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         if dir.is_dir() {
-            let _ = fs::copy(
+            fs::copy(
                 cfg.cache_dir.join("colors-alacritty.toml"),
                 dir.join("theme-colors.toml"),
-            );
+            )
+            .map_err(|_| "cannot update Alacritty colors".to_string())?;
         }
+        Ok(())
     }
 }
 
@@ -281,20 +307,22 @@ impl Terminal for Alacritty {
 /// clean). Skipped inside kitty, whose socket path already applied.
 struct OscTty;
 impl Terminal for OscTty {
-    fn apply(&self, cfg: &Config) {
+    fn apply(&self, cfg: &Config) -> Result<(), String> {
         if std::env::var("KITTY_WINDOW_ID")
             .map(|v| !v.is_empty())
             .unwrap_or(false)
         {
-            return;
+            return Ok(());
         }
         let Ok(pal) = fs::read_to_string(cfg.cache_dir.join("colors")) else {
-            return;
+            return Err("cannot read terminal colors".into());
         };
         let seq = osc_sequences(&pal);
         if let Ok(mut tty) = fs::OpenOptions::new().write(true).open("/dev/tty") {
-            let _ = tty.write_all(seq.as_bytes());
+            tty.write_all(seq.as_bytes())
+                .map_err(|_| "cannot apply terminal colors".to_string())?;
         }
+        Ok(())
     }
 }
 
@@ -345,8 +373,10 @@ pub fn schemes_dir(cfg: &Config) -> PathBuf {
 }
 
 /// Derive (cached), floor against the EFFECTIVE background, export the
-/// palette files, repoint kitty's include, and push to every terminal.
-pub fn set_palette(cfg: &Config, img: &Path) {
+/// palette files and repoint Kitty's include BEFORE changing the wallpaper.
+/// A bad image or unwritable palette must leave the desktop untouched.
+fn export_palette(cfg: &Config, img: &Path) {
+    let opacity = crate::presentation::opacity(cfg).unwrap_or_else(|error| die(&error));
     if cfg.no_apply {
         note(&format!(
             "[no-apply] would derive a palette from {}",
@@ -363,7 +393,8 @@ pub fn set_palette(cfg: &Config, img: &Path) {
     };
     // The identical preparation path powers preview and apply. Metrics remain
     // sampled estimates; emitters accept only the contrast-adjusted palette.
-    let prepared = crate::presentation::from_palette(cfg, pal).unwrap_or_else(|error| die(&error));
+    let prepared = crate::presentation::prepare(pal, opacity, cfg.contrast)
+        .unwrap_or_else(|error| die(&error));
     if let Some(warning) = prepared.readability_warning() {
         note(&warning);
     }
@@ -398,22 +429,22 @@ pub fn set_palette(cfg: &Config, img: &Path) {
     if fs::write(&cfg.current, include).is_err() {
         die(&format!("cannot write {}", cfg.current.display()));
     }
-    let terminals: [&dyn Terminal; 3] = [&Kitty, &Alacritty, &OscTty];
-    for t in &terminals {
-        t.apply(cfg);
-    }
 }
 
 /// Apply `img` everywhere (or desktop-only), then say what is now current.
 pub fn use_image(cfg: &Config, img: &Path, desktop_only: bool) {
-    // Refuse unresolved opacity before changing the desktop. A desktop-only
-    // request does not depend on terminal palette configuration.
     if !desktop_only {
-        crate::presentation::opacity(cfg).unwrap_or_else(|error| die(&error));
+        export_palette(cfg, img);
     }
     let desktop = set_desktop(cfg, img);
-    if !desktop_only {
-        set_palette(cfg, img);
+    let mut failures = Vec::new();
+    if !desktop_only && !cfg.no_apply {
+        let terminals: [&dyn Terminal; 3] = [&Kitty, &Alacritty, &OscTty];
+        for terminal in terminals {
+            if let Err(error) = terminal.apply(cfg) {
+                failures.push(error);
+            }
+        }
     }
     let size = img_size(img);
     let name = img.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -424,6 +455,9 @@ pub fn use_image(cfg: &Config, img: &Path, desktop_only: bool) {
     };
     note(&format!("now: {name}{suffix}"));
     settle(desktop);
+    if !failures.is_empty() {
+        die(&failures.join("; "));
+    }
 }
 
 #[cfg(test)]
@@ -463,11 +497,22 @@ mod tests {
             .spawn()
             .unwrap();
         let start = Instant::now();
-        wait_capped(child, Duration::from_millis(300));
+        assert!(!wait_capped(child, Duration::from_millis(300)));
         assert!(
             start.elapsed() < Duration::from_secs(3),
             "wait_capped did not bound the child"
         );
+    }
+
+    #[test]
+    fn wait_capped_reports_delivery_failure() {
+        for (status, expected) in [("0", true), ("1", false)] {
+            let child = std::process::Command::new("sh")
+                .args(["-c", &format!("exit {status}")])
+                .spawn()
+                .unwrap();
+            assert_eq!(wait_capped(child, Duration::from_secs(1)), expected);
+        }
     }
 
     /// The socket predicate: our own socket qualifies; a regular file and a

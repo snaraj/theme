@@ -93,6 +93,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
                 "version, repository, maintainer — and whether a newer release exists",
             ),
             ("help", "this text (per-command: theme <command> --help)"),
+            ("completions", "shell definitions: bash, zsh, fish, nushell"),
         ],
     ),
 ];
@@ -164,7 +165,12 @@ fn os_line() -> String {
 }
 
 pub fn usage(cfg: &Config) {
-    let desk = wallpaper_to_print(cfg);
+    let cache = if !crate::update::check_off() {
+        crate::update::check_dir(cfg)
+    } else {
+        crate::apply::desktop_cache(cfg)
+    };
+    let desk = wallpaper_to_print(cfg, cache.as_ref());
     let inc = include_line(cfg);
     let label = if inc.is_empty() || inc.ends_with("colors-kitty.conf") {
         String::new()
@@ -315,12 +321,13 @@ pub fn usage(cfg: &Config) {
     ) {
         println!("{l}");
     }
-    crate::update::maybe_note(cfg);
+    crate::update::maybe_note(cache.as_ref());
 }
 
 pub fn usage_cmd(cfg: &Config, cmd: &str) -> i32 {
     let wdir = display_text(&cfg.wallpaper_dirs_display);
     match cmd {
+        "completions" => crate::completions::run(&[]),
         "browse" | "surf" => crate::browse::usage(),
         "index" => print!("theme index\n\n  Prepare missing palettes and refresh the incremental search index.\n  Repeated searches reuse unchanged image metadata; new, replaced, or\n  edited files are refreshed. No desktop or terminal colors are applied.\n"),
         "random" => print!(

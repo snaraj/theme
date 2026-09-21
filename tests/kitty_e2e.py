@@ -16,12 +16,13 @@ Exit 0 when every assertion passed, 1 otherwise. Every screenshot, screen dump
 and kitty log is written under --output, pass or fail, and summary.json records
 the geometry and the numbers each assertion measured.
 
-What it does NOT prove: the desktop side. Applying a wallpaper, macOS Spaces
-and the palette delivered to a second window are outside this test — it never
-presses `apply`, and THEME_NO_APPLY is set so it could not if it tried.
+The apply test uses a recording wallpaper helper and a color-only Kitty
+socket, then checks persisted and live colors and a new window's inheritance.
+Physical desktop/Spaces behavior remains outside this isolated test.
 """
 
 import argparse
+import base64
 import json
 import importlib.util
 import hashlib
@@ -30,6 +31,8 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import shlex
+import socket
 import struct
 import subprocess
 import sys
@@ -129,6 +132,7 @@ class Fixture:
         # UNIX sockets have a short path limit; keep the controller separate
         # from image storage so deeply nested checkouts remain usable.
         self.socket_dir = Path(tempfile.mkdtemp(prefix="theme-socket-"))
+        self.production_socket = Path("/tmp") / ("kitty-samuel-theme-e2e-" + self.socket_dir.name)
         self.library = self.root / "library"
         for child in ("library", "cache", "config/kitty", "kitty-config", "tmp", "bin"):
             (self.root / child).mkdir(mode=0o700, parents=True)
@@ -152,9 +156,24 @@ class Fixture:
                         '[ -n "$out" ]\ncp "$THEME_WALLPAPER_DIR/large.jpg" "$out"\n')
         curl.chmod(0o500)
         stub = self.root / "bin/wallpaper"
-        stub.write_text('#!/bin/sh\n[ "$#" -eq 1 ] && [ "$1" = get ] || exit 64\n'
-                        f'printf "%s\\n" "{self.library}/fixture-000.png"\n')
+        stub.write_text('#!/bin/sh\ncase "$1" in\nget) '
+                        f'printf "%s\\n" "{self.library}/fixture-000.png" ;;\n'
+                        'set) printf "%s\\n" "$2" > "$THEME_CACHE_DIR/wallpaper-called" ;;\n'
+                        '*) exit 64 ;;\nesac\n')
         stub.chmod(0o500)
+        # A local run may coexist with the owner's terminals. Permit Theme's
+        # image transport, but contain color delivery to this disposable Kitty.
+        # The controller always uses the real helper through its private fd.
+        helper = self.root / "bin/kitten"
+        helper.write_text('#!/bin/sh\nto=\nprevious=\ncolors=\nfor arg do\n'
+            '  [ "$previous" != --to ] || to=$arg\n'
+            '  [ "$arg" != set-colors ] || colors=1\n  previous=$arg\ndone\n'
+            'if [ -n "$colors" ]; then\n'
+            '  [ "$to" = "$THEME_E2E_SOCKET" ] || exit 0\n'
+            '  [ "$THEME_E2E_MUTATION" != drop-colors ] || exit 0\nfi\n'
+            'if [ "$1" = icat ] && [ "$THEME_E2E_MUTATION" = drop-images ]; then exit 0; fi\n'
+            'exec ' + shlex.quote(str(kitty_bin / "kitten")) + ' "$@"\n')
+        helper.chmod(0o500)
         self.env = {
             "PATH": f"{self.root / 'bin'}:{kitty_bin}:/usr/bin:/bin",
             "HOME": str(self.root), "LANG": "C", "LC_ALL": "C", "TZ": "UTC",
@@ -164,6 +183,7 @@ class Fixture:
             "TMPDIR": str(self.root / "tmp"), "THEME_NO_UPDATE_CHECK": "1",
             "THEME_NO_APPLY": "1", "THEME_FORMATS": "png", "THEME_EXCLUDE_FORMATS": "",
             "THEME_CONTRAST": "7", "THEME_OPACITY": "0.9", "THEME": str(theme),
+            "THEME_E2E_SOCKET": "unix:" + str(self.production_socket), "THEME_E2E_MUTATION": "",
         }
         if "DISPLAY" in os.environ:
             self.env["DISPLAY"] = os.environ["DISPLAY"]
@@ -184,10 +204,12 @@ class Session:
         self.kitten = self.kitty.parent / "kitten"
         if not self.kitten.is_file():
             raise Failure(f"no kitten next to {self.kitty}")
-        self.socket = fixture.socket_dir / "kitty.sock"
+        self.socket = fixture.production_socket
+        self.controller = fixture.socket_dir / "controller.sock"
         self.log = (output / "kitty.log").open("wb")
         argv = [str(self.kitty), "--config", "NONE",
-                "-o", "allow_remote_control=socket-only", "-o", "font_size=11",
+                "-o", "allow_remote_control=password", "-o", 'remote_control_password="" set-colors',
+                "-o", "font_size=11",
                 "-o", "background=#000000", "-o", "foreground=#ffffff",
                 "-o", "placement_strategy=top-left", "-o", "window_padding_width=0",
                 "-o", "hide_window_decorations=yes", "-o", "confirm_os_window_close=0",
@@ -203,13 +225,19 @@ class Session:
         argv += ["-o", f"initial_window_width={WINDOW[0]}",
                  "-o", f"initial_window_height={WINDOW[1]}"]
         if command is None:
-            argv += ["--", str(args.theme), "browse", "--all", "--page-size", str(PAGE_SIZE)]
+            program = [str(args.theme), "browse", "--all", "--page-size", str(PAGE_SIZE)]
         else:
             # Hold only this test window after a one-shot command, preserving
             # its exit status and visible frame for the controller.
-            argv += ["--", "/bin/sh", "-c",
+            program = ["/bin/sh", "-c",
                      '\"$@\"; result=$?; printf "\\nTHEME_E2E_DONE=%s\\n" "$result"; read answer',
                      "theme-e2e", str(args.theme), *command]
+        session_file = output / "session.kitty"
+        controller = [sys.executable, "-I", "-B", str(Path(__file__).with_name("kitty_controller.py").resolve()),
+                      str(self.controller), str(self.kitten)]
+        session_file.write_text("launch --type=background --allow-remote-control " + shlex.join(controller)
+                                + "\nlaunch " + shlex.join(program) + "\n")
+        argv += ["--session", str(session_file)]
         self.argv = argv
         self.process = subprocess.Popen(argv, env=fixture.env, stdin=subprocess.DEVNULL,
                                         stdout=self.log, stderr=self.log)
@@ -217,6 +245,21 @@ class Session:
         self.geometry = self.window()
 
     def remote(self, *arguments, stdin=None):
+        try:
+            with socket.socket(socket.AF_UNIX) as connection:
+                connection.settimeout(35)
+                connection.connect(str(self.controller))
+                with connection.makefile("rwb") as stream:
+                    stream.write(json.dumps({"args": arguments, "stdin": base64.b64encode(stdin).decode()
+                        if stdin is not None else None}).encode() + b"\n")
+                    stream.flush()
+                    response = json.loads(stream.readline(1 << 22))
+            return subprocess.CompletedProcess(arguments, response["returncode"],
+                base64.b64decode(response["stdout"]), base64.b64decode(response["stderr"]))
+        except (OSError, ValueError) as error:
+            return subprocess.CompletedProcess(arguments, 1, b"", str(error).encode())
+
+    def public_remote(self, *arguments, stdin=None):
         return subprocess.run([str(self.kitten), "@", "--to", f"unix:{self.socket}", *arguments],
                               input=stdin, env=self.fixture.env, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=30)
@@ -301,13 +344,25 @@ class Session:
             window_id = self.geometry["platform_window_id"]
             if not window_id:
                 raise Failure("kitty reported no platform window id to capture")
-            tool = ["screencapture", "-x", "-o", "-l", str(window_id), str(path)]
+            # macOS suspends drawing an occluded window. Focus only this
+            # disposable window, so capture cannot read a stale composited frame.
+            self.remote("focus-window", "--match", "all")
+            raw = self.output / f"{name}-display.png"
+            tool = ["screencapture", "-x", "-o", "-l", str(window_id), str(raw)]
         result = subprocess.run(tool, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        if platform.system() == "Darwin" and result.returncode == 0:
+            # Native captures carry the display's ICC profile. Keep the raw
+            # evidence and compare RGB only after an explicit conversion to sRGB.
+            result = subprocess.run(["magick", str(raw), "-profile",
+                "/System/Library/ColorSync/Profiles/sRGB Profile.icc", "-depth", "8",
+                "-define", "png:color-type=2", str(path)], capture_output=True, timeout=60)
         if result.returncode != 0 or not path.is_file():
             raise Failure(f"{tool[0]} failed: {result.stderr[-500:]!r}")
         return path
 
     def close(self):
+        if self.controller.exists():
+            self.remote("stop-controller")
         if self.process.poll() is None:
             self.process.kill()
         self.process.wait(timeout=10)
@@ -426,6 +481,7 @@ def main():
     parser.add_argument("--kitty", required=True, help="the pinned kitty binary")
     parser.add_argument("--theme", required=True, help="the theme binary under test")
     parser.add_argument("--output", required=True, type=Path, help="empty directory for evidence")
+    parser.add_argument("--mutation", choices=("drop-images", "drop-colors"))
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -437,7 +493,10 @@ def main():
     version = subprocess.run([str(kitty), "--version"], stdout=subprocess.PIPE,
                              timeout=60).stdout.decode(errors="replace").strip()
     summary = {"kitty": version, "platform": platform.platform(), "theme": str(theme),
-               "sha256": hashlib.sha256(theme.read_bytes()).hexdigest(), "images": IMAGES, "page_size": PAGE_SIZE, "assertions": []}
+               "sha256": hashlib.sha256(theme.read_bytes()).hexdigest(),
+               "kitty_sha256": hashlib.sha256(kitty.read_bytes()).hexdigest(),
+               "theme_version": subprocess.check_output([str(theme), "-V"], text=True).strip(),
+               "mutation": args.mutation, "images": IMAGES, "page_size": PAGE_SIZE, "assertions": []}
     passed = True
 
     def check(name, ok, detail=""):
@@ -447,6 +506,7 @@ def main():
         print(f"{'OK  ' if ok else 'FAIL'} {name}{': ' + detail if detail else ''}", flush=True)
 
     fixture = Fixture(theme, kitty.parent, output)
+    fixture.env["THEME_E2E_MUTATION"] = args.mutation or ""
     session = None
     try:
         session = Session(args, fixture, output)
@@ -494,6 +554,8 @@ def main():
             summary["capture"] = capture
             check("sheet paints the named pictures at their source aspect ratios", capture["drawn"],
                   json.dumps(capture["matches"]))
+        if args.mutation == "drop-images":
+            return 0 if passed else 1
 
         # The keys a person presses, in the order a person presses them. Which
         # picture the queue starts on is the library's business, not this
@@ -599,6 +661,73 @@ def main():
                 check("get saved the downloaded bytes", (fixture.library / "download.jpg").read_bytes()
                       == (fixture.library / "large.jpg").read_bytes())
             check(name + " applies no palette", not (fixture.root / "cache/wal").exists())
+            session.close()
+            session = None
+        if platform.system() in ("Linux", "Darwin"):
+            fixture.env["THEME_NO_APPLY"] = ""
+            child = output / "apply"
+            child.mkdir()
+            session = Session(args, fixture, child)
+            session.wait_until("apply sheet", settled)
+            check("production socket refuses controller commands", session.public_remote("ls").returncode != 0)
+            check("production socket permits only color delivery", session.public_remote("set-colors", "background=#010203").returncode == 0)
+            def colors(text):
+                return dict(line.split(None, 1) for line in text.splitlines() if line.strip() and not line.startswith("#"))
+
+            cache = fixture.root / "cache"
+            include = fixture.root / "kitty-config/current-theme.conf"
+            prior = None
+            for phase, number in (("first", 1), ("second", 2), ("replacement", 2)):
+                before = session.remote("get-colors").stdout.decode()
+                session.send(f"select {number}\n".encode())
+                screen = session.wait_until("apply selection", lambda s: settled(s) and last_title(s) is not None
+                                            and last_title(s)[0] == str(number))
+                selected = last_title(screen)[1]
+                selected_path = fixture.library / selected
+                if phase == "replacement":
+                    stamp = selected_path.stat()
+                    selected_path.write_bytes(picture.png(19, *fixture.sizes[int(selected[8:11])], texture=True))
+                    os.utime(selected_path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+                    session.send(b"apply\n")
+                    screen = session.wait_until("changed image requires a fresh preview", lambda s: settled(s)
+                        and "the preview changed or is unavailable" in s)
+                    check("replacement refuses an unseen image", session.remote("get-colors").stdout.decode() == before)
+                # Old exports must never survive a new apply, including when
+                # the image changes at the same path with a restored mtime.
+                (cache / "colors-kitty.conf").write_text("foreground #020304\n")
+                count = session.text(extent="all").count("now:")
+                session.send(b"apply\n")
+                screen = session.wait_until("apply finishes", lambda s: settled(s)
+                                            and session.text(extent="all").count("now:") > count)
+                check(phase + " persists the selected wallpaper", (cache / "wal").read_text() == str(selected_path))
+                check(phase + " desktop helper receives the selected image", (cache / "wallpaper-called").read_text().strip() == str(selected_path))
+                check(phase + " new terminal configuration includes the palette", include.read_text().strip() == f"include {cache}/colors-kitty.conf")
+                expected = colors((cache / "colors-kitty.conf").read_text())
+                fresh = ["#%02x%02x%02x" % rgb for rgb in palette_for(session, selected)]
+                check(phase + " regenerates all ANSI colors from the selected image",
+                      [expected.get(f"color{i}") for i in range(16)] == fresh)
+                if prior is not None:
+                    check(phase + " replaces the previous colorscheme", expected != prior)
+                prior = expected
+                live = session.remote("get-colors").stdout.decode()
+                check(phase + " changes every existing terminal color",
+                      all(colors(live).get(k) == v for k, v in expected.items()) and live != before)
+                launched = session.remote("launch", "--type=window", "/bin/sh", "-c", "read answer")
+                check(phase + " controller creates a new window", launched.returncode == 0)
+                window_id = launched.stdout.decode().strip()
+                inherited = session.remote("get-colors", "--match", "id:" + window_id).stdout.decode()
+                check(phase + " new window inherits every palette color",
+                      all(colors(inherited).get(k) == v for k, v in expected.items()))
+                session.remote("close-window", "--match", "id:" + window_id)
+                evidence = child / phase
+                evidence.mkdir()
+                for name, text in [("before-colors", before), ("live-colors", live), ("inherited-colors", inherited)]:
+                    (evidence / (name + ".txt")).write_text(text)
+                for name in ("wal", "colors", "colors-kitty.conf", "colors-alacritty.toml", "wallpaper-called"):
+                    shutil.copyfile(cache / name, evidence / name)
+                shutil.copyfile(include, evidence / include.name)
+                session.dump("applied-" + phase, screen)
+                session.screenshot("applied-" + phase)
             session.close()
             session = None
     except (Failure, OSError, ValueError, subprocess.SubprocessError) as error:

@@ -100,6 +100,13 @@ class Distribution(unittest.TestCase):
         ci = (ROOT / ".github/workflows/ci.yml").read_text()
         release = (ROOT / ".github/workflows/release.yml").read_text().split("  distribution:\n", 1)[1]
         self.assertIn(".github/scripts/prepared_release.py homebrew", ci)
+        kitty = ci.split("  browser-kitty:\n", 1)[1].split("  test-macos:\n", 1)[0]
+        for command in ("cargo install --path . --locked --root target/source",
+                        "prepared_release.py install", "kitty_mutation_test.py",
+                        "--theme target/source/bin/theme --output target/kitty-e2e/source",
+                        "--theme target/installed/bin/theme --output target/kitty-e2e/installed"):
+            self.assertIn(command, kitty)
+        self.assertNotIn("continue-on-error", kitty)
         for workflow in (ci, release):
             self.assertIn("brew install snaraj/theme/theme", workflow)
             self.assertIn("brew test snaraj/theme/theme", workflow)

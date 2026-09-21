@@ -84,7 +84,7 @@ impl Palette {
     pub fn to_cache_format(&self) -> String {
         use std::fmt::Write;
         let mut out = String::with_capacity(256 + self.profile.colors.len() * 8);
-        out.push_str("pigment2\n");
+        out.push_str("pigment3\n");
         for c in &self.colors {
             out.push_str(&c.hex());
             out.push('\n');
@@ -105,6 +105,9 @@ impl Palette {
         ));
         for color in &self.profile.colors {
             writeln!(out, "#{:02x}{:02x}{:02x}", color.r, color.g, color.b).unwrap();
+        }
+        for color in self.profile.bounds {
+            writeln!(out, "{}", color.hex()).unwrap();
         }
         out
     }
@@ -128,6 +131,7 @@ pub(crate) struct CacheRecord {
     columns: usize,
     rows: usize,
     samples: Vec<Rgb>,
+    bounds: [Rgb; 2],
 }
 
 impl CacheRecord {
@@ -141,7 +145,7 @@ impl CacheRecord {
 
     fn parse_samples<const KEEP: bool>(s: &str) -> Option<Self> {
         let mut lines = s.lines();
-        if lines.next()? != "pigment2" {
+        if lines.next()? != "pigment3" {
             return None;
         }
         let mut colors = [Rgb::BLACK; 16];
@@ -168,13 +172,32 @@ impl CacheRecord {
             return None;
         }
         let mut samples = Vec::with_capacity(if KEEP { columns * rows } else { 0 });
+        let mut sampled_bounds = [Rgb::WHITE, Rgb::BLACK];
         for _ in 0..columns * rows {
             let sample = Rgb::parse(lines.next()?)?;
+            let [low, high] = sampled_bounds;
+            sampled_bounds = [
+                Rgb {
+                    r: low.r.min(sample.r),
+                    g: low.g.min(sample.g),
+                    b: low.b.min(sample.b),
+                },
+                Rgb {
+                    r: high.r.max(sample.r),
+                    g: high.g.max(sample.g),
+                    b: high.b.max(sample.b),
+                },
+            ];
             if KEEP {
                 samples.push(sample);
             }
         }
-        if lines.next().is_some() {
+        let bounds = [Rgb::parse(lines.next()?)?, Rgb::parse(lines.next()?)?];
+        if lines.next().is_some()
+            || sampled_bounds
+                .iter()
+                .any(|&c| !ImageProfile::bounds_cover(bounds, c))
+        {
             return None;
         }
         Some(Self {
@@ -188,6 +211,7 @@ impl CacheRecord {
             columns,
             rows,
             samples,
+            bounds,
         })
     }
 
@@ -203,8 +227,10 @@ impl CacheRecord {
             columns,
             rows,
             samples,
+            bounds,
         } = self;
-        let profile = ImageProfile::new(width, height, columns, rows, samples)?;
+        let profile =
+            ImageProfile::new(width, height, columns, rows, samples)?.with_bounds(bounds)?;
         Some(Palette {
             colors,
             foreground,
@@ -361,6 +387,12 @@ mod tests {
         for suffix in ["\n", "extra\n", "#123456\n", "\r"] {
             check(&(valid.clone() + suffix), None);
         }
+        // A narrowed or inverted bound would understate the required floor.
+        for (position, color) in [(lines.len() - 2, "#ff28be"), (lines.len() - 1, "#0028be")] {
+            let mut changed = lines.clone();
+            changed[position] = color;
+            check(&changed.join("\n"), None);
+        }
     }
 
     #[test]
@@ -370,7 +402,7 @@ mod tests {
         assert!(Palette::from_cache_format("wal\n#000000\n").is_none());
         let valid = sample().to_cache_format();
         for invalid in [
-            valid.replace("pigment2", "pigment1"),
+            valid.replace("pigment3", "pigment2"),
             valid.replace("profile 1 1 1 1", "profile 1 1 17 1"),
             valid.replace("profile 1 1 1 1", "profile 0 1 1 1"),
             valid.clone() + "#123456\n",
