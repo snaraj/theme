@@ -249,8 +249,9 @@ splits without adding or replacing key mappings.
   and your own `kitty-*` sockets in the temp directory); future windows pick
   the palette up from `current-theme.conf`. Pictures use kitty's graphics
   protocol, over ssh too.
-- **tmux, screen, zellij** — colored like any other terminal; no inline
-  pictures, and a preview says why.
+- **tmux, screen, zellij** — colored like any other terminal. Pictures work in
+  tmux inside kitty with `set -g allow-passthrough on`; screen and zellij get
+  none, and a preview says why.
 - **alacritty** — a managed `theme-colors.toml` is written under
   `~/.config/alacritty/`; import it once and alacritty live-reloads on every
   theme change.

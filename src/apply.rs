@@ -4,7 +4,7 @@
 //! sanctioned path to a live kitty (never SIGUSR1: a config reload resets
 //! runtime state, and a theme change may touch colors only).
 
-use crate::config::{Config, TerminalClass};
+use crate::config::Config;
 use crate::imaging::img_size;
 use crate::ui::{die, note, parse_hex6};
 use pigment::{Options, Palette};
@@ -209,9 +209,10 @@ impl Terminal for Kitty {
             current,
             rustix::process::getuid().as_raw(),
         );
-        // The window theme runs in must be among those reached.
-        let mut failed = cfg.term.class == TerminalClass::Kitty
-            && current.is_none_or(|p| !sockets.iter().any(|s| s == p));
+        // The kitty window theme runs in, inside tmux too, must be among
+        // those reached.
+        let mut failed =
+            cfg.term.kitty_window() && current.is_none_or(|p| !sockets.iter().any(|s| s == p));
         for p in sockets {
             let child = Command::new("kitten")
                 .arg("@")
@@ -317,7 +318,7 @@ impl Terminal for Alacritty {
 struct OscTty;
 impl Terminal for OscTty {
     fn apply(&self, cfg: &Config) -> Result<(), String> {
-        if cfg.term.class == TerminalClass::Kitty {
+        if cfg.term.kitty_window() {
             return Ok(());
         }
         let Ok(pal) = fs::read_to_string(cfg.cache_dir.join("colors")) else {

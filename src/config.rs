@@ -34,8 +34,12 @@ pub enum TerminalClass {
     /// kitty's protocol on the tty, but no local window to address: over
     /// ssh, or behind a hop such as sudo that dropped KITTY_WINDOW_ID.
     KittyRemote,
-    /// tmux, screen or zellij owns the screen. Kitty graphics are not
-    /// attempted, even when kitty is the outer terminal.
+    /// tmux with kitty outside it (KITTY_WINDOW_ID or TERM=xterm-kitty):
+    /// kitty graphics pass through when tmux allows it. `window` is a local
+    /// kitty window named by KITTY_WINDOW_ID, whose socket a palette must
+    /// reach.
+    TmuxInKitty { window: bool },
+    /// screen, zellij, or tmux without kitty outside: no kitty graphics.
     Multiplexed,
     /// Any other terminal, or none: OSC colors, no inline pictures.
     #[default]
@@ -74,6 +78,8 @@ pub struct TermFacts {
     pub term: String,
     pub kitty_window: bool,
     pub listen_on: String,
+    pub tmux: bool,
+    /// screen or zellij.
     pub multiplexer: bool,
     pub ssh: bool,
     pub no_color: bool,
@@ -90,7 +96,8 @@ impl TermFacts {
             term: var("TERM"),
             kitty_window: set(&["KITTY_WINDOW_ID"]),
             listen_on: var("KITTY_LISTEN_ON"),
-            multiplexer: set(&["TMUX", "STY", "ZELLIJ"]),
+            tmux: set(&["TMUX"]),
+            multiplexer: set(&["STY", "ZELLIJ"]),
             ssh: set(&["SSH_CONNECTION", "SSH_TTY"]),
             no_color: set(&["NO_COLOR"]),
             colorterm: var("COLORTERM"),
@@ -101,11 +108,19 @@ impl TermFacts {
 impl Term {
     pub fn detect(f: &TermFacts) -> Term {
         use TerminalClass::*;
-        let class = if f.multiplexer || f.term.starts_with("screen") || f.term.starts_with("tmux") {
+        let kitty = f.kitty_window || f.term == "xterm-kitty";
+        let window = f.kitty_window && !f.ssh;
+        let class = if f.tmux && !f.multiplexer && kitty {
+            TmuxInKitty { window }
+        } else if f.tmux
+            || f.multiplexer
+            || f.term.starts_with("screen")
+            || f.term.starts_with("tmux")
+        {
             Multiplexed
-        } else if f.kitty_window && !f.ssh {
+        } else if window {
             Kitty
-        } else if f.kitty_window || f.term == "xterm-kitty" {
+        } else if kitty {
             KittyRemote
         } else {
             Osc
@@ -132,11 +147,14 @@ impl Term {
     /// kitty draws what stdout shows: its graphics and hyperlinks reach a
     /// person.
     pub fn graphics(&self) -> bool {
-        self.tty
-            && matches!(
-                self.class,
-                TerminalClass::Kitty | TerminalClass::KittyRemote
-            )
+        use TerminalClass::*;
+        self.tty && matches!(self.class, Kitty | KittyRemote | TmuxInKitty { .. })
+    }
+
+    /// theme runs in a local kitty window, which its socket must recolor.
+    pub fn kitty_window(&self) -> bool {
+        use TerminalClass::*;
+        matches!(self.class, Kitty | TmuxInKitty { window: true })
     }
 }
 
@@ -261,8 +279,8 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// Facts from TERM and flags: t tty, w KITTY_WINDOW_ID, m multiplexer,
-    /// s ssh, n NO_COLOR, c/b COLORTERM truecolor/24bit.
+    /// Facts from TERM and flags: t tty, w KITTY_WINDOW_ID, x TMUX, m STY or
+    /// ZELLIJ, s ssh, n NO_COLOR, c/b COLORTERM truecolor/24bit.
     fn facts(term: &str, flags: &str) -> TermFacts {
         let on = |c| flags.contains(c);
         let colorterm = match (on('c'), on('b')) {
@@ -274,6 +292,7 @@ mod tests {
             stdout_tty: on('t'),
             term: term.into(),
             kitty_window: on('w'),
+            tmux: on('x'),
             multiplexer: on('m'),
             ssh: on('s'),
             no_color: on('n'),
@@ -287,24 +306,31 @@ mod tests {
     fn every_terminal_class_is_decided_by_its_facts() {
         use Colors::*;
         use TerminalClass::*;
-        for (term, flags, class, colors, graphics) in [
-            ("xterm-kitty", "w", Kitty, True, false), // a pipe inside kitty
-            ("xterm-kitty", "tw", Kitty, True, true), // plain kitty
-            ("xterm-kitty", "ts", KittyRemote, True, true), // kitty over ssh
-            ("xterm-kitty", "tws", KittyRemote, True, true), // window id over ssh
-            ("xterm-kitty", "t", KittyRemote, True, true), // no KITTY_WINDOW_ID
-            ("tmux-256color", "twm", Multiplexed, Ansi256, false), // tmux in kitty
-            ("screen-256color", "tw", Multiplexed, Ansi256, false), // TERM only
-            ("xterm-kitty", "twmc", Multiplexed, True, false), // zellij keeps TERM
-            ("xterm-256color", "tb", Osc, True, false), // OSC, 24-bit
-            ("xterm-256color", "t", Osc, Ansi256, false), // OSC, no COLORTERM
-            ("xterm-256color", "", Osc, True, false), // OSC into a pipe
-            ("xterm-kitty", "twn", Kitty, Off, true), // NO_COLOR in kitty
-            ("", "n", Osc, Off, false),               // NO_COLOR, a pipe
+        let tik = |window| TmuxInKitty { window };
+        for (term, flags, class, colors, graphics, window) in [
+            ("xterm-kitty", "w", Kitty, True, false, true), // a pipe inside kitty
+            ("xterm-kitty", "tw", Kitty, True, true, true), // plain kitty
+            ("xterm-kitty", "ts", KittyRemote, True, true, false), // kitty over ssh
+            ("xterm-kitty", "tws", KittyRemote, True, true, false), // window id over ssh
+            ("xterm-kitty", "t", KittyRemote, True, true, false), // no KITTY_WINDOW_ID
+            ("tmux-256color", "twx", tik(true), Ansi256, true, true), // tmux in kitty
+            ("tmux-256color", "wx", tik(true), True, false, true), // tmux in kitty, a pipe
+            ("xterm-kitty", "tx", tik(false), Ansi256, true, false), // tmux, kitty TERM
+            ("tmux-256color", "twxs", tik(false), Ansi256, true, false), // tmux in kitty, ssh
+            ("tmux-256color", "tx", Multiplexed, Ansi256, false, false), // tmux, no kitty
+            ("screen-256color", "twm", Multiplexed, Ansi256, false, false), // screen in kitty
+            ("screen-256color", "tw", Multiplexed, Ansi256, false, false), // screen, TERM only
+            ("xterm-kitty", "twmc", Multiplexed, True, false, false), // zellij in kitty
+            ("tmux-256color", "twxm", Multiplexed, Ansi256, false, false), // screen in tmux
+            ("xterm-256color", "tb", Osc, True, false, false), // OSC, 24-bit
+            ("xterm-256color", "t", Osc, Ansi256, false, false), // OSC, no COLORTERM
+            ("xterm-256color", "", Osc, True, false, false), // OSC into a pipe
+            ("xterm-kitty", "twn", Kitty, Off, true, true), // NO_COLOR in kitty
+            ("", "n", Osc, Off, false, false),              // NO_COLOR, a pipe
         ] {
             let t = Term::detect(&facts(term, flags));
-            let got = (t.class, t.colors, t.graphics());
-            assert_eq!(got, (class, colors, graphics), "{term} {flags}");
+            let got = (t.class, t.colors, t.graphics(), t.kitty_window());
+            assert_eq!(got, (class, colors, graphics, window), "{term} {flags}");
         }
     }
 

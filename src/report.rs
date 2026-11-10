@@ -46,6 +46,9 @@ pub(crate) fn preview_failure(term: &Term, cols: usize) -> Option<&'static str> 
         _ if !have("kitten") => {
             "image preview unavailable: Kitty's kitten helper was not found on PATH."
         }
+        TerminalClass::TmuxInKitty { .. } => {
+            "image preview unavailable: tmux passthrough is probably off; add 'set -g allow-passthrough on' to tmux.conf."
+        }
         _ => "image preview unavailable: Kitty's image renderer failed for this file.",
     })
 }
@@ -382,10 +385,32 @@ pub fn render_preview(term: &Term, img: &Path, cols: usize, rows: usize) -> Opti
 fn parse_preview(out: &str, cols: usize, rows: usize) -> Option<Preview> {
     let out = out.trim_start_matches('\r');
     let mut end = 0;
-    // A streamed picture can span several APCs; keep every packet intact.
-    // No multiplexer wrapper can arrive: kitten never runs inside one.
-    while out[end..].starts_with("\x1b_G") {
-        end += 3 + out[end + 3..].find("\x1b\\")? + 2;
+    // A streamed picture can span several APCs. Keep every packet intact,
+    // including tmux's wrappers; its doubled ESC is not the wrapper's end.
+    loop {
+        let rest = &out[end..];
+        let wrapped = rest.starts_with("\x1bPtmux;");
+        if !wrapped && !rest.starts_with("\x1b_G") {
+            break;
+        }
+        let bytes = rest.as_bytes();
+        let mut i = if wrapped { 7 } else { 3 };
+        loop {
+            if i + 1 >= bytes.len() {
+                return None;
+            }
+            if bytes[i] == 0x1b {
+                if wrapped && bytes[i + 1] == 0x1b {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i + 1] == b'\\' {
+                    end += i + 2;
+                    break;
+                }
+            }
+            i += 1;
+        }
     }
     if end == 0 {
         return None;
@@ -453,6 +478,15 @@ mod graphics_tests {
             p.rows,
             ["\x1b[38:2:1:2:3m\u{10eeee}\u{305}\u{305}  \x1b[39m"]
         );
+    }
+
+    #[test]
+    fn tmux_wrappers_keep_their_escaped_inner_terminators() {
+        let packets = "\x1b_Ga=T,c=1,m=1;YWJj\x1b\\\x1b_Gm=0;ZA==\x1b\\";
+        let wrapped = format!("\x1bPtmux;{}\x1b\\", packets.replace('\x1b', "\x1b\x1b"));
+        let p = parse_preview(&format!("{wrapped}{CELLS}"), 1, 1).unwrap();
+        assert_eq!(p.apc, wrapped);
+        assert_eq!(p.rows.len(), 1);
     }
 
     #[test]
