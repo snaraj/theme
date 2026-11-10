@@ -184,9 +184,10 @@ pub fn usage(cfg: &Config) {
     };
     let colors = scheme_colors(cfg);
     let eight: Vec<String> = colors.iter().take(8).cloned().collect();
-    let term = if cfg.term.kitty() {
-        // Our own literal OSC 8 hyperlink — assigned WITHOUT display_text,
-        // which would strip the very sequence it exists to emit.
+    let term = if cfg.term.graphics() {
+        // Our own literal OSC 8 hyperlink, for a terminal only — assigned
+        // WITHOUT display_text, which would strip the very sequence it
+        // exists to emit.
         "\x1b]8;;https://sw.kovidgoyal.net/kitty/\x07kitty\x1b]8;;\x07".to_string()
     } else {
         // TERM_PROGRAM and TERM are environment data — either can carry an

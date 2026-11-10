@@ -1143,7 +1143,7 @@ pub fn run(cfg: &Config, args: &[String]) {
         .collect();
     paths.sort();
     paths.dedup();
-    let graphics = interactive && cfg.term.kitty();
+    let graphics = interactive && cfg.term.graphics();
     let mut browser = Browser {
         cfg,
         options,

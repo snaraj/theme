@@ -24,14 +24,11 @@ pub const UA: &str = concat!(
 );
 const FORMATS_ALL: &str = "jpg jpeg png webp gif bmp tif tiff";
 
-/// What the terminal on stdout can show. Kitty graphics, the window a
-/// palette must reach, OSC color writes and the TERMINAL label all match on
-/// this one value, decided once by [`Term::detect`].
+/// The terminal theme runs in. Kitty graphics, the window a palette must
+/// reach, OSC color writes and the TERMINAL label all match on this one
+/// value, decided once by [`Term::detect`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TerminalClass {
-    /// stdout is not a terminal: nothing here is drawn for a person.
-    #[default]
-    Pipe,
     /// A local kitty window, addressable over its own socket.
     Kitty,
     /// kitty's protocol on the tty, but no local window to address: over
@@ -40,13 +37,14 @@ pub enum TerminalClass {
     /// tmux, screen or zellij owns the screen. Kitty graphics are not
     /// attempted, even when kitty is the outer terminal.
     Multiplexed,
-    /// Any other terminal: OSC colors, no inline pictures.
+    /// Any other terminal, or none: OSC colors, no inline pictures.
+    #[default]
     Osc,
 }
 
 /// How color swatches are written: off under NO_COLOR (any non-empty value,
-/// no-color.org), 24-bit where the terminal is kitty or says so in
-/// COLORTERM, the 256-color cube elsewhere.
+/// no-color.org), 24-bit into a pipe, in kitty or where COLORTERM says so,
+/// the 256-color cube elsewhere.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Colors {
     Off,
@@ -59,6 +57,9 @@ pub enum Colors {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Term {
     pub class: TerminalClass,
+    /// stdout is a terminal. Only then is anything drawn for a person: a
+    /// pipe gets no pictures and no notices whatever the class.
+    pub tty: bool,
     pub colors: Colors,
     /// KITTY_LISTEN_ON's unix socket, wherever the variable is set.
     pub socket: Option<PathBuf>,
@@ -66,8 +67,7 @@ pub struct Term {
 
 /// Everything detection reads, in one place, so [`Term::detect`] is a pure
 /// function a test drives without a terminal. The tty answer comes from the
-/// descriptor itself and outranks every variable: a pipe is a pipe whatever
-/// the environment claims.
+/// descriptor itself, never from a variable.
 #[derive(Default)]
 pub struct TermFacts {
     pub stdout_tty: bool,
@@ -101,9 +101,7 @@ impl TermFacts {
 impl Term {
     pub fn detect(f: &TermFacts) -> Term {
         use TerminalClass::*;
-        let class = if !f.stdout_tty {
-            Pipe
-        } else if f.multiplexer || f.term.starts_with("screen") || f.term.starts_with("tmux") {
+        let class = if f.multiplexer || f.term.starts_with("screen") || f.term.starts_with("tmux") {
             Multiplexed
         } else if f.kitty_window && !f.ssh {
             Kitty
@@ -114,7 +112,8 @@ impl Term {
         };
         let colors = if f.no_color {
             Colors::Off
-        } else if matches!(class, Pipe | Kitty | KittyRemote)
+        } else if !f.stdout_tty
+            || matches!(class, Kitty | KittyRemote)
             || matches!(f.colorterm.as_str(), "truecolor" | "24bit")
         {
             Colors::True
@@ -124,17 +123,20 @@ impl Term {
         let socket = f.listen_on.strip_prefix("unix:").map(PathBuf::from);
         Term {
             class,
+            tty: f.stdout_tty,
             colors,
             socket,
         }
     }
 
-    /// kitty's own protocol reaches the person reading stdout.
-    pub fn kitty(&self) -> bool {
-        matches!(
-            self.class,
-            TerminalClass::Kitty | TerminalClass::KittyRemote
-        )
+    /// kitty draws what stdout shows: its graphics and hyperlinks reach a
+    /// person.
+    pub fn graphics(&self) -> bool {
+        self.tty
+            && matches!(
+                self.class,
+                TerminalClass::Kitty | TerminalClass::KittyRemote
+            )
     }
 }
 
@@ -259,118 +261,50 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// One row per terminal class. The facts are the whole input, so each
-    /// class is pinned without a real terminal.
+    /// Facts from TERM and flags: t tty, w KITTY_WINDOW_ID, m multiplexer,
+    /// s ssh, n NO_COLOR, c/b COLORTERM truecolor/24bit.
+    fn facts(term: &str, flags: &str) -> TermFacts {
+        let on = |c| flags.contains(c);
+        let colorterm = match (on('c'), on('b')) {
+            (true, _) => "truecolor",
+            (_, true) => "24bit",
+            _ => "",
+        };
+        TermFacts {
+            stdout_tty: on('t'),
+            term: term.into(),
+            kitty_window: on('w'),
+            multiplexer: on('m'),
+            ssh: on('s'),
+            no_color: on('n'),
+            colorterm: colorterm.into(),
+            ..Default::default()
+        }
+    }
+
+    /// One row per terminal class; the facts are the whole input.
     #[test]
     fn every_terminal_class_is_decided_by_its_facts() {
         use Colors::*;
         use TerminalClass::*;
-        let tty = |term: &str| TermFacts {
-            stdout_tty: true,
-            term: term.into(),
-            ..Default::default()
-        };
-        let kitty = |f: TermFacts| TermFacts {
-            kitty_window: true,
-            ..f
-        };
-        let rows = [
-            (
-                "pipe inside kitty",
-                TermFacts {
-                    stdout_tty: false,
-                    ..kitty(tty("xterm-kitty"))
-                },
-                Pipe,
-                True,
-            ),
-            ("plain kitty", kitty(tty("xterm-kitty")), Kitty, True),
-            (
-                "kitty over ssh",
-                TermFacts {
-                    ssh: true,
-                    ..tty("xterm-kitty")
-                },
-                KittyRemote,
-                True,
-            ),
-            (
-                "kitty window id over ssh",
-                TermFacts {
-                    ssh: true,
-                    ..kitty(tty("xterm-kitty"))
-                },
-                KittyRemote,
-                True,
-            ),
-            (
-                "tmux inside kitty",
-                TermFacts {
-                    multiplexer: true,
-                    ..kitty(tty("tmux-256color"))
-                },
-                Multiplexed,
-                Ansi256,
-            ),
-            (
-                "screen inside kitty, TERM only",
-                kitty(tty("screen-256color")),
-                Multiplexed,
-                Ansi256,
-            ),
-            (
-                "zellij keeps kitty's TERM",
-                TermFacts {
-                    multiplexer: true,
-                    colorterm: "truecolor".into(),
-                    ..kitty(tty("xterm-kitty"))
-                },
-                Multiplexed,
-                True,
-            ),
-            (
-                "OSC terminal with truecolor",
-                TermFacts {
-                    colorterm: "24bit".into(),
-                    ..tty("xterm-256color")
-                },
-                Osc,
-                True,
-            ),
-            (
-                "OSC terminal without COLORTERM",
-                tty("xterm-256color"),
-                Osc,
-                Ansi256,
-            ),
-            (
-                "TERM=xterm-kitty without KITTY_WINDOW_ID",
-                tty("xterm-kitty"),
-                KittyRemote,
-                True,
-            ),
-            (
-                "NO_COLOR in kitty",
-                TermFacts {
-                    no_color: true,
-                    ..kitty(tty("xterm-kitty"))
-                },
-                Kitty,
-                Off,
-            ),
-            (
-                "NO_COLOR into a pipe",
-                TermFacts {
-                    no_color: true,
-                    ..Default::default()
-                },
-                Pipe,
-                Off,
-            ),
-        ];
-        for (name, facts, class, colors) in rows {
-            let t = Term::detect(&facts);
-            assert_eq!((t.class, t.colors), (class, colors), "{name}");
+        for (term, flags, class, colors, graphics) in [
+            ("xterm-kitty", "w", Kitty, True, false), // a pipe inside kitty
+            ("xterm-kitty", "tw", Kitty, True, true), // plain kitty
+            ("xterm-kitty", "ts", KittyRemote, True, true), // kitty over ssh
+            ("xterm-kitty", "tws", KittyRemote, True, true), // window id over ssh
+            ("xterm-kitty", "t", KittyRemote, True, true), // no KITTY_WINDOW_ID
+            ("tmux-256color", "twm", Multiplexed, Ansi256, false), // tmux in kitty
+            ("screen-256color", "tw", Multiplexed, Ansi256, false), // TERM only
+            ("xterm-kitty", "twmc", Multiplexed, True, false), // zellij keeps TERM
+            ("xterm-256color", "tb", Osc, True, false), // OSC, 24-bit
+            ("xterm-256color", "t", Osc, Ansi256, false), // OSC, no COLORTERM
+            ("xterm-256color", "", Osc, True, false), // OSC into a pipe
+            ("xterm-kitty", "twn", Kitty, Off, true), // NO_COLOR in kitty
+            ("", "n", Osc, Off, false),               // NO_COLOR, a pipe
+        ] {
+            let t = Term::detect(&facts(term, flags));
+            let got = (t.class, t.colors, t.graphics());
+            assert_eq!(got, (class, colors, graphics), "{term} {flags}");
         }
     }
 

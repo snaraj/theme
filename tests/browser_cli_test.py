@@ -128,7 +128,8 @@ class Terminal:
         return not modes & self.termios.ECHO and not modes & self.termios.ICANON
 
     def leave(self, keys=b"q\n", code=0):
-        self.send(keys)
+        if keys:  # a command that leaves by itself may already have closed the pty
+            self.send(keys)
         deadline = time.monotonic() + 15
         while self.process.poll() is None:
             # Keep reading while it goes: a pty whose master stops being

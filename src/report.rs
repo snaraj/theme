@@ -32,8 +32,10 @@ fn have(cmd: &str) -> bool {
 
 /// Explain a missing requested picture to a person, without adding noise to pipes.
 pub(crate) fn preview_failure(term: &Term, cols: usize) -> Option<&'static str> {
+    if !term.tty {
+        return None;
+    }
     Some(match term.class {
-        TerminalClass::Pipe => return None,
         TerminalClass::Multiplexed => {
             "image preview unavailable inside tmux, screen or zellij; run theme directly in Kitty to view pictures."
         }
@@ -357,7 +359,7 @@ pub(crate) fn preview_window_size() -> String {
 }
 
 pub fn render_preview(term: &Term, img: &Path, cols: usize, rows: usize) -> Option<Preview> {
-    if !term.kitty() || !have("kitten") {
+    if !term.graphics() || !have("kitten") {
         return None;
     }
     let out = Command::new("kitten")
@@ -746,7 +748,7 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
     let stacked = cols < if verbose { 87 } else { 44 };
     let indent = if cols < 16 { "" } else { "  " };
     let continuation = if cols < 16 { "" } else { "    " };
-    let pv_ok = verbose && !stacked && cols >= 96 && cfg.term.kitty() && have("kitten");
+    let pv_ok = verbose && !stacked && cols >= 96 && cfg.term.graphics() && have("kitten");
     let pvw = if pv_ok { 9 } else { 0 };
     let mut namew = if verbose {
         cols.saturating_sub(71 + pvw)
