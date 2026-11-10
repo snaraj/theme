@@ -59,8 +59,12 @@ money, never trade away security.
   update, no delete, no force-push). One release slot, anchored by the tag
   ledger itself: a Draft claims the next unpublished `vX.Y.Z`; parallel
   Drafts each claim base+1, and declared merge order resolves who re-cuts.
-- A merge to main that moves `Cargo.toml` publishes after its Linux and macOS
-  CI jobs succeed. Before merge, dispatch the branch release dry run and record
+- A merge to main that moves `Cargo.toml` publishes after all five CI jobs
+  succeed on it: `lint-test`, `test-macos`, `browser-kitty`,
+  `test-linux-distros`, `test-nixos` (the release authorizer's set, pinned to
+  `ci.yml` by a test). The branch ruleset requires only the first three; until
+  it requires all five, a version-moving PR merges only with all five green,
+  or it merges and never publishes. Before merge, dispatch the branch release dry run and record
   its tested artifacts in `.github/release-preparation.json`; update the four
   Homebrew pins in that same PR. Publication verifies the source tree matches
   preparation, excluding only that receipt and `Formula/theme.rb`, which are

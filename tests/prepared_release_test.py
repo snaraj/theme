@@ -255,6 +255,10 @@ class Preparation(unittest.TestCase):
             elif command == ["git", "rev-parse", "HEAD"]:
                 self.assertFalse(published, "published expectations must never come from HEAD")
                 data = source.encode()
+            elif command == ["git", "show", source + ":.github/scripts/prepared_release.py"]:
+                self.assertTrue(published, "prepared expectations come from HEAD's own list")
+                data = {"undeclared": b"TESTS = ()\n", "traversal": b'INSTALLED_TESTS = ("../x.py",)\n'}.get(
+                    bad, b'INSTALLED_TESTS = ("portable-smoke.sh", "browser_cli_test.py")\n')
             elif command == ["git", "show", source + ":Cargo.toml"]:
                 data = b'version = "1.2.2"\n' if bad == "version" else b'version = "1.2.3"\n'
             elif command[:4] == ["git", "ls-tree", "-z", source]:
@@ -277,7 +281,9 @@ class Preparation(unittest.TestCase):
             prepared.export_tests(destination, "v1.2.3", published)
         manifest = prepared.json.loads((destination / "manifest.json").read_text())
         self.assertEqual(manifest["source_sha"], source)
-        self.assertEqual(set(manifest["scripts"]), set(prepared.INSTALLED_TESTS))
+        # A published tag older than a newly added test exports what it declared.
+        expected = {"portable-smoke.sh", "browser_cli_test.py"} if published else set(prepared.INSTALLED_TESTS)
+        self.assertEqual(set(manifest["scripts"]), expected)
         self.assertEqual(manifest["published"], published)
         for name, digest in manifest["scripts"].items():
             self.assertEqual((destination / name).read_bytes(), payload)
@@ -289,7 +295,7 @@ class Preparation(unittest.TestCase):
         self.export_tests(False)
 
     def test_installed_expectations_never_fall_back_or_accept_wrong_sources(self):
-        for bad in ("fetch", "version", "missing", "symlink", "size", "mutable", "moved"):
+        for bad in ("fetch", "version", "missing", "symlink", "size", "mutable", "moved", "undeclared", "traversal"):
             with self.subTest(bad=bad), self.assertRaises((ValueError, prepared.subprocess.CalledProcessError)):
                 self.export_tests(True, bad)
             self.assertFalse((self.directory / "tests").exists())

@@ -3520,9 +3520,9 @@ mod tests {
         // The ACE lines `ls -lde` prints, and the header line it prints
         // first — which carries a ':' of its own in the timestamp.
         assert!(ace_line(" 0: group:everyone deny delete"));
-        assert!(ace_line("12: user:samuel allow read"));
+        assert!(ace_line("12: user:someone allow read"));
         assert!(!ace_line(
-            "-rw-r--r--@ 1 samuel  staff  6595 Sep  3 01:47 Index.plist"
+            "-rw-r--r--@ 1 someone  staff  6595 Sep  3 01:47 Index.plist"
         ));
         assert!(!ace_line(""));
         assert!(!ace_line("no colon here"));

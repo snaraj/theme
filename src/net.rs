@@ -428,6 +428,7 @@ pub fn curl_download(url: &str, dest: &Path, timeout: u32) -> bool {
 pub fn curl_config(config: &str, args: &[&str]) -> Option<Vec<u8>> {
     let mut child = Command::new("curl")
         .args(args)
+        .args(["-A", UA])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -607,6 +608,63 @@ mod tests {
             }
         });
         (port, hits, jh)
+    }
+
+    /// #95: what curl actually sends is the honest User-Agent, on the pinned
+    /// hop and on the plain download alike.
+    #[test]
+    fn requests_send_the_honest_user_agent() {
+        let capture = || {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            l.set_nonblocking(true).unwrap();
+            let jh = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut s = loop {
+                    match l.accept() {
+                        Ok((s, _)) => break s,
+                        Err(_) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(e) => panic!("curl never connected: {e}"),
+                    }
+                };
+                s.set_nonblocking(false).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                String::from_utf8_lossy(&request).into_owned()
+            });
+            (port, jh)
+        };
+        let dest = std::env::temp_dir().join(format!("theme-ua-{}", std::process::id()));
+        let (port, jh) = capture();
+        let v = Vetted {
+            url: format!("http://pin.test:{port}/x"),
+            host: "pin.test".to_string(),
+            port,
+            ip: "127.0.0.1".parse().unwrap(),
+        };
+        let _ = curl_pinned(&v.url, &v, &dest, 5);
+        let pinned = jh.join().unwrap();
+        let (port, jh) = capture();
+        let _ = curl_download(&format!("http://127.0.0.1:{port}/x"), &dest, 5);
+        let plain = jh.join().unwrap();
+        let _ = std::fs::remove_file(&dest);
+        for request in [pinned, plain] {
+            assert!(
+                request.contains(&format!("\r\nUser-Agent: {UA}\r\n")),
+                "{request}"
+            );
+            assert!(!request.contains("Mozilla"), "{request}");
+        }
     }
 
     /// The SSRF vectors the string check missed: numeric host spellings and a

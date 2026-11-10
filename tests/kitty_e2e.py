@@ -132,7 +132,7 @@ class Fixture:
         # UNIX sockets have a short path limit; keep the controller separate
         # from image storage so deeply nested checkouts remain usable.
         self.socket_dir = Path(tempfile.mkdtemp(prefix="theme-socket-"))
-        self.production_socket = Path("/tmp") / ("kitty-samuel-theme-e2e-" + self.socket_dir.name)
+        self.production_socket = Path("/tmp") / ("kitty-theme-e2e-" + self.socket_dir.name)
         self.library = self.root / "library"
         for child in ("library", "cache", "config/kitty", "kitty-config", "tmp", "bin"):
             (self.root / child).mkdir(mode=0o700, parents=True)

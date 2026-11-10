@@ -313,7 +313,7 @@ impl Browser<'_> {
     fn image_unavailable(&mut self, cols: usize) {
         if self.interactive
             && !self.image_warning_shown
-            && let Some(message) = report::preview_failure(cols)
+            && let Some(message) = report::preview_failure(&self.cfg.term, cols)
         {
             note(message);
             self.image_warning_shown = true;
@@ -335,7 +335,7 @@ impl Browser<'_> {
             self.pictures.push_front(cached);
             return Some(picture);
         }
-        let picture = report::render_preview(&self.paths[id], cols, rows)?;
+        let picture = report::render_preview(&self.cfg.term, &self.paths[id], cols, rows)?;
         if identity(&self.paths[id])? != current {
             return None;
         }
@@ -541,7 +541,7 @@ impl Browser<'_> {
                         .collect();
                     print!(
                         "{}{}",
-                        report::swatch_cells(&sw).0,
+                        report::swatch_cells(&sw, self.cfg.term.colors).0,
                         " ".repeat(width.saturating_sub(count * 3))
                     );
                 } else {
@@ -579,7 +579,7 @@ impl Browser<'_> {
         match &self.measured[&id] {
             Ok(p) => {
                 say("COLORSCHEME");
-                print!("{}", p.swatches(cols));
+                print!("{}", p.swatches(cols, self.cfg.term.colors));
             }
             Err(e) => note(&format!("preview unavailable: {e}")),
         }
@@ -1143,7 +1143,7 @@ pub fn run(cfg: &Config, args: &[String]) {
         .collect();
     paths.sort();
     paths.dedup();
-    let graphics = interactive && report::in_kitty();
+    let graphics = interactive && cfg.term.kitty();
     let mut browser = Browser {
         cfg,
         options,
@@ -1415,6 +1415,7 @@ mod tests {
             formats: vec!["png".into()],
             contrast: 7.0,
             no_apply: true,
+            term: Default::default(),
         };
         let mut browser = Browser {
             cfg: &cfg,

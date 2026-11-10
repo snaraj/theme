@@ -46,7 +46,8 @@ sys.stdout.write("\\r\\x1b_Ga=T,c=1,r=1,m=1;YWJj\\x1b\\\\"
             "THEME_WALLPAPER_DIR": str(root / "library"), "THEME_NO_APPLY": "1",
             "THEME_NO_UPDATE_CHECK": "1", "THEME_OPACITY": "0.8", "THEME_CONTRAST": "4.5",
             "THEME_FORMATS": "png", "THEME_EXCLUDE_FORMATS": "", "TMPDIR": str(root / "tmp"),
-            "KITTY_WINDOW_ID": "1", "TERM": "xterm-kitty", "PREVIEW_CALLS": str(calls)}
+            "KITTY_WINDOW_ID": "1", "TERM": "xterm-kitty", "TMUX": "", "STY": "", "ZELLIJ": "",
+            "PREVIEW_CALLS": str(calls)}
         for args in (["preview", str(picture)], ["list", "-v"], ["browse", "--all"]):
             result = subprocess.run([str(binary), *args], env=env, capture_output=True, timeout=15)
             browser.require(result.returncode == 0, result.stderr)
@@ -88,6 +89,7 @@ sys.stdout.write("\\r\\x1b_Ga=T,c=1,r=1,m=1;YWJj\\x1b\\\\"
 
         for overrides, columns, reason in [
             ({"KITTY_WINDOW_ID": "", "TERM": "xterm-256color"}, 80, "use Kitty to view pictures"),
+            ({"TMUX": "/tmp/tmux-0/default,1,0"}, 80, "inside tmux, screen or zellij"),
             ({"PATH": str(root / "empty-bin")}, 80, "kitten helper was not found on PATH"),
             ({"PREVIEW_FAILURE": "1"}, 80, "image renderer failed for this file"),
             ({"PREVIEW_INVALID": "1"}, 80, "image renderer failed for this file"),

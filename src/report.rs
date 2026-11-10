@@ -4,7 +4,7 @@
 //! inline previews.
 
 use crate::apply::{derive_options, schemes_dir, wallpaper_to_print};
-use crate::config::Config;
+use crate::config::{Colors, Config, Term, TerminalClass};
 use crate::imaging::img_size;
 use crate::library::{all_images, resolve_local};
 use crate::net::{host_label, url_host};
@@ -23,15 +23,6 @@ fn columns() -> usize {
     crate::ui::term_cols()
 }
 
-pub(crate) fn in_kitty() -> bool {
-    use std::io::IsTerminal;
-    std::io::stdout().is_terminal()
-        && (std::env::var("KITTY_WINDOW_ID")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-            || std::env::var("TERM").is_ok_and(|v| v == "xterm-kitty"))
-}
-
 fn have(cmd: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -40,19 +31,21 @@ fn have(cmd: &str) -> bool {
 }
 
 /// Explain a missing requested picture to a person, without adding noise to pipes.
-pub(crate) fn preview_failure(cols: usize) -> Option<&'static str> {
-    use std::io::IsTerminal;
-    if !std::io::stdout().is_terminal() {
-        None
-    } else if !in_kitty() {
-        Some("image preview unavailable in this terminal; use Kitty to view pictures.")
-    } else if cols < 8 {
-        Some("image preview unavailable: this window is too narrow; widen it.")
-    } else if !have("kitten") {
-        Some("image preview unavailable: Kitty's kitten helper was not found on PATH.")
-    } else {
-        Some("image preview unavailable: Kitty's image renderer failed for this file.")
-    }
+pub(crate) fn preview_failure(term: &Term, cols: usize) -> Option<&'static str> {
+    Some(match term.class {
+        TerminalClass::Pipe => return None,
+        TerminalClass::Multiplexed => {
+            "image preview unavailable inside tmux, screen or zellij; run theme directly in Kitty to view pictures."
+        }
+        TerminalClass::Osc => {
+            "image preview unavailable in this terminal; use Kitty to view pictures."
+        }
+        _ if cols < 8 => "image preview unavailable: this window is too narrow; widen it.",
+        _ if !have("kitten") => {
+            "image preview unavailable: Kitty's kitten helper was not found on PATH."
+        }
+        _ => "image preview unavailable: Kitty's image renderer failed for this file.",
+    })
 }
 
 /// Where a wallpaper came from, as a short label: the `theme.source` xattr
@@ -363,8 +356,8 @@ pub(crate) fn preview_window_size() -> String {
     format!("{cols},{rows},{width},{height}")
 }
 
-pub fn render_preview(img: &Path, cols: usize, rows: usize) -> Option<Preview> {
-    if !in_kitty() || !have("kitten") {
+pub fn render_preview(term: &Term, img: &Path, cols: usize, rows: usize) -> Option<Preview> {
+    if !term.kitty() || !have("kitten") {
         return None;
     }
     let out = Command::new("kitten")
@@ -387,32 +380,10 @@ pub fn render_preview(img: &Path, cols: usize, rows: usize) -> Option<Preview> {
 fn parse_preview(out: &str, cols: usize, rows: usize) -> Option<Preview> {
     let out = out.trim_start_matches('\r');
     let mut end = 0;
-    // A streamed picture can span several APCs. Keep every packet intact,
-    // including tmux's wrappers; its doubled ESC is not the wrapper's end.
-    loop {
-        let rest = &out[end..];
-        let wrapped = rest.starts_with("\x1bPtmux;");
-        if !wrapped && !rest.starts_with("\x1b_G") {
-            break;
-        }
-        let bytes = rest.as_bytes();
-        let mut i = if wrapped { 7 } else { 3 };
-        loop {
-            if i + 1 >= bytes.len() {
-                return None;
-            }
-            if bytes[i] == 0x1b {
-                if wrapped && bytes[i + 1] == 0x1b {
-                    i += 2;
-                    continue;
-                }
-                if bytes[i + 1] == b'\\' {
-                    end += i + 2;
-                    break;
-                }
-            }
-            i += 1;
-        }
+    // A streamed picture can span several APCs; keep every packet intact.
+    // No multiplexer wrapper can arrive: kitten never runs inside one.
+    while out[end..].starts_with("\x1b_G") {
+        end += 3 + out[end + 3..].find("\x1b\\")? + 2;
     }
     if end == 0 {
         return None;
@@ -480,15 +451,6 @@ mod graphics_tests {
             p.rows,
             ["\x1b[38:2:1:2:3m\u{10eeee}\u{305}\u{305}  \x1b[39m"]
         );
-    }
-
-    #[test]
-    fn tmux_wrappers_keep_their_escaped_inner_terminators() {
-        let packets = "\x1b_Ga=T,c=1,m=1;YWJj\x1b\\\x1b_Gm=0;ZA==\x1b\\";
-        let wrapped = format!("\x1bPtmux;{}\x1b\\", packets.replace('\x1b', "\x1b\x1b"));
-        let p = parse_preview(&format!("{wrapped}{CELLS}"), 1, 1).unwrap();
-        assert_eq!(p.apc, wrapped);
-        assert_eq!(p.rows.len(), 1);
     }
 
     #[test]
@@ -749,13 +711,14 @@ pub(crate) fn birth_key(path: &Path) -> i64 {
     birth_secs(path).unwrap_or(0)
 }
 
-pub(crate) fn swatch_cells(scheme: &[String]) -> (String, usize) {
+pub(crate) fn swatch_cells(scheme: &[String], depth: Colors) -> (String, usize) {
     // 8 swatches of 2 cells + a trailing space = exactly 24 visible columns.
     let mut out = String::new();
     let mut n = 0;
     for c in scheme {
-        if let Some((r, g, b)) = crate::ui::parse_hex6(c) {
-            out.push_str(&format!("\x1b[48;2;{r};{g};{b}m  \x1b[0m "));
+        if let Some(rgb) = crate::ui::parse_hex6(c) {
+            out.push_str(&crate::ui::paint(depth, rgb, "  "));
+            out.push(' ');
             n += 1;
         }
     }
@@ -783,7 +746,7 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
     let stacked = cols < if verbose { 87 } else { 44 };
     let indent = if cols < 16 { "" } else { "  " };
     let continuation = if cols < 16 { "" } else { "    " };
-    let pv_ok = verbose && !stacked && cols >= 96 && in_kitty() && have("kitten");
+    let pv_ok = verbose && !stacked && cols >= 96 && cfg.term.kitty() && have("kitten");
     let pvw = if pv_ok { 9 } else { 0 };
     let mut namew = if verbose {
         cols.saturating_sub(71 + pvw)
@@ -820,7 +783,7 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
                 println!("  -");
             } else {
                 for row in colors.chunks((width / 3).clamp(1, 8)) {
-                    println!("  {}", swatch_cells(row).0);
+                    println!("  {}", swatch_cells(row, cfg.term.colors).0);
                 }
             }
             if verbose {
@@ -859,7 +822,7 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
         let name = crate::ui::pad_cells(&display_text(stem), namew);
         let mut pv2 = String::new();
         if pv_ok {
-            match render_preview(f, PREVIEW_COLS, 2) {
+            match render_preview(&cfg.term, f, PREVIEW_COLS, 2) {
                 Some(p) => {
                     print!("{}", p.apc);
                     print!("  {}", p.rows[0]);
@@ -873,7 +836,10 @@ pub fn cmd_list(cfg: &Config, verbose: bool, list_n: usize) {
             }
         }
         print!("  {name}  ");
-        let (sw, n) = schemes.get(f).map(|s| swatch_cells(s)).unwrap_or_default();
+        let (sw, n) = schemes
+            .get(f)
+            .map(|s| swatch_cells(s, cfg.term.colors))
+            .unwrap_or_default();
         print!("{sw}");
         if n == 0 {
             print!("{:<24}", "-");
@@ -985,14 +951,14 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>, verbose: bool) {
     let mut frame = String::with_capacity(4096);
     let pw = cols.saturating_sub(2).min(24);
     if pw >= 8
-        && let Some(p) = render_preview(&img, pw, 10)
+        && let Some(p) = render_preview(&cfg.term, &img, pw, 10)
     {
         write!(frame, "{}", p.apc).unwrap();
         for r in &p.rows {
             writeln!(frame, "  {r}").unwrap();
         }
         writeln!(frame).unwrap();
-    } else if let Some(message) = preview_failure(pw) {
+    } else if let Some(message) = preview_failure(&cfg.term, pw) {
         for line in crate::ui::wrap_prefixed(message, cols, "  theme: ", "    ") {
             writeln!(frame, "{line}").unwrap();
         }
@@ -1007,7 +973,7 @@ pub fn cmd_preview(cfg: &Config, arg: Option<&str>, verbose: bool) {
             for line in crate::ui::wrap_prefixed("COLORSCHEME", cols, "  ", "  ") {
                 writeln!(frame, "{line}").unwrap();
             }
-            for line in p.swatches(cols.saturating_sub(2)).lines() {
+            for line in p.swatches(cols.saturating_sub(2), cfg.term.colors).lines() {
                 writeln!(frame, "  {line}").unwrap();
             }
         }
@@ -1135,12 +1101,15 @@ pub fn cmd_status(cfg: &Config) {
     if colors.is_empty() {
         println!("color scheme:    <none>");
     } else if cols >= 17 + 32 {
-        println!("color scheme:    {}", crate::ui::swatch_row(&colors));
+        println!(
+            "color scheme:    {}",
+            crate::ui::swatch_row(&colors, cfg.term.colors)
+        );
     } else {
         let n = (cols.saturating_sub(17) / 4).max(1);
         println!(
             "color scheme:    {}",
-            crate::ui::swatch_row(&colors[..n.min(colors.len())])
+            crate::ui::swatch_row(&colors[..n.min(colors.len())], cfg.term.colors)
         );
     }
     vwrap(

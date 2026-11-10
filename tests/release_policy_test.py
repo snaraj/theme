@@ -85,6 +85,10 @@ class Publication(unittest.TestCase):
         self.assertTrue(names, "no jobs parsed out of " + str(WORKFLOW))
         self.assertEqual(names, policy.CHECKS)
 
+    def test_only_main_ci_wakes_the_release_chain(self):
+        trigger = (WORKFLOW.parent / "release.yml").read_text().split("  workflow_run:\n", 1)[1]
+        self.assertIn("    branches: [main]\n", trigger.split("  workflow_dispatch:", 1)[0])
+
     def test_nixos_failure_and_unavailable_pty_cannot_pass(self):
         logged = WORKFLOW.read_text().split("- name: Build, test and boot the NixOS package\n", 1)[1]
         logged = logged.split("\n      - ", 1)[0]

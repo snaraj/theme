@@ -4,7 +4,7 @@
 //! sanctioned path to a live kitty (never SIGUSR1: a config reload resets
 //! runtime state, and a theme change may touch colors only).
 
-use crate::config::Config;
+use crate::config::{Config, TerminalClass};
 use crate::imaging::img_size;
 use crate::ui::{die, note, parse_hex6};
 use pigment::{Options, Palette};
@@ -203,29 +203,15 @@ struct Kitty;
 impl Terminal for Kitty {
     fn apply(&self, cfg: &Config) -> Result<(), String> {
         let colors = cfg.cache_dir.join("colors-kitty.conf");
-        let me = rustix::process::getuid().as_raw();
-        let current = std::env::var("KITTY_LISTEN_ON")
-            .ok()
-            .and_then(|s| s.strip_prefix("unix:").map(PathBuf::from));
-        let mut sockets = Vec::new();
-        if let Ok(rd) = fs::read_dir("/tmp") {
-            for e in rd.flatten() {
-                if e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with("kitty-samuel-"))
-                {
-                    sockets.push(e.path());
-                }
-            }
-        }
-        if let Some(p) = &current {
-            sockets.push(p.clone());
-        }
-        sockets.sort();
-        sockets.dedup();
-        sockets.retain(|p| own_socket(p, me));
-        let inside = std::env::var("KITTY_WINDOW_ID").is_ok_and(|v| !v.is_empty());
-        let mut failed = inside && current.as_ref().is_none_or(|p| !sockets.contains(p));
+        let current = cfg.term.socket.as_deref();
+        let sockets = kitty_sockets(
+            &[PathBuf::from("/tmp"), std::env::temp_dir()],
+            current,
+            rustix::process::getuid().as_raw(),
+        );
+        // The window theme runs in must be among those reached.
+        let mut failed = cfg.term.class == TerminalClass::Kitty
+            && current.is_none_or(|p| !sockets.iter().any(|s| s == p));
         for p in sockets {
             let child = Command::new("kitten")
                 .arg("@")
@@ -248,7 +234,30 @@ impl Terminal for Kitty {
     }
 }
 
-/// A `/tmp` entry we may hand the palette to: a socket (checked without
+/// Every kitty this user runs: the `kitty-*` sockets kitty's own `listen_on
+/// unix:/tmp/kitty` naming leaves in the temp directories, plus
+/// KITTY_LISTEN_ON's, each kept only when [`own_socket`] admits it.
+fn kitty_sockets(dirs: &[PathBuf], listen_on: Option<&Path>, me: u32) -> Vec<PathBuf> {
+    let mut sockets: Vec<PathBuf> = dirs
+        .iter()
+        .filter_map(|d| fs::read_dir(d).ok())
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("kitty-"))
+        })
+        .map(|e| e.path())
+        .chain(listen_on.map(Path::to_path_buf))
+        .collect();
+    sockets.sort();
+    sockets.dedup();
+    sockets.retain(|p| own_socket(p, me));
+    sockets
+}
+
+/// A socket we may hand the palette to: a socket (checked without
 /// following symlinks) that WE own. A symlink, a non-socket, or another
 /// principal's socket is skipped — no disclosure, no connection.
 fn own_socket(p: &Path, me: u32) -> bool {
@@ -308,10 +317,7 @@ impl Terminal for Alacritty {
 struct OscTty;
 impl Terminal for OscTty {
     fn apply(&self, cfg: &Config) -> Result<(), String> {
-        if std::env::var("KITTY_WINDOW_ID")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-        {
+        if cfg.term.class == TerminalClass::Kitty {
             return Ok(());
         }
         let Ok(pal) = fs::read_to_string(cfg.cache_dir.join("colors")) else {
@@ -462,7 +468,7 @@ pub fn use_image(cfg: &Config, img: &Path, desktop_only: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{osc_color, osc_sequences, own_socket, set_desktop, wait_capped};
+    use super::{kitty_sockets, osc_color, osc_sequences, own_socket, set_desktop, wait_capped};
     use crate::config::Config;
     use pigment::{Mode, Palette, Rgb, effective_background};
     use std::path::PathBuf;
@@ -484,6 +490,7 @@ mod tests {
             formats: vec!["jpg".into()],
             contrast: 4.5,
             no_apply: true,
+            term: Default::default(),
         };
         assert!(set_desktop(&cfg, &nowhere.join("x.jpg")).is_ok());
     }
@@ -540,6 +547,31 @@ mod tests {
         std::os::unix::fs::symlink(&sock, &link).unwrap();
         assert!(!own_socket(&link, me), "a symlink must not be followed");
 
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Discovery follows kitty's own `kitty-*` naming plus KITTY_LISTEN_ON,
+    /// and only our sockets: no other name, regular file, symlink or uid.
+    #[test]
+    fn kitty_sockets_follow_kittys_naming_and_ownership() {
+        use std::os::unix::net::UnixListener;
+        let d = std::env::temp_dir().join(format!("theme-ks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let bind = |name: &str| (UnixListener::bind(d.join(name)).unwrap(), d.join(name));
+        let (_kitty, kitty) = bind("kitty-1234");
+        let (_custom, custom) = bind("mykitty");
+        let (_other, _) = bind("other.sock");
+        std::fs::write(d.join("kitty-file"), b"x").unwrap();
+        std::os::unix::fs::symlink(&kitty, d.join("kitty-link")).unwrap();
+        let dirs = [d.clone()];
+        assert_eq!(kitty_sockets(&dirs, None, me), std::slice::from_ref(&kitty));
+        assert_eq!(
+            kitty_sockets(&dirs, Some(&custom), me),
+            [kitty, custom.clone()]
+        );
+        assert!(kitty_sockets(&dirs, Some(&custom), me + 1).is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 

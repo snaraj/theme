@@ -184,10 +184,7 @@ pub fn usage(cfg: &Config) {
     };
     let colors = scheme_colors(cfg);
     let eight: Vec<String> = colors.iter().take(8).cloned().collect();
-    let in_kitty = std::env::var("KITTY_WINDOW_ID")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let term = if in_kitty {
+    let term = if cfg.term.kitty() {
         // Our own literal OSC 8 hyperlink — assigned WITHOUT display_text,
         // which would strip the very sequence it exists to emit.
         "\x1b]8;;https://sw.kovidgoyal.net/kitty/\x07kitty\x1b]8;;\x07".to_string()
@@ -226,7 +223,7 @@ pub fn usage(cfg: &Config) {
             } else {
                 String::new()
             };
-            format!("{}{tail}", swatch_row(&eight))
+            format!("{}{tail}", swatch_row(&eight, cfg.term.colors))
         };
         // The name row spans the label column too, so it gets those 13
         // cells back on top of a value's width.
@@ -239,7 +236,7 @@ pub fn usage(cfg: &Config) {
             format!("{:<12} {}", "OS", os),
             format!("{:<12} {}", "THEME CLI", ver),
         ];
-        let pv = desk_file.and_then(|d| render_preview(d, IMG_COLS, IMG_ROWS));
+        let pv = desk_file.and_then(|d| render_preview(&cfg.term, d, IMG_COLS, IMG_ROWS));
         match pv {
             Some(p) => {
                 print!("{}", p.apc);
@@ -268,7 +265,7 @@ pub fn usage(cfg: &Config) {
         // the image is absent with dignity — never torn.
         let tcols = cols.saturating_sub(2).min(IMG_COLS);
         if tcols >= IMG_FLOOR
-            && let Some(p) = desk_file.and_then(|d| render_preview(d, tcols, IMG_ROWS))
+            && let Some(p) = desk_file.and_then(|d| render_preview(&cfg.term, d, tcols, IMG_ROWS))
         {
             print!("{}", p.apc);
             for r in &p.rows {
@@ -283,7 +280,7 @@ pub fn usage(cfg: &Config) {
         let sw = if eight.is_empty() {
             "<none>".to_string()
         } else {
-            swatch_row(&eight[..n.min(eight.len())])
+            swatch_row(&eight[..n.min(eight.len())], cfg.term.colors)
         };
         for (l, v) in [
             ("COLORSCHEME", sw),
