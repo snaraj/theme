@@ -245,13 +245,21 @@ splits without adding or replacing key mappings.
 
 ## Terminals
 
-- **kitty** — recolored live over its remote-control socket; future windows
-  pick the palette up from `current-theme.conf`.
+- **kitty** — recolored live over its remote-control sockets (`KITTY_LISTEN_ON`
+  and your own `kitty-*` sockets in the temp directory); future windows pick
+  the palette up from `current-theme.conf`. Pictures use kitty's graphics
+  protocol, over ssh too.
+- **tmux, screen, zellij** — colored like any other terminal. Pictures work in
+  tmux inside kitty with `set -g allow-passthrough on`; screen and zellij get
+  none, and a preview says why.
 - **alacritty** — a managed `theme-colors.toml` is written under
   `~/.config/alacritty/`; import it once and alacritty live-reloads on every
   theme change.
 - **anything else** — standard OSC 4/10/11/12 color sequences to the calling
   terminal.
+
+Swatches are 24-bit in kitty or where `COLORTERM` is `truecolor`, 256-color
+elsewhere, and plain cells when `NO_COLOR` is set.
 
 ## Environment
 
@@ -278,6 +286,20 @@ banner with no PATH scan or network request.
 - `UNSPLASH_ACCESS_KEY` / `UNSPLASH_SECRET_KEY` / `UNSPLASH_USER_TOKEN` —
   Unsplash credentials (the macOS Keychain is consulted when unset; no
   credential ever appears on an argv).
+
+## Network
+
+Only the commands below make requests, and each names itself
+`theme/<version> (+https://github.com/snaraj/theme)`, never a browser.
+
+| Command | Hosts | Request |
+| --- | --- | --- |
+| `set`, `get` with a link | The link's host and its redirects; a page's `og:image` host | The page or image; an `og:image` must resolve to a public address |
+| `unsplash` | `api.unsplash.com`, `unsplash.com`, Unsplash image hosts | Photo lookup with your key, the image, the download report Unsplash requires |
+| `version`, `update` | `github.com`, `release-assets.githubusercontent.com` | Latest tag from the release redirect, then `SHA256SUMS` and the archive |
+
+Everything else, including bare `theme`, `help`, `-V` and completions, is
+offline.
 
 ## Build and test
 

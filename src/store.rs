@@ -255,6 +255,7 @@ mod tests {
                 formats: Vec::new(),
                 contrast: 4.5,
                 no_apply: false,
+                term: Default::default(),
             }
         }
     }

@@ -1,44 +1,44 @@
 {
   "artifacts": [
     {
-      "digest": "sha256:dfb307ade13950be497721e94be2df14256a4189dc01a4fc927e7fc4183ab58f",
-      "id": 10621801539,
+      "digest": "sha256:9d69f81a1d219279134c821bee6cfa3d6bba8c9feb47db8b3bcb70a5070742fc",
+      "id": 13808112850,
       "name": "theme-aarch64-apple-darwin",
-      "size_in_bytes": 1527596
+      "size_in_bytes": 1543960
     },
     {
-      "digest": "sha256:b5e07ff852ed26347bb47d59eb22fdb53a05b6b792632e2a63be0a6f75ec5ea0",
-      "id": 10621437251,
+      "digest": "sha256:e2af23d10ee1f7dbdc978649188d9cc4b5979fcb7172984c117bf26e1f7f0b25",
+      "id": 13807957490,
       "name": "theme-aarch64-unknown-linux-gnu",
-      "size_in_bytes": 4240819
+      "size_in_bytes": 4237011
     },
     {
-      "digest": "sha256:db0f3ae9882321e49b86df9131b33f061af0fec4b5cac983c173a972e91f546c",
-      "id": 10621642002,
+      "digest": "sha256:10c0016274ac5b31fa466ddba7ec75c5639bd3d6d541844f1e03acad7486e674",
+      "id": 13808386392,
       "name": "theme-x86_64-apple-darwin",
-      "size_in_bytes": 1600457
+      "size_in_bytes": 1600603
     },
     {
-      "digest": "sha256:3421f16403189a381500759694d80eb15f5e843ecf0e84ea183bdf3e2fddbdcc",
-      "id": 10621871405,
+      "digest": "sha256:92934e7990954c8afe1b58de672a4075c024563da7a323476d5d5156bdf1ea64",
+      "id": 13808845773,
       "name": "theme-x86_64-unknown-linux-gnu",
-      "size_in_bytes": 4487619
+      "size_in_bytes": 4514576
     }
   ],
   "files": {
-    "theme-0.3.12-1.aarch64.rpm": "75bf9974bd97d280a4762e5ca5e73166b8529dde4fbd61a9b38bc88653507e9a",
-    "theme-0.3.12-1.x86_64.rpm": "488b974a3528b24a8feb52a485c9a493271ab4ee134d7785eb03190f9d2f395c",
-    "theme-aarch64-apple-darwin.tar.gz": "f9bba956f484fc42d2616e9ea4e8e79262cbeb62d6af580ec4e527c73c25edaf",
-    "theme-aarch64-unknown-linux-gnu.tar.gz": "6fdf435190d13fc6a6ecd7efd46c197e2ec9add5e343e30691fb2e4273c1e68a",
-    "theme-x86_64-apple-darwin.tar.gz": "848a47f35f781ded06ba59730a00e32b0e68eff7e4f190748c70ecbfacd3f102",
-    "theme-x86_64-unknown-linux-gnu.tar.gz": "e24e16440fd1fbd393d5c700bde2211f5ac5deac8306d7bab406623cb940e8bb",
-    "theme_0.3.12_amd64.deb": "520900a30b3398b44526179d198c53d436528a46adfcb9bde6f9b2349fa6155d",
-    "theme_0.3.12_arm64.deb": "7b5825917197dcad5f3f6ba80f32835d1d33ea1c7b675cf979e638c9fb6b608c"
+    "theme-0.3.13-1.aarch64.rpm": "9e70d9264496fb260b5670e1de116e86db7f7ca8fb8cce5e6a43d54d92c580a0",
+    "theme-0.3.13-1.x86_64.rpm": "c9e1dff153a17a1fda7d2278b6566ecb6e7a8791bda70ef14e2cb858a85cf2b7",
+    "theme-aarch64-apple-darwin.tar.gz": "285cdb86904a874edb092df04c5c9b73a68d7c41d89fa114ca45b509f7084c68",
+    "theme-aarch64-unknown-linux-gnu.tar.gz": "1614ab313af09d54a25cd5c0b500ba45716f144c842aa1b91f7b9b01c55d9494",
+    "theme-x86_64-apple-darwin.tar.gz": "5f3ef6dfe2e1499aa24865988a5f9b4ca3577774ea2aa6b61be7416335a2272e",
+    "theme-x86_64-unknown-linux-gnu.tar.gz": "9348ee14314b53a3e24d57ca78eb27031ed339c51c41e9933970b9a63dbbf1e0",
+    "theme_0.3.13_amd64.deb": "801981d3bdd34401eec5cdfa70ada263770f2f4f3ab6d2f0f19742b46b560570",
+    "theme_0.3.13_arm64.deb": "6526e235593cf0531c0da96b109b490fa44b0d627b4b6006b89c8cb279538af9"
   },
   "run_attempt": 1,
-  "run_id": 35559538647,
+  "run_id": 42913085729,
   "schema": 1,
-  "source_fingerprint": "3f9c910565f1f776c6373511cb5be5e91a578c53801df567ed84d43d5e52c264",
-  "source_sha": "2bf6c423f9e1d451d6658b55edabf2e72ec84930",
-  "tag": "v0.3.12"
+  "source_fingerprint": "e98bcb34d6045741c99659d7502622834750a4cc6f2844e432f200c396b38005",
+  "source_sha": "25ed591d33a6bab3ce8063c9633c34613b2b0f21",
+  "tag": "v0.3.13"
 }

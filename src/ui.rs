@@ -5,6 +5,7 @@
 //! sanitized display copy is what may be shown, while the operational value
 //! stays byte-exact for everything we open, copy, move or delete.
 
+use crate::config::Colors;
 use rustix::termios::Termios;
 use std::process::exit;
 use std::sync::Mutex;
@@ -123,21 +124,60 @@ pub fn note(msg: &str) {
 /// Render hex colors as truecolor background swatches, 8 per row, matching
 /// the shell's `swatch_row` (3-cell blocks, continuation rows indented to
 /// the status block's value column).
-pub fn swatch_row(colors: &[String]) -> String {
+pub fn swatch_row(colors: &[String], depth: Colors) -> String {
     let mut out = String::new();
     let total = colors.len();
     for (i, c) in colors.iter().enumerate() {
         let c = c.trim_start_matches('#');
-        let (r, g, b) = match parse_hex6(c) {
-            Some(t) => t,
-            None => continue,
+        let Some(rgb) = parse_hex6(c) else {
+            continue;
         };
-        out.push_str(&format!("\x1b[48;2;{r};{g};{b}m   \x1b[0m "));
+        out.push_str(&paint(depth, rgb, "   "));
+        out.push(' ');
         if (i + 1) % 8 == 0 && i + 1 < total {
             out.push_str("\n                 ");
         }
     }
     out
+}
+
+/// `cells` on one background color, at the depth the terminal takes; plain
+/// cells when color is off.
+pub fn paint(depth: Colors, (r, g, b): (u8, u8, u8), cells: &str) -> String {
+    match depth {
+        Colors::True => format!("\x1b[48;2;{r};{g};{b}m{cells}\x1b[0m"),
+        Colors::Ansi256 => format!("\x1b[48;5;{}m{cells}\x1b[0m", ansi256(r, g, b)),
+        Colors::Off => cells.to_string(),
+    }
+}
+
+/// The nearest xterm-256 index: the 6×6×6 cube or the 24-step gray ramp,
+/// whichever is closer (tmux's own mapping).
+fn ansi256(r: u8, g: u8, b: u8) -> u8 {
+    const LEVELS: [i32; 6] = [0, 95, 135, 175, 215, 255];
+    let cube = |v: u8| match v {
+        0..48 => 0,
+        48..114 => 1,
+        _ => (usize::from(v) - 35) / 40,
+    };
+    let (qr, qg, qb) = (cube(r), cube(g), cube(b));
+    let distance = |x: i32, y: i32, z: i32| {
+        let d = |a: i32, v: u8| (a - i32::from(v)).pow(2);
+        d(x, r) + d(y, g) + d(z, b)
+    };
+    let average = (i32::from(r) + i32::from(g) + i32::from(b)) / 3;
+    let step = if average > 238 {
+        23
+    } else {
+        (average - 3).max(0) / 10
+    };
+    let gray = 8 + 10 * step;
+    let cube_index = 16 + 36 * qr + 6 * qg + qb;
+    if distance(gray, gray, gray) < distance(LEVELS[qr], LEVELS[qg], LEVELS[qb]) {
+        232 + step as u8
+    } else {
+        cube_index as u8
+    }
 }
 
 /// Terminal width, from the terminal ITSELF first (issue #21): the v0.2.1
@@ -308,6 +348,29 @@ mod tests {
     #[test]
     fn display_text_keeps_utf8() {
         assert_eq!(display_text("héllo…"), "héllo…");
+    }
+
+    /// One swatch per depth: 24-bit, the nearest 256-color index (cube or
+    /// gray ramp), and plain cells under NO_COLOR.
+    #[test]
+    fn swatches_follow_the_terminal_color_depth() {
+        let rgb = (128, 128, 128);
+        assert_eq!(
+            paint(Colors::True, rgb, "  "),
+            "\x1b[48;2;128;128;128m  \x1b[0m"
+        );
+        assert_eq!(paint(Colors::Ansi256, rgb, "  "), "\x1b[48;5;244m  \x1b[0m");
+        assert_eq!(paint(Colors::Off, rgb, "  "), "  ");
+        for (rgb, index) in [
+            ((0, 0, 0), 16),
+            ((255, 255, 255), 231),
+            ((255, 0, 0), 196),
+            ((95, 135, 175), 67),
+            ((8, 8, 8), 232),
+            ((238, 238, 238), 255),
+        ] {
+            assert_eq!(ansi256(rgb.0, rgb.1, rgb.2), index, "{rgb:?}");
+        }
     }
 
     /// The narrow-render wrap (issue #19): words fill the window, every

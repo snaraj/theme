@@ -2047,6 +2047,7 @@ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *theme-x86_64-u
             formats: Vec::new(),
             contrast: 4.5,
             no_apply: true,
+            term: Default::default(),
         }
     }
 

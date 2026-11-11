@@ -9,6 +9,9 @@ on:
   workflow_run:
     workflows: [ci]
     types: [completed]
+    # Pull-request CI never releases; without this every one spawned a
+    # skipped release run.
+    branches: [main]
   workflow_dispatch:
 
 permissions:

@@ -27,6 +27,22 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      - &cargo-cache
+        # Dependencies and build outputs, per job and lockfile. Only cargo's own
+        # output directories: steps that install or export refuse an existing
+        # destination. release.yml never restores a cache; releases build cold.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/debug/
+            !target/debug/incremental/
+            target/release/
+            target/performance-base-build/
+            target/x86_64-unknown-linux-musl/
+          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
       - run: python3 -I -B tests/release_policy_test.py
       - run: python3 -I -B tests/distribution_test.py
       - run: python3 -I -B tests/prepared_release_test.py
@@ -76,6 +92,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - *cargo-cache
       - name: Install the X server, software GL and the screen capture tool
         run: |
           sudo apt-get update
@@ -144,6 +161,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      - *cargo-cache
       - run: cargo test --workspace --locked
       # Tapping the checkout is what makes Homebrew judge the formula by its
       # FORMULA rules — a bare path gets generic Ruby cops. `--formula` is
@@ -213,6 +231,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - *cargo-cache
       - run: cargo build --release --locked
       - name: Exercise the glibc build on supported distributions
         run: |
@@ -247,7 +266,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           enable_kvm: false
           set_as_trusted_user: false

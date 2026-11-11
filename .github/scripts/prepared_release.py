@@ -1,5 +1,6 @@
 """Bind reviewed Homebrew pins to tested branch artifacts, then promote those bytes."""
 import argparse
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -172,6 +173,18 @@ def verify(destination):
     return result
 
 
+def declared_tests(script):
+    """INSTALLED_TESTS as a version of this script declares it, read as data."""
+    for node in ast.parse(script).body:
+        if isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == ["INSTALLED_TESTS"]:
+            names = ast.literal_eval(node.value)
+            require(type(names) is tuple and names and all(
+                type(n) is str and re.fullmatch(r"[A-Za-z0-9_-]+\.(?:py|sh)", n) for n in names),
+                "invalid installed test list")
+            return names
+    raise ValueError("test source declares no installed tests")
+
+
 def export_tests(destination, tag, published):
     """After byte verification, bind installed expectations to their source version."""
     require(not destination.exists(), "test destination already exists")
@@ -193,8 +206,12 @@ def export_tests(destination, tag, published):
             require(re.fullmatch(r"[0-9a-f]{40}", source), "invalid prepared test source commit")
         cargo = git("show", source + ":Cargo.toml").decode()
         require(re.findall(r'^version = "([^"]+)"$', cargo, re.M) == [tag[1:]], "test source version differs")
+        # A published version is tested by the scripts IT declared: a test
+        # added since then does not exist at that tag.
+        names = declared_tests(git("show", source + ":.github/scripts/prepared_release.py").decode()) \
+            if published else INSTALLED_TESTS
         scripts = {}
-        for name in INSTALLED_TESTS:
+        for name in names:
             path = "tests/" + name
             entry = git("ls-tree", "-z", source, "--", path).decode().rstrip("\0")
             require(re.fullmatch(r"100(?:644|755) blob [0-9a-f]{40}\t" + re.escape(path), entry),

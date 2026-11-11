@@ -447,7 +447,7 @@ pub fn cmd_search(cfg: &Config, args: &[String], list_n: usize) {
     }
     let shown = if list_n > 0 { list_n } else { hits.len() };
     for h in hits.iter().take(shown) {
-        let (sw, n) = swatch_cells(&h.scheme[..swn.min(h.scheme.len())]);
+        let (sw, n) = swatch_cells(&h.scheme[..swn.min(h.scheme.len())], cfg.term.colors);
         let w = swn * 3;
         let cells = if n == 0 {
             format!("{:<w$}", "-")
@@ -535,6 +535,7 @@ mod tests {
             formats: vec!["png".into()],
             contrast: 7.0,
             no_apply: false,
+            term: Default::default(),
         };
         assert_eq!(matching_paths(&cfg, &[]), vec![path]);
         assert!(!cfg.cache_dir.exists());

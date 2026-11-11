@@ -9,28 +9,28 @@
 class Theme < Formula
   desc "Wallpaper and terminal palette driven by one command"
   homepage "https://github.com/snaraj/theme"
-  version "0.3.12"
+  version "0.3.13"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/snaraj/theme/releases/download/v0.3.12/theme-aarch64-apple-darwin.tar.gz"
-      sha256 "f9bba956f484fc42d2616e9ea4e8e79262cbeb62d6af580ec4e527c73c25edaf" # aarch64-apple-darwin
+      url "https://github.com/snaraj/theme/releases/download/v0.3.13/theme-aarch64-apple-darwin.tar.gz"
+      sha256 "285cdb86904a874edb092df04c5c9b73a68d7c41d89fa114ca45b509f7084c68" # aarch64-apple-darwin
     end
     on_intel do
-      url "https://github.com/snaraj/theme/releases/download/v0.3.12/theme-x86_64-apple-darwin.tar.gz"
-      sha256 "848a47f35f781ded06ba59730a00e32b0e68eff7e4f190748c70ecbfacd3f102" # x86_64-apple-darwin
+      url "https://github.com/snaraj/theme/releases/download/v0.3.13/theme-x86_64-apple-darwin.tar.gz"
+      sha256 "5f3ef6dfe2e1499aa24865988a5f9b4ca3577774ea2aa6b61be7416335a2272e" # x86_64-apple-darwin
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/snaraj/theme/releases/download/v0.3.12/theme-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "6fdf435190d13fc6a6ecd7efd46c197e2ec9add5e343e30691fb2e4273c1e68a" # aarch64-unknown-linux-gnu
+      url "https://github.com/snaraj/theme/releases/download/v0.3.13/theme-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "1614ab313af09d54a25cd5c0b500ba45716f144c842aa1b91f7b9b01c55d9494" # aarch64-unknown-linux-gnu
     end
     on_intel do
-      url "https://github.com/snaraj/theme/releases/download/v0.3.12/theme-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "e24e16440fd1fbd393d5c700bde2211f5ac5deac8306d7bab406623cb940e8bb" # x86_64-unknown-linux-gnu
+      url "https://github.com/snaraj/theme/releases/download/v0.3.13/theme-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "9348ee14314b53a3e24d57ca78eb27031ed339c51c41e9933970b9a63dbbf1e0" # x86_64-unknown-linux-gnu
     end
   end
 

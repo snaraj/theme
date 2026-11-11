@@ -62,8 +62,10 @@ exists() { # $1 description, $2 yes|no, $3 path
 # against a stubbed/failing curl.
 export THEME_NO_UPDATE_CHECK=1
 # Headless by default even when invoked from Kitty. Graphics-specific cases
-# set their own window id and deterministic kitten stub below.
+# set their own window id and deterministic kitten stub below. A multiplexer
+# or NO_COLOR around the run would change the terminal class every case pins.
 export KITTY_WINDOW_ID=''
+unset TMUX STY ZELLIJ NO_COLOR
 
 # The self-update/footer transport never consults PATH (round 8): those
 # sections drive a DEBUG build, whose THEME_CURL test seam (compiled OUT of
@@ -436,6 +438,12 @@ dllog="$fixture/curl-dl.log"; : >"$dllog"
 check  "clean photo: fetch + report succeed"   0 run_stub "$dllog" unsplash https://unsplash.com/photos/clean-slug-abcdef12345
 dlhits=$(grep -c '^KEYTO https://api\.unsplash\.com/photos/stub123/download$' "$dllog")
 if [ "$dlhits" = 1 ]; then pass "legit download endpoint reported exactly once"; else fail "expected 1 authenticated download report, saw $dlhits"; fi
+# #95: the API call, the image download and the report each name the tool.
+honest_ua="theme/$("$THEME" -V | sed -n 's/^version: v//p') (+https://github.com/snaraj/theme)"
+ua_calls=$(grep -c '^ARGV: ' "$dllog")
+if [ "$ua_calls" = 3 ] && [ "$(grep -cF -- "-A $honest_ua" "$dllog")" = 3 ] && ! grep -q Mozilla "$dllog"; then
+    pass "every Unsplash request sends the honest User-Agent"
+else fail "a request hid the tool's identity: $(cat "$dllog")"; fi
 
 STUB_DESC=$(printf 'safe name\thttps://evil.invalid/steal\nsecond line')
 export STUB_DESC
@@ -1130,9 +1138,10 @@ else fail "help sanitizing removed more than the control bytes:$help_missing"; f
 kittyout=$(THEME_WALLPAPER_DIR="$sweeplib" THEME_CACHE_DIR="$helpcache" CONFIG_DIR="$helpcache" \
     KITTY_CONFIG_DIRECTORY="$helpcache" THEME_NO_APPLY=1 TMPDIR="$fixture/tmpdir" \
     PATH="$sweepbin:$PATH" KITTY_WINDOW_ID=1 "$THEME" help 2>&1)
-if printf '%s' "$kittyout" | grep -qF -- "$(printf '\033]8;;https://sw.kovidgoyal.net/kitty/')"; then
-    pass "the intentional kitty hyperlink survives sanitizing"
-else fail "sanitizing stripped the kitty hyperlink it was supposed to keep"; fi
+kitty_link="$(printf '\033]8;;https://sw.kovidgoyal.net/kitty/')"
+if printf '%s' "$kittyout" | grep -qF -- "$kitty_link"; then
+    fail "a pipe received the kitty hyperlink"
+else pass "a pipe gets no hyperlink, even from inside kitty"; fi
 
 # --- the OS row comes from the KERNEL, not from PATH -----------------------
 # `uname` ×2 and `sw_vers` were three of the bare screen's four spawns. The
@@ -1245,6 +1254,7 @@ for ((i = 0; i < ${#args[@]}; i++)); do
     case "${args[$i]}" in
     -o) out="${args[$((i + 1))]}" ;;
     -D) hdr="${args[$((i + 1))]}" ;;
+    -A) printf '%s\n' "${args[$((i + 1))]}" >>"$UPD_LOG.ua" ;;
     --url) url="${args[$((i + 1))]}" ;;
     -K) k=1 ;;
     esac
@@ -1345,6 +1355,7 @@ upd_run() { # output lands in $upd_out, exit code in $upd_rc (parent shell —
     rm -f "$bin"
     cp "$THEME_DBG" "$bin"
     : >"$updlog"
+    : >"$updlog.ua"
     {
         printf "UPD_LOG='%s'\n" "$updlog"
         printf "UPD_TRIPLE='%s'\n" "$triple"
@@ -1397,6 +1408,9 @@ else fail "the resolve path drifted: $(cat "$updlog")"; fi
 if ! grep -q 'releases/tag/v9.9.9' "$updlog"; then
     pass "the redirect target itself is parsed, never fetched"
 else fail "the Location was followed: $(cat "$updlog")"; fi
+if [ "$(wc -l <"$updlog.ua" | tr -d ' ')" = "$(wc -l <"$updlog" | tr -d ' ')" ] && [ "$(sort -u "$updlog.ua")" = "theme/$cur_ver (+https://github.com/snaraj/theme)" ]; then
+    pass "every update request sends the honest User-Agent"
+else fail "an update request hid the tool's identity: $(cat "$updlog.ua")"; fi
 
 # A throttled or failing github.com must NAME what answered — the defect
 # that opened #51 was an unrelated 403 reported as "no network".
@@ -2304,6 +2318,9 @@ narrow_run 100
 if grep -q '#.*narrow-check' "$narrow_out" && grep -q "THEME CLI *v$cur_ver" "$narrow_out"; then
     pass "the wide header carries the name beside the image and ends with v$cur_ver"
 else fail "wide header wrong: $(tail -3 "$narrow_out")"; fi
+if grep -qF -- "$kitty_link" "$narrow_out"; then
+    pass "the intentional kitty hyperlink survives sanitizing"
+else fail "sanitizing stripped the kitty hyperlink it was supposed to keep"; fi
 
 # --- no kitty, no protocol: absence is clean (portability doctrine) ---------
 # On an iTerm2-class terminal (no KITTY_WINDOW_ID) the screen must carry

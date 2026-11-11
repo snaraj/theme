@@ -246,6 +246,7 @@ mod tests {
             formats: vec!["png".into()],
             contrast: 7.0,
             no_apply: false,
+            term: Default::default(),
         };
         (cfg, path)
     }

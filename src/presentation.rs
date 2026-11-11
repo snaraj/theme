@@ -2,7 +2,7 @@
 //! bounded reads and in-memory derivation only; swatches use SGR, never OSC.
 
 use crate::apply::{derive_options, schemes_dir};
-use crate::config::Config;
+use crate::config::{Colors, Config};
 use pigment::{Floored, ImageProfile, Palette, Readability};
 use std::borrow::Cow;
 use std::fs;
@@ -250,7 +250,7 @@ impl PreparedPalette {
 
     /// All 16 final colors, wrapped to fit without changing terminal colors.
     /// Width is bounded; every line ends in SGR reset, with no OSC or cursor moves.
-    pub fn swatches(&self, width: usize) -> String {
+    pub fn swatches(&self, width: usize, depth: Colors) -> String {
         if width == 0 {
             return String::new();
         }
@@ -259,12 +259,10 @@ impl PreparedPalette {
         for chunk in self.palette.colors.chunks(per_row) {
             let mut line = String::new();
             for color in chunk {
-                line.push_str(&format!(
-                    "\x1b[48;2;{};{};{}m{}\x1b[0m",
-                    color.r,
-                    color.g,
-                    color.b,
-                    " ".repeat(width.min(4)),
+                line.push_str(&crate::ui::paint(
+                    depth,
+                    (color.r, color.g, color.b),
+                    &" ".repeat(width.min(4)),
                 ));
             }
             lines.push(line);
@@ -290,6 +288,7 @@ mod tests {
             formats: vec!["png".into()],
             contrast: 4.5,
             no_apply: true,
+            term: Default::default(),
         }
     }
 
@@ -496,7 +495,7 @@ mod tests {
         assert!(!cfg.cache_dir.exists());
         assert!(!cfg.current.exists());
         for width in [0, 1, 3, 20, 80] {
-            let swatches = shown.swatches(width);
+            let swatches = shown.swatches(width, Colors::True);
             assert_eq!(
                 swatches.matches("\x1b[48;2;").count(),
                 if width == 0 { 0 } else { 16 }
@@ -549,7 +548,7 @@ mod tests {
         assert!(warning.contains("10% opacity"));
         assert!(warning.contains("increase your terminal's background opacity"));
         assert!(!warning.contains("sample") && !warning.contains('\x1b'));
-        assert!(!low.swatches(80).contains("opacity"));
+        assert!(!low.swatches(80, Colors::True).contains("opacity"));
         assert!(
             prepare(raw, 1.0, 7.0)
                 .unwrap()

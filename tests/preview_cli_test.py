@@ -46,7 +46,8 @@ sys.stdout.write("\\r\\x1b_Ga=T,c=1,r=1,m=1;YWJj\\x1b\\\\"
             "THEME_WALLPAPER_DIR": str(root / "library"), "THEME_NO_APPLY": "1",
             "THEME_NO_UPDATE_CHECK": "1", "THEME_OPACITY": "0.8", "THEME_CONTRAST": "4.5",
             "THEME_FORMATS": "png", "THEME_EXCLUDE_FORMATS": "", "TMPDIR": str(root / "tmp"),
-            "KITTY_WINDOW_ID": "1", "TERM": "xterm-kitty", "PREVIEW_CALLS": str(calls)}
+            "KITTY_WINDOW_ID": "1", "TERM": "xterm-kitty", "TMUX": "", "STY": "", "ZELLIJ": "",
+            "PREVIEW_CALLS": str(calls)}
         for args in (["preview", str(picture)], ["list", "-v"], ["browse", "--all"]):
             result = subprocess.run([str(binary), *args], env=env, capture_output=True, timeout=15)
             browser.require(result.returncode == 0, result.stderr)
@@ -86,8 +87,15 @@ sys.stdout.write("\\r\\x1b_Ga=T,c=1,r=1,m=1;YWJj\\x1b\\\\"
             browser.require(b"image preview unavailable" not in raw, "successful rendering printed a failure")
             term.leave()
 
+        # tmux with kitty outside draws through passthrough, like kitty itself.
+        with browser.Terminal(binary, env | {"TMUX": "/tmp/tmux-0/default,1,0"}, ["preview", str(picture)], columns=80) as term:
+            term.leave(b"")
+            browser.require(b"\x1b_Ga=T" in bytes(term.output) and b"unavailable" not in bytes(term.output),
+                            "tmux inside Kitty lost its picture")
         for overrides, columns, reason in [
             ({"KITTY_WINDOW_ID": "", "TERM": "xterm-256color"}, 80, "use Kitty to view pictures"),
+            ({"STY": "1.pts-0.host"}, 80, "inside tmux, screen or zellij"),
+            ({"TMUX": "/tmp/tmux-0/default,1,0", "PREVIEW_FAILURE": "1"}, 80, "tmux passthrough is probably off"),
             ({"PATH": str(root / "empty-bin")}, 80, "kitten helper was not found on PATH"),
             ({"PREVIEW_FAILURE": "1"}, 80, "image renderer failed for this file"),
             ({"PREVIEW_INVALID": "1"}, 80, "image renderer failed for this file"),
@@ -146,6 +154,11 @@ sys.stdout.write("\\r\\x1b_Ga=T,c=1,r=1,m=1;YWJj\\x1b\\\\"
             preview = subprocess.run([str(binary), "preview", str(picture)], env=apply_env, capture_output=True, timeout=15)
             browser.require(preview.returncode == 0 and b"text may be hard to read" not in preview.stdout + preview.stderr,
                             "preview printed apply advice")
+        # The Kitty window must be reached from inside tmux too.
+        result = subprocess.run([str(binary), "set", str(picture)], env=apply_env | {"TMUX": "/tmp/tmux-0/default,1,0"},
+                                capture_output=True, timeout=15)
+        browser.require(result.returncode == 1 and b"Kitty colors were not applied" in result.stderr,
+                        "inside tmux, a missing Kitty socket silently succeeded: " + repr(result.stderr))
         wallpaper = root / "bin/wallpaper"
         wallpaper.write_text(f'#!/bin/sh\nprintf "%s\\n" "$2" > "{root}/desktop-called"\n')
         wallpaper.chmod(0o700)
