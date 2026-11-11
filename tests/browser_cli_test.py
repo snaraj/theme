@@ -257,11 +257,18 @@ def main():
         library, config, kitty = (fixture / name for name in ("library", "config", "kitty"))
         for directory in (library, config, kitty):
             directory.mkdir(mode=0o700)
-        for name, color in [("blue calm 01.png", (24, 45, 120)),
-                            ("blue calm 02.png", (36, 60, 135)),
-                            ("green hills #3.png", (30, 95, 45)),
-                            ("界" * 20 + ".png", (40, 90, 120))]:
+        # The browser lists newest first by birth second; names break ties.
+        # Written in reverse, the last picture born is the first listed, so a
+        # clock tick between two writes cannot reorder them. The last written
+        # is also stamped a second after the rest, the split run 42935100225
+        # hit: macOS takes that as the birth time, as does a system without one.
+        pictures = [("blue calm 01.png", (24, 45, 120)), ("blue calm 02.png", (36, 60, 135)),
+                    ("green hills #3.png", (30, 95, 45)), ("界" * 20 + ".png", (40, 90, 120))]
+        stamp = int(time.time()) - 60
+        for written, (name, color) in enumerate(reversed(pictures), 1):
             png(library / name, color)
+            born = stamp + 1 if written == len(pictures) else stamp
+            os.utime(library / name, (born, born))
         (kitty / "kitty.conf").write_text("background_opacity 0.8\n")
         before = {p.relative_to(fixture): p.read_bytes() for p in fixture.rglob("*") if p.is_file()}
         env = os.environ.copy()  # HOME is preserved, never redirected.
